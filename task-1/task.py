@@ -5,6 +5,7 @@ import numpy as np
 import time
 import json
 from test import testdata_kmeans, testdata_knn, testdata_ann
+import time
 # ------------------------------------------------------------------------------------------------
 # Your Task 1.1 code here
 # ------------------------------------------------------------------------------------------------
@@ -13,17 +14,53 @@ from test import testdata_kmeans, testdata_knn, testdata_ann
 # def distance_kernel(X, Y, D):
 #     pass
 
+
 def distance_cosine(X, Y):
-    pass
+    norm_X = cp.linalg.norm(X, axis=1, keepdims=True) 
+    norm_Y = cp.linalg.norm(Y, axis=1, keepdims=True)
+    cosine_similarity = cp.sum(X * Y, axis=1) / (norm_X.flatten() * norm_Y.flatten())
+    cosine_distance = 1 - cosine_similarity
+    return cosine_distance
 
 def distance_l2(X, Y):
-    pass
+    squared_diff = cp.sum((X - Y) ** 2, axis=1)
+    l2_distance = cp.sqrt(squared_diff)
+    return l2_distance
 
 def distance_dot(X, Y):
-    pass
+    dot_product = cp.sum(X * Y, axis=1)
+    return dot_product
 
 def distance_manhattan(X, Y):
-    pass
+    manhattan_distance = cp.sum(cp.abs(X - Y), axis=1)
+    return manhattan_distance
+
+
+def main():
+    n = 1000
+    d = 100
+    X = cp.random.rand(n, d).astype(cp.float32)
+    Y = cp.random.rand(n, d).astype(cp.float32)
+
+    start_time = time.time()
+    cosine_dist = distance_cosine(X, Y)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    l2_dist = distance_l2(X, Y)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    dot_dist = distance_dot(X, Y)
+    end_time = time.time()
+    print(f"Dot product computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    manhattan_dist = distance_manhattan(X, Y)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
 
 # ------------------------------------------------------------------------------------------------
 # Your Task 1.2 code here
@@ -83,4 +120,5 @@ def recall_rate(list1, list2):
     return len(set(list1) & set(list2)) / len(list1)
 
 if __name__ == "__main__":
-    test_kmeans()
+    main()
+    # test_kmeans()
