@@ -1,0 +1,80 @@
+/bin/bash: /home/s2686742/.conda/envs/MLSystems/lib/libtinfo.so.6: no version information available (required by /bin/bash)
+Python executable: /home/s2686742/.conda/envs/MLSystems/bin/python
+13.3.0
+OS                           : Linux-5.15.0-130-generic-x86_64-with-glibc2.31
+Python Version               : 3.9.21
+CuPy Version                 : 13.3.0
+CuPy Platform                : NVIDIA CUDA
+NumPy Version                : 2.0.1
+SciPy Version                : 1.13.1
+Cython Build Version         : 0.29.36
+Cython Runtime Version       : None
+CUDA Root                    : /home/s2686742/.conda/envs/MLSystems
+nvcc PATH                    : /home/s2686742/.conda/envs/MLSystems/bin/nvcc
+CUDA Build Version           : 12060
+CUDA Driver Version          : 12040
+CUDA Runtime Version         : 12060 (linked to CuPy) / 12040 (locally installed)
+CUDA Extra Include Dirs      : []
+cuBLAS Version               : (available)
+cuFFT Version                : 11201
+cuRAND Version               : 10300
+cuSOLVER Version             : (11, 4, 1)
+cuSPARSE Version             : (available)
+NVRTC Version                : (12, 4)
+Thrust Version               : 200600
+CUB Build Version            : 200600
+Jitify Build Version         : <unknown>
+cuDNN Build Version          : (not loaded; try `import cupy.cuda.cudnn` first)
+cuDNN Version                : (not loaded; try `import cupy.cuda.cudnn` first)
+NCCL Build Version           : (not loaded; try `import cupy.cuda.nccl` first)
+NCCL Runtime Version         : (not loaded; try `import cupy.cuda.nccl` first)
+cuTENSOR Version             : None
+cuSPARSELt Build Version     : None
+Device 0 Name                : NVIDIA GeForce GTX 1060 6GB
+Device 0 Compute Capability  : 61
+Device 0 PCI Bus ID          : 0000:88:00.0
+None
+Traceback (most recent call last):
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/cuda/compiler.py", line 692, in compile
+    nvrtc.compileProgram(self.ptr, options)
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 125, in cupy_backends.cuda.libs.nvrtc.compileProgram
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 138, in cupy_backends.cuda.libs.nvrtc.compileProgram
+  File "cupy_backends/cuda/libs/nvrtc.pyx", line 53, in cupy_backends.cuda.libs.nvrtc.check_status
+cupy_backends.cuda.libs.nvrtc.NVRTCError: NVRTC_ERROR_COMPILATION (6)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/s2686742/MLS-G31/task-1/task.py", line 133, in <module>
+    main()
+  File "/home/s2686742/MLS-G31/task-1/task.py", line 51, in main
+    X = cp.random.rand(n, d).astype(cp.float32)
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/random/_sample.py", line 44, in rand
+    return random_sample(size=size, dtype=dtype)
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/random/_sample.py", line 156, in random_sample
+    return rs.random_sample(size=size, dtype=dtype)
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/random/_generator.py", line 630, in random_sample
+    RandomState._mod1_kernel(out)
+  File "cupy/_core/_kernel.pyx", line 920, in cupy._core._kernel.ElementwiseKernel.__call__
+  File "cupy/_core/_kernel.pyx", line 945, in cupy._core._kernel.ElementwiseKernel._get_elementwise_kernel
+  File "cupy/_util.pyx", line 64, in cupy._util.memoize.decorator.ret
+  File "cupy/_core/_kernel.pyx", line 728, in cupy._core._kernel._get_elementwise_kernel
+  File "cupy/_core/_kernel.pyx", line 82, in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+  File "cupy/_core/core.pyx", line 2283, in cupy._core.core.compile_with_cache
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/cuda/compiler.py", line 498, in _compile_module_with_cache
+    return _compile_with_cache_cuda(
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/cuda/compiler.py", line 577, in _compile_with_cache_cuda
+    ptx, mapping = compile_using_nvrtc(
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/cuda/compiler.py", line 333, in compile_using_nvrtc
+    return _compile(source, options, cu_path,
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/cuda/compiler.py", line 317, in _compile
+    compiled_obj, mapping = prog.compile(options, log_stream)
+  File "/home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/cuda/compiler.py", line 711, in compile
+    raise CompileException(log, self.src, self.name, options,
+cupy.cuda.compiler.CompileException: /home/s2686742/.conda/envs/MLSystems/lib/python3.9/site-packages/cupy/_core/include/cupy/_cuda/cuda-12.4/cuda_fp16.h(129): catastrophic error: cannot open source file "vector_types.h"
+  #include "vector_types.h"
+                           ^
+
+1 catastrophic error detected in the compilation of "/tmp/tmpx_0ja6np/1010e34d53092b64ca13595c92282cfbd7bbed94.cubin.cu".
+Compilation terminated.
+

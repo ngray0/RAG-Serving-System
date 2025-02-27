@@ -20,7 +20,7 @@ from cupyx.jit import rawkernel
 # ---------------------------
 # 1. L2 Distance (Euclidean)
 # ---------------------------
-@rawkernel
+@rawkernel()
 def l2_distance_kernel(A, B, output, N):
     """
     extern "C" __global__
@@ -65,7 +65,7 @@ def compute_l2_distance(A, B, threads_per_block=256):
 # ---------------------------
 # 2. Dot Product
 # ---------------------------
-@rawkernel
+@rawkernel()
 def dot_product_kernel(A, B, output, N):
     '''
     extern "C" __global__
@@ -107,7 +107,7 @@ def compute_dot_product(A, B, threads_per_block=256):
 # ---------------------------
 # 3. Manhattan Distance (L1)
 # ---------------------------
-@rawkernel
+@rawkernel()
 def manhattan_distance_kernel(A, B, output, N):
     """
     extern "C" __global__
@@ -148,7 +148,7 @@ def compute_manhattan_distance(A, B, threads_per_block=256):
 # ---------------------------
 # 4. Cosine Distance (for reference)
 # ---------------------------
-@rawkernel
+@rawkernel()
 def cosine_distance_kernel(A, B, output, N):
     """
     extern "C" __global__
@@ -258,6 +258,7 @@ def our_ann(N, D, A, X, K):
 # ------------------------------------------------------------------------------------------------
 
 # Example
+'''
 def test_kmeans():
     N, D, A, K = testdata_kmeans("test_file.json")
     kmeans_result = our_kmeans(N, D, A, K)
@@ -280,7 +281,7 @@ def recall_rate(list1, list2):
     list2[K]: The top K nearest vectors ID
     """
     return len(set(list1) & set(list2)) / len(list1)
-
+'''
 def main():
     np.random.seed(0)
     size = 1 << 20  # 1 million elements
@@ -303,4 +304,4 @@ def main():
 
 
 if __name__ == "__main__":
-    test_kmeans()
+    main()
