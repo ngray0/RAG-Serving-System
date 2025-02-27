@@ -5,27 +5,28 @@ import numpy as np
 import time
 import json
 from test import testdata_kmeans, testdata_knn, testdata_ann
-from cupyx.jit import rawkernel
+
 import time
 
-def distance_l2(X, Y):
-    X_norm = cp.sum(X * X, axis=1).reshape(-1, 1)
-    Y_norm = cp.sum(Y * Y, axis=1).reshape(1, -1)
-    dist_sq = cp.maximum(X_norm + Y_norm - 2 * cp.dot(X, Y.T), 0.0)
-    return cp.sqrt(dist_sq)
-
-
 def distance_cosine(X, Y):
-    X_norm = X / cp.linalg.norm(X, axis=1, keepdims=True)
-    Y_norm = Y / cp.linalg.norm(Y, axis=1, keepdims=True)
-    cosine_similarity = cp.dot(X_norm, Y_norm.T)
+    # Compute norms for each row
+    norm_X = cp.linalg.norm(X, axis=1, keepdims=True)
+    norm_Y = cp.linalg.norm(Y, axis=1, keepdims=True)
+    # Compute cosine similarity and convert to cosine distance
+    cosine_similarity = cp.sum(X * Y, axis=1) / (norm_X.flatten() * norm_Y.flatten())
     return 1 - cosine_similarity
 
+def distance_l2(X, Y):
+    # Direct L2 norm computation
+    return cp.linalg.norm(X - Y, axis=1)
+
 def distance_dot(X, Y):
-    return cp.dot(X, Y.T)
+    # Compute row-wise dot product
+    return cp.sum(X * Y, axis=1)
 
 def distance_manhattan(X, Y):
-    return cp.sum(cp.abs(X[:, cp.newaxis, :] - Y[cp.newaxis, :, :]), axis=2)
+    # Compute Manhattan (L1) distance row-wise
+    return cp.sum(cp.abs(X - Y), axis=1)
 
 
 # ------------------------------------------------------------------------------------------------
