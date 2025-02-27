@@ -5,7 +5,7 @@ import numpy as np
 import time
 import json
 from test import testdata_kmeans, testdata_knn, testdata_ann
-from cupyx import jit
+from cupyx.jit import rawkernel
 # ------------------------------------------------------------------------------------------------
 # Your Task 1.1 code here
 # ------------------------------------------------------------------------------------------------
@@ -20,7 +20,7 @@ from cupyx import jit
 # ---------------------------
 # 1. L2 Distance (Euclidean)
 # ---------------------------
-@jit.rawkernel
+@rawkernel
 def l2_distance_kernel(A, B, output, N):
     """
     extern "C" __global__
@@ -65,7 +65,7 @@ def compute_l2_distance(A, B, threads_per_block=256):
 # ---------------------------
 # 2. Dot Product
 # ---------------------------
-@jit.rawkernel
+@rawkernel
 def dot_product_kernel(A, B, output, N):
     '''
     extern "C" __global__
@@ -107,7 +107,7 @@ def compute_dot_product(A, B, threads_per_block=256):
 # ---------------------------
 # 3. Manhattan Distance (L1)
 # ---------------------------
-@jit.rawkernel
+@rawkernel
 def manhattan_distance_kernel(A, B, output, N):
     """
     extern "C" __global__
@@ -148,7 +148,7 @@ def compute_manhattan_distance(A, B, threads_per_block=256):
 # ---------------------------
 # 4. Cosine Distance (for reference)
 # ---------------------------
-@jit.rawkernel
+@rawkernel
 def cosine_distance_kernel(A, B, output, N):
     """
     extern "C" __global__
