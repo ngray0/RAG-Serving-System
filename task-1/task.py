@@ -90,13 +90,11 @@ def recall_rate(list1, list2):
 def main():
     np.random.seed(0)
     #size = 1 << 20  # 1 million elements
-    size = (1000, 100)
-    # Create two random vectors.
-    A_np = np.random.rand(*size).astype(np.float32)
-    B_np = np.random.rand(*size).astype(np.float32)
+    n = 1000
+    d = 100
     # Transfer to GPU.
-    A_cp = cp.array(A_np)
-    B_cp = cp.array(B_np)
+    A_cp = cp.random.rand(n, d).astype(cp.float32)
+    B_cp = cp.random.rand(n, d).astype(cp.float32)
     
     start_time = time.time()
     l2 = distance_l2(A_cp, B_cp)
