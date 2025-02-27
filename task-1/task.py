@@ -6,6 +6,7 @@ import time
 import json
 from test import testdata_kmeans, testdata_knn, testdata_ann
 from cupyx.jit import rawkernel
+import time
 # ------------------------------------------------------------------------------------------------
 # Your Task 1.1 code here
 # ------------------------------------------------------------------------------------------------
@@ -284,18 +285,34 @@ def recall_rate(list1, list2):
 '''
 def main():
     np.random.seed(0)
-    size = 1 << 20  # 1 million elements
+    #size = 1 << 20  # 1 million elements
+    size = (1000, 100)
     # Create two random vectors.
-    A_np = np.random.rand(size).astype(np.float32)
-    B_np = np.random.rand(size).astype(np.float32)
+    A_np = np.random.rand(*size).astype(np.float32)
+    B_np = np.random.rand(*size).astype(np.float32)
     # Transfer to GPU.
     A_cp = cp.array(A_np)
     B_cp = cp.array(B_np)
     
+    start_time = time.time()
     l2 = compute_l2_distance(A_cp, B_cp)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
     dot = compute_dot_product(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Dot Product distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
     manhattan = compute_manhattan_distance(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
     cosine = compute_cosine_distance(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
     
     print("L2 (Euclidean) distance:", l2)
     print("Dot product:", dot)
