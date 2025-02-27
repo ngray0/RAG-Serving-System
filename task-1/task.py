@@ -28,6 +28,26 @@ def distance_manhattan(X, Y):
     # Compute Manhattan (L1) distance row-wise
     return cp.sum(cp.abs(X - Y), axis=1)
 
+def distance_cosine2(X, Y):
+    norm_X = cp.linalg.norm(X, axis=1, keepdims=True) 
+    norm_Y = cp.linalg.norm(Y, axis=1, keepdims=True)
+    cosine_similarity = cp.sum(X * Y, axis=1) / (norm_X.flatten() * norm_Y.flatten())
+    cosine_distance = 1 - cosine_similarity
+    return cosine_distance
+
+def distance_l22(X, Y):
+    squared_diff = cp.sum((X - Y) ** 2, axis=1)
+    l2_distance = cp.sqrt(squared_diff)
+    return l2_distance
+
+def distance_dot2(X, Y):
+    dot_product = cp.sum(X * Y, axis=1)
+    return dot_product
+
+def distance_manhattan2(X, Y):
+    manhattan_distance = cp.sum(cp.abs(X - Y), axis=1)
+    return manhattan_distance
+
 
 # ------------------------------------------------------------------------------------------------
 # Your Task 1.2 code here
@@ -113,6 +133,26 @@ def main():
 
     start_time = time.time()
     cosine = distance_cosine(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    l2 = distance_l22(A_cp, B_cp)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    dot = distance_dot2(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Dot Product distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    manhattan = distance_manhattan2(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    cosine = distance_cosine2(A_cp, B_cp)
     end_time = time.time()
     print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
     
