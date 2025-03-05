@@ -114,8 +114,55 @@ def main():
 
 # You can create any kernel here
 
+def compute_all_distances(A, X, distance_fn):
+    """
+    Compute the distances between each row in array A and the vector X using the provided distance function.
+    
+    If X is a 1D vector, it is reshaped to 2D for broadcasting.
+    
+    Parameters:
+        A (cupy.ndarray): 2D array of shape (N, D)
+        X (cupy.ndarray): 1D or 2D array representing the query vector.
+        distance_fn (function): A function that computes the distance given two arrays.
+        
+    Returns:
+        cupy.ndarray: An array of distances computed between each row of A and X.
+    """
+    if X.ndim == 1:
+        X = X[None, :]
+    return distance_fn(A, cp.broadcast_to(X, A.shape))
+
+
 def our_knn(N, D, A, X, K):
-    pass
+    """
+    Compute the K nearest neighbors indices for a query vector X from the dataset A using L2 distance.
+    
+    The function expects:
+      - N: number of vectors in A.
+      - D: dimension of each vector.
+      - A: dataset array of shape (N, D) stored on the GPU.
+      - X: query vector of dimension D.
+      - K: number of nearest neighbors to retrieve.
+    
+    This function computes the distances between the query and each vector in A using L2 distance,
+    then uses a partial sort (via cp.argpartition) to select the K smallest distances,
+    and finally orders these K indices by their actual distances.
+    
+    Parameters:
+        N (int): Number of vectors.
+        D (int): Dimension of each vector.
+        A (cupy.ndarray): 2D array of shape (N, D) containing the dataset vectors.
+        X (cupy.ndarray): 1D array of shape (D,) or 2D array (1, D) representing the query vector.
+        K (int): Number of nearest neighbors to retrieve.
+        
+    Returns:
+        cupy.ndarray: 1D array containing the indices of the K nearest neighbors, ordered by distance.
+    """
+    distances = compute_all_distances(A, X, distance_l2)
+    k_indices = cp.argpartition(distances, K)[:K]
+    k_indices = k_indices[cp.argsort(distances[k_indices])]
+    return k_indices
+
 
 # ------------------------------------------------------------------------------------------------
 # Your Task 2.1 code here
@@ -167,4 +214,4 @@ def recall_rate(list1, list2):
 
 if __name__ == "__main__":
     main()
-    # test_kmeans()
+    test_kmeans()
