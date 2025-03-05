@@ -1,6 +1,7 @@
 import torch
 import cupy as cp
 import triton
+import triton.language as tl
 import numpy as np
 import time
 import json
@@ -16,7 +17,7 @@ import csv
 # Q1: How did you implement four distinct distance functions on the GPU?
 # ------------------------------------------------------------------------------------------------
 
-# Bench Mark
+# Benchmark
 def distance_cosine(X, Y):
     norm_X = cp.linalg.norm(X, axis=1, keepdims=True) 
     norm_Y = cp.linalg.norm(Y, axis=1, keepdims=True)
@@ -132,7 +133,7 @@ def compute_all_distances(A, X, distance_fn):
         X = X[None, :]
     return distance_fn(A, cp.broadcast_to(X, A.shape))
 
-
+# Benchmark
 def our_knn(N, D, A, X, K):
     """
     Compute the K nearest neighbors indices for a query vector X from the dataset A using L2 distance.
@@ -162,6 +163,93 @@ def our_knn(N, D, A, X, K):
     k_indices = cp.argpartition(distances, K)[:K]
     k_indices = k_indices[cp.argsort(distances[k_indices])]
     return k_indices
+
+# CuPy + CUDA Streams
+def our_knn_stream(N, D, A, X, K):
+    """
+    Optimized KNN using CUDA Streams in CuPy.
+    This allows concurrent computation of multiple queries.
+
+    N: Number of vectors in A
+    D: Dimension of each vector
+    A: Dataset array (CuPy array on GPU)
+    X: Query vector (CuPy array on GPU)
+    K: Number of nearest neighbors
+    """
+    B = X.shape[0] if X.ndim > 1 else 1  # Determine batch size
+    streams = [cp.cuda.Stream() for _ in range(B)]
+    results = [None] * B
+
+    for i in range(B):
+        with streams[i]:
+            query = X[i] if X.ndim > 1 else X
+            distances = cp.sqrt(cp.sum((A - query) ** 2, axis=1))
+            k_indices = cp.argpartition(distances, K)[:K]
+            results[i] = k_indices[cp.argsort(distances[k_indices])]
+
+    for s in streams:
+        s.synchronize()
+    
+    return results if B > 1 else results[0]
+
+# Triton
+
+@triton.jit
+def knn_kernel(A_ptr, X_ptr, dist_ptr, N: tl.constexpr, D: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    """
+    Triton kernel to compute L2 distances between each row in A and X.
+    Uses shared memory tiling to reduce redundant accesses.
+    """
+    row_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = row_idx < N
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    for i in range(0, D, 128):
+        x_tile = tl.load(X_ptr + i, mask=tl.arange(0, 128) < (D - i), other=0.0)
+        a_tile = tl.load(A_ptr + row_idx[:, None] * D + i, mask=mask[:, None], other=0.0)
+        acc += tl.sum((a_tile - x_tile) ** 2, axis=1)
+
+    tl.store(dist_ptr + row_idx, tl.sqrt(acc), mask=mask)
+
+def our_knn_triton(N, D, A, X, K):
+    """
+    Optimized KNN using Triton Kernel with Shared Memory Tiling.
+    N: Number of vectors
+    D: Dimension of each vector
+    A: Dataset (CuPy array)
+    X: Query (CuPy array)
+    K: Number of nearest neighbors
+    """
+    distances = cp.empty((N,), dtype=cp.float32)
+    grid = (N + 127) // 128
+
+    knn_kernel[grid](A, X, distances, N, D, 128)
+    cp.cuda.Device(0).synchronize()
+
+    k_indices = cp.argpartition(distances, K)[:K]
+    return k_indices[cp.argsort(distances[k_indices])]
+
+# Hierachy Memory
+def our_knn_hierachy(N, D, A, X, K):
+    """
+    Optimized KNN using Pinned Memory for Efficient Data Transfer.
+    Pinned memory allows fast CPU-GPU transfers for batch operations.
+    """
+    if not isinstance(A, cp.ndarray):
+        A = cp.asarray(A)  # Ensure A is on GPU
+    if not isinstance(X, cp.ndarray):
+        X = cp.asarray(X)  # Ensure X is on GPU
+
+    distances = cp.empty((N,), dtype=cp.float32)
+
+    # Pinned memory for efficient transfers
+    X_pinned = cp.get_pinned_memory(X.nbytes)
+    cp.cuda.runtime.memcpyAsync(X_pinned, X.data.ptr, X.nbytes, cp.cuda.runtime.memcpyHostToDevice)
+
+    distances = cp.sqrt(cp.sum((A - X) ** 2, axis=1))
+    k_indices = cp.argpartition(distances, K)[:K]
+
+    return k_indices[cp.argsort(distances[k_indices])]
 
 
 # ------------------------------------------------------------------------------------------------
@@ -213,5 +301,5 @@ def recall_rate(list1, list2):
     return len(set(list1) & set(list2)) / len(list1)
 
 if __name__ == "__main__":
-    main()
+    # main()
     test_kmeans()
