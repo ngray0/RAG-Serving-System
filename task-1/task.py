@@ -854,7 +854,10 @@ if __name__ == "__main__":
     print(f"Testing our_ann (HNSW, K={K_val})...")
     print("="*40)
     # Reduce HNSW params for quicker example run
-    ann_indices, ann_dists = our_ann(N_data, Dim, A_data, X_queries, K_val, M=10, ef_construction=50, ef_search=30)
+    ann_indices, ann_dists = our_ann(N_data, Dim, A_data, X_queries, K_val,
+                                 M=32,              # Increased connections
+                                 ef_construction=200, # Increased construction beam
+                                 ef_search=100) 
     print("ANN results shape (Indices):", ann_indices.shape)
     print("ANN results shape (Distances):", ann_dists.shape)
     print("Sample ANN Indices (Query 0):\n", ann_indices[0])
