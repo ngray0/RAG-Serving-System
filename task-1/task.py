@@ -1,107 +1,831 @@
 import torch
-import cupy as cp
 import triton
-import numpy as np
+import triton.language as tl
+import math
+import heapq # For HNSW priority queues
+import random
 import time
-import json
-from test import testdata_kmeans, testdata_knn, testdata_ann
 
-import time
+# --- Ensure GPU is available ---
+if not torch.cuda.is_available():
+    print("CUDA not available, exiting.")
+    exit()
+device = torch.device("cuda:0")
+print(f"Using device: {device}")
 
-def distance_cosine(X, Y):
-    norm_X = cp.linalg.norm(X, axis=1, keepdims=True) 
-    norm_Y = cp.linalg.norm(Y, axis=1, keepdims=True)
-    cosine_similarity = cp.sum(X * Y, axis=1) / (norm_X.flatten() * norm_Y.flatten())
-    cosine_distance = 1 - cosine_similarity
-    return cosine_distance
+# ============================================================================
+# Triton Distance Kernels (Pairwise: Q queries vs N database points)
+# ============================================================================
 
-def distance_l2(X, Y):
-    squared_diff = cp.sum((X - Y) ** 2, axis=1)
-    l2_distance = cp.sqrt(squared_diff)
-    return l2_distance
+@triton.jit
+def l2_dist_kernel_pairwise(
+    X_ptr,      # Pointer to Query vectors (Q, D)
+    A_ptr,      # Pointer to Database vectors (N, D)
+    Out_ptr,    # Pointer to output distances (Q, N)
+    # --- Dimensions ---
+    Q, N, D,
+    # --- Strides ---
+    stride_xq, stride_xd,
+    stride_an, stride_ad,
+    stride_outq, stride_outn,
+    # --- Block Size ---
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates pairwise squared L2 distance: dist(X[q], A[n])"""
+    pid_q = tl.program_id(axis=0) # Query index
+    pid_n = tl.program_id(axis=1) # Database index
 
-def distance_dot(X, Y):
-    dot_product = cp.sum(X * Y, axis=1)
-    return dot_product
+    dist_sq = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < d_end
 
-def distance_manhattan(X, Y):
-    manhattan_distance = cp.sum(cp.abs(X - Y), axis=1)
-    return manhattan_distance
+        # Load X[pid_q, d_start:d_end]
+        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
+
+        # Load A[pid_n, d_start:d_end]
+        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
+
+        diff = x_vals - a_vals
+        dist_sq += tl.sum(diff * diff, axis=0)
+
+    # Store result
+    out_offset = pid_q * stride_outq + pid_n * stride_outn
+    tl.store(Out_ptr + out_offset, dist_sq)
+
+@triton.jit
+def dot_kernel_pairwise(
+    X_ptr, A_ptr, Out_ptr,
+    Q, N, D,
+    stride_xq, stride_xd,
+    stride_an, stride_ad,
+    stride_outq, stride_outn,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates pairwise dot product: dot(X[q], A[n])"""
+    pid_q = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    dot_prod = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < d_end
+
+        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
+
+        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
+
+        dot_prod += tl.sum(x_vals * a_vals, axis=0)
+
+    out_offset = pid_q * stride_outq + pid_n * stride_outn
+    tl.store(Out_ptr + out_offset, dot_prod)
+
+@triton.jit
+def norm_kernel(
+    V_ptr, Norms_ptr, # Input vectors (Count, D), Output norms (Count,)
+    Count, D,
+    stride_vn, stride_vd,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates L2 norm for each vector in V."""
+    pid_n = tl.program_id(axis=0) # Vector index
+
+    norm_sq = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < d_end
+
+        v_ptrs = V_ptr + pid_n * stride_vn + offs_d * stride_vd
+        v_vals = tl.load(v_ptrs, mask=mask_d, other=0.0)
+
+        norm_sq += tl.sum(v_vals * v_vals, axis=0)
+
+    norm = tl.sqrt(norm_sq)
+    tl.store(Norms_ptr + pid_n, norm)
 
 
-# ------------------------------------------------------------------------------------------------
-# Your Task 1.2 code here
-# ------------------------------------------------------------------------------------------------
+@triton.jit
+def manhattan_dist_kernel_pairwise(
+    X_ptr, A_ptr, Out_ptr,
+    Q, N, D,
+    stride_xq, stride_xd,
+    stride_an, stride_ad,
+    stride_outq, stride_outn,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates pairwise Manhattan (L1) distance: sum(abs(X[q] - A[n]))"""
+    pid_q = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
 
-# You can create any kernel here
+    dist_l1 = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < d_end
 
-def our_knn(N, D, A, X, K, distance_func, batch_size=1024, num_streams=4):
+        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
+
+        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
+
+        diff = x_vals - a_vals
+        dist_l1 += tl.sum(tl.abs(diff), axis=0)
+
+    out_offset = pid_q * stride_outq + pid_n * stride_outn
+    tl.store(Out_ptr + out_offset, dist_l1)
+
+
+# ============================================================================
+# Python Distance Function Wrappers
+# ============================================================================
+# Default block size for dimension splitting in kernels (can be tuned)
+DEFAULT_BLOCK_D = 128
+
+def _prepare_tensors(*tensors):
+    """Ensure tensors are float32, contiguous, and on the correct device."""
+    prepared = []
+    for t in tensors:
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, dtype=torch.float32, device=device)
+        if t.device != device:
+            t = t.to(device)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
+        # Kernels often benefit from contiguous memory
+        prepared.append(t.contiguous())
+    return prepared
+
+def distance_l2(X, A):
+    """Computes pairwise squared L2 distance using Triton kernel."""
+    X_prep, A_prep = _prepare_tensors(X, A)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+    grid = (Q, N)
+    l2_dist_kernel_pairwise[grid](
+        X_prep, A_prep, Out,
+        Q, N, D,
+        X_prep.stride(0), X_prep.stride(1),
+        A_prep.stride(0), A_prep.stride(1),
+        Out.stride(0), Out.stride(1),
+        BLOCK_SIZE_D=DEFAULT_BLOCK_D
+    )
+    return Out
+
+def distance_dot(X, A):
+    """Computes pairwise dot product using Triton kernel."""
+    X_prep, A_prep = _prepare_tensors(X, A)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+    grid = (Q, N)
+    dot_kernel_pairwise[grid](
+        X_prep, A_prep, Out,
+        Q, N, D,
+        X_prep.stride(0), X_prep.stride(1),
+        A_prep.stride(0), A_prep.stride(1),
+        Out.stride(0), Out.stride(1),
+        BLOCK_SIZE_D=DEFAULT_BLOCK_D
+    )
+    # Return negative dot product if used for minimization (finding 'nearest')
+    # return -Out
+    # Or return raw dot product if similarity maximization is intended
+    return Out
+
+
+def distance_cosine(X, A):
+    """Computes pairwise cosine distance using Triton kernels."""
+    X_prep, A_prep = _prepare_tensors(X, A)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    # Calculate norms
+    X_norms = torch.empty(Q, dtype=torch.float32, device=device)
+    A_norms = torch.empty(N, dtype=torch.float32, device=device)
+
+    grid_q = (Q,)
+    norm_kernel[grid_q](X_prep, X_norms, Q, D, X_prep.stride(0), X_prep.stride(1), BLOCK_SIZE_D=DEFAULT_BLOCK_D)
+    grid_n = (N,)
+    norm_kernel[grid_n](A_prep, A_norms, N, D, A_prep.stride(0), A_prep.stride(1), BLOCK_SIZE_D=DEFAULT_BLOCK_D)
+
+    # Calculate dot products
+    dot_products = distance_dot(X_prep, A_prep) # Uses the dot kernel internally
+
+    # Calculate cosine similarity
+    # Add epsilon to avoid division by zero for zero vectors
+    epsilon = 1e-8
+    norm_product = X_norms[:, None] * A_norms[None, :]
+    similarities = dot_products / norm_product.clamp(min=epsilon)
+    # Clamp similarities to [-1, 1] due to potential floating point inaccuracies
+    similarities.clamp_(min=-1.0, max=1.0)
+
+    # Cosine distance = 1 - similarity
+    distances = 1.0 - similarities
+    return distances
+
+def distance_manhattan(X, A):
+    """Computes pairwise Manhattan (L1) distance using Triton kernel."""
+    X_prep, A_prep = _prepare_tensors(X, A)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+    grid = (Q, N)
+    manhattan_dist_kernel_pairwise[grid](
+        X_prep, A_prep, Out,
+        Q, N, D,
+        X_prep.stride(0), X_prep.stride(1),
+        A_prep.stride(0), A_prep.stride(1),
+        Out.stride(0), Out.stride(1),
+        BLOCK_SIZE_D=DEFAULT_BLOCK_D
+    )
+    return Out
+
+# ============================================================================
+# Task 1.2: k-Nearest Neighbors (Brute Force)
+# ============================================================================
+
+def our_knn(N_A, D, A, X, K):
     """
-    Parameters:
-      N: Number of training examples.
-      D: Dimensionality of the data.
-      A: Training data, a (N, D) Cupy array.
-      X: Query data, a (M, D) Cupy array.
-      K: Number of nearest neighbors to return.
-      distance_func: A callable that computes distances between a training set A and a single query vector.
-                     It should accept two arguments: the training set (shape (N, D)) and a query (shape (1, D)),
-                     and return a 1D Cupy array of distances of length N.
-      batch_size: How many queries to process per batch.
-      num_streams: Number of CUDA streams to use for overlapping computations.
-    
+    Finds the K nearest neighbors in A for each query vector in X using
+    brute-force pairwise L2 distance calculation.
+
+    Args:
+        N_A (int): Number of database points (should match A.shape[0]).
+        D (int): Dimensionality (should match A.shape[1] and X.shape[1]).
+        A (torch.Tensor): Database vectors (N_A, D) on GPU.
+        X (torch.Tensor): Query vectors (Q, D) on GPU.
+        K (int): Number of neighbors to find.
+
     Returns:
-      knn_indices: (M, K) array with indices of the K nearest training points for each query.
-      knn_distances: (M, K) array with corresponding distances.
+        tuple[torch.Tensor, torch.Tensor]:
+            - topk_indices (torch.Tensor): Indices of the K nearest neighbors (Q, K).
+            - topk_distances (torch.Tensor): Squared L2 distances of the K nearest neighbors (Q, K).
     """
-    M = X.shape[0]
-    knn_indices = cp.empty((M, K), dtype=cp.int32)
-    knn_distances = cp.empty((M, K), dtype=A.dtype)
-    
-    streams = [cp.cuda.Stream() for _ in range(num_streams)]
-    
-    for batch_start in range(0, M, batch_size):
-        batch_end = min(batch_start + batch_size, M)
-        for i in range(batch_start, batch_end):
-            stream = streams[i % num_streams]
-            with stream:
-                query = X[i:i+1, :]
-                dists = distance_func(A, query)
-                idx_part = cp.argpartition(dists, K)[:K]
-                selected_dists = dists[idx_part]
-                sorted_order = cp.argsort(selected_dists)
-                sorted_idx = idx_part[sorted_order]
-                sorted_dists = dists[sorted_idx]
-                knn_indices[i] = sorted_idx
-                knn_distances[i] = sorted_dists
-    cp.cuda.Stream.null.synchronize()
-    
-    return knn_indices, knn_distances
+    A_prep, X_prep = _prepare_tensors(A, X)
+    Q = X_prep.shape[0]
+    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
+    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
+    assert X_prep.shape[1] == D, "D doesn't match X.shape[1]"
+    assert K > 0, "K must be positive"
+    assert K <= N_A, "K cannot be larger than the number of database points"
 
-# ------------------------------------------------------------------------------------------------
-# Your Task 2.1 code here
-# ------------------------------------------------------------------------------------------------
 
-# You can create any kernel here
-# def distance_kernel(X, Y, D):
-#     pass
+    print(f"Running k-NN: Q={Q}, N={N_A}, D={D}, K={K}")
+    start_time = time.time()
 
-def our_kmeans(N, D, A, K):
-    pass
+    # 1. Calculate all pairwise squared L2 distances
+    #    distance_l2 returns squared L2 distances
+    all_distances = distance_l2(X_prep, A_prep) # Shape (Q, N_A)
 
-# ------------------------------------------------------------------------------------------------
-# Your Task 2.2 code here
-# ------------------------------------------------------------------------------------------------
+    # 2. Find the top K smallest distances for each query
+    #    largest=False gives smallest distances (nearest neighbors)
+    topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
 
-# You can create any kernel here
+    end_time = time.time()
+    print(f"k-NN computation time: {end_time - start_time:.4f} seconds")
 
-def our_ann(N, D, A, X, K):
-    pass
+    return topk_indices, topk_distances
 
-# ------------------------------------------------------------------------------------------------
-# Test your code here
-# ------------------------------------------------------------------------------------------------
 
-# Example
+# ============================================================================
+# Task 2.1: K-Means Clustering
+# ============================================================================
+
+# --- Triton Kernels specific to K-Means (adapted from previous examples) ---
+# --- Uses 1-vs-M distance logic internally for assignment ---
+@triton.jit
+def kmeans_assign_kernel(
+    A_ptr,           # Pointer to data points (N, D)
+    centroids_ptr,   # Pointer to centroids (K, D)
+    assignments_ptr, # Pointer to output assignments (N,)
+    # --- Dimensions ---
+    N, D, K,
+    # --- Strides ---
+    stride_an, stride_ad, # Strides for A
+    stride_ck, stride_cd, # Strides for centroids
+    # --- Block Sizes (Tuning parameters) ---
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K_CHUNK: tl.constexpr,
+):
+    """Assigns each point in A to the nearest centroid (Squared L2)."""
+    pid_n = tl.program_id(axis=0) # ID for the N dimension block
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask_n = offs_n < N
+    A_block_ptrs = A_ptr + offs_n[:, None] * stride_an + tl.arange(0, D)[None, :] * stride_ad # (BLOCK_SIZE_N, D)
+
+    min_dist_sq = tl.full((BLOCK_SIZE_N,), float('inf'), dtype=tl.float32)
+    best_assignment = tl.zeros((BLOCK_SIZE_N,), dtype=tl.int32)
+
+    for k_start in range(0, K, BLOCK_SIZE_K_CHUNK):
+        k_end = tl.minimum(k_start + BLOCK_SIZE_K_CHUNK, K)
+        offs_k = k_start + tl.arange(0, BLOCK_SIZE_K_CHUNK)
+
+        for k_idx in range(BLOCK_SIZE_K_CHUNK):
+            actual_k = k_start + k_idx
+            if actual_k < k_end:
+                # Load centroid k
+                current_centroid_ptr = centroids_ptr + actual_k * stride_ck + tl.arange(0, D) * stride_cd
+                centroid = tl.load(current_centroid_ptr) # Shape (D,)
+
+                # Load points for this block
+                points = tl.load(A_block_ptrs, mask=mask_n[:, None], other=0.0) # (BLOCK_SIZE_N, D)
+
+                # Calculate Squared L2 Distance
+                diff = points - centroid[None, :]
+                dist_sq = tl.sum(diff * diff, axis=1) # Shape (BLOCK_SIZE_N,)
+
+                # Update Minimum
+                is_closer = dist_sq < min_dist_sq
+                min_dist_sq = tl.where(is_closer, dist_sq, min_dist_sq)
+                best_assignment = tl.where(is_closer, actual_k, best_assignment)
+
+    assignments_out_ptrs = assignments_ptr + offs_n
+    tl.store(assignments_out_ptrs, best_assignment, mask=mask_n)
+
+@triton.jit
+def kmeans_update_kernel_part1(
+    A_ptr,              # Pointer to data points (N, D)
+    assignments_ptr,    # Pointer to assignments (N,)
+    partial_sums_ptr,   # Pointer to output partial sums (num_blocks_n, K, D)
+    partial_counts_ptr, # Pointer to output partial counts (num_blocks_n, K)
+    # --- Dimensions ---
+    N, D, K,
+    # --- Strides ---
+    stride_an, stride_ad,
+    stride_ps_block, stride_ps_k, stride_ps_d,
+    stride_pc_block, stride_pc_k,
+    # --- Block Size ---
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    """Calculates partial sums and counts using atomics."""
+    pid_n_block = tl.program_id(axis=0) # Block ID
+    offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask_n = offs_n < N
+
+    assignments_ptrs = assignments_ptr + offs_n
+    assignments = tl.load(assignments_ptrs, mask=mask_n, other=-1) # Shape (BLOCK_SIZE_N,)
+
+    A_block_ptrs = A_ptr + offs_n[:, None] * stride_an + tl.arange(0, D)[None, :] * stride_ad
+
+    # Atomic updates for sums (dimension by dimension)
+    for d_idx in tl.static_range(D):
+        a_d = tl.load(A_block_ptrs + d_idx * stride_ad, mask=mask_n, other=0.0) # (BLOCK_SIZE_N,)
+        assigned_clusters = assignments # (BLOCK_SIZE_N,)
+        partial_sums_target_ptrs = (partial_sums_ptr +
+                                    pid_n_block * stride_ps_block +
+                                    assigned_clusters * stride_ps_k +
+                                    d_idx * stride_ps_d)
+        valid_update_mask = mask_n & (assigned_clusters >= 0)
+        tl.atomic_add(partial_sums_target_ptrs, a_d, mask=valid_update_mask)
+
+    # Atomic updates for counts (once per point)
+    partial_counts_target_ptrs = (partial_counts_ptr +
+                                  pid_n_block * stride_pc_block +
+                                  assignments * stride_pc_k)
+    valid_update_mask = mask_n & (assignments >= 0)
+    tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_update_mask)
+
+
+def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
+    """
+    Performs K-means clustering on data A using Triton kernels.
+
+    Args:
+        N_A (int): Number of data points (should match A.shape[0]).
+        D (int): Dimensionality (should match A.shape[1]).
+        A (torch.Tensor): Data points (N_A, D) on GPU.
+        K (int): Number of clusters.
+        max_iters (int): Maximum number of iterations.
+        tol (float): Tolerance for centroid movement convergence check.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - centroids (torch.Tensor): Final centroids (K, D).
+            - assignments (torch.Tensor): Final cluster assignment for each point (N_A,).
+    """
+    A_prep, = _prepare_tensors(A)
+    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
+    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
+    assert K > 0, "K must be positive"
+    assert K <= N_A, "K cannot be larger than the number of data points"
+
+    print(f"Running K-Means: N={N_A}, D={D}, K={K}")
+    start_time_total = time.time()
+
+    # --- Initialization ---
+    initial_indices = torch.randperm(N_A, device=device)[:K]
+    centroids = A_prep[initial_indices].clone() # Shape (K, D)
+    assignments = torch.empty(N_A, dtype=torch.int32, device=device)
+
+    # --- Triton Kernel Launch Configuration ---
+    BLOCK_SIZE_N_ASSIGN = 128
+    BLOCK_SIZE_K_CHUNK_ASSIGN = 64 # Centroid chunking
+    BLOCK_SIZE_N_UPDATE = 128
+
+    grid_assign = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
+    grid_update = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
+    num_blocks_n_update = triton.cdiv(N_A, BLOCK_SIZE_N_UPDATE)
+
+    for i in range(max_iters):
+        iter_start_time = time.time()
+
+        # --- 1. Assignment Step ---
+        kmeans_assign_kernel[grid_assign](
+            A_prep, centroids, assignments,
+            N_A, D, K,
+            A_prep.stride(0), A_prep.stride(1),
+            centroids.stride(0), centroids.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
+            BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN
+        )
+
+        # --- 2. Update Step ---
+        partial_sums = torch.zeros((num_blocks_n_update, K, D), dtype=torch.float32, device=device)
+        partial_counts = torch.zeros((num_blocks_n_update, K), dtype=torch.float32, device=device)
+
+        kmeans_update_kernel_part1[grid_update](
+            A_prep, assignments,
+            partial_sums, partial_counts,
+            N_A, D, K,
+            A_prep.stride(0), A_prep.stride(1),
+            partial_sums.stride(0), partial_sums.stride(1), partial_sums.stride(2),
+            partial_counts.stride(0), partial_counts.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N_UPDATE
+        )
+
+        # Reduce partials
+        final_sums = partial_sums.sum(dim=0)
+        final_counts = partial_counts.sum(dim=0)
+
+        # Calculate new centroids, handle empty clusters
+        final_counts_safe = final_counts.unsqueeze(1).clamp(min=1.0)
+        new_centroids = final_sums / final_counts_safe
+        empty_cluster_mask = (final_counts == 0)
+        # Keep old centroid if cluster becomes empty
+        new_centroids[empty_cluster_mask] = centroids[empty_cluster_mask]
+
+        # --- Check Convergence ---
+        centroid_diff = torch.norm(new_centroids - centroids)
+        centroids = new_centroids # Update centroids
+
+        iter_end_time = time.time()
+        print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff:.4f} | Time: {iter_end_time - iter_start_time:.4f}s")
+
+        if centroid_diff < tol:
+            print(f"Converged after {i+1} iterations.")
+            break
+
+    if i == max_iters - 1:
+        print(f"Reached max iterations ({max_iters}).")
+
+    total_time = time.time() - start_time_total
+    print(f"Total K-Means time: {total_time:.4f}s")
+
+    return centroids, assignments
+
+
+# ============================================================================
+# Task 2.2: Approximate Nearest Neighbors (Simplified HNSW)
+# ============================================================================
+
+# --- Triton Kernel for 1 Query vs M Candidates (used by HNSW) ---
+@triton.jit
+def l2_dist_kernel_1_vs_M( # Renamed from previous example
+    query_ptr,      # Pointer to query vector (D,)
+    candidates_ptr, # Pointer to candidate vectors (M, D)
+    output_ptr,     # Pointer to output distances (M,)
+    M, D,           # Dimensions
+    stride_cand_m, stride_cand_d,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates squared L2 distance: 1 query vs M candidates."""
+    pid_m = tl.program_id(axis=0) # Candidate index
+    dist_sq = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < D
+        # Load query block
+        query_d_ptr = query_ptr + offs_d
+        query_vals = tl.load(query_d_ptr, mask=mask_d, other=0.0)
+        # Load candidate block
+        cand_d_ptr = candidates_ptr + pid_m * stride_cand_m + offs_d * stride_cand_d
+        cand_vals = tl.load(cand_d_ptr, mask=mask_d, other=0.0)
+        # Accumulate difference squared
+        diff = query_vals - cand_vals
+        dist_sq += tl.sum(diff * diff, axis=0)
+    # Store result
+    tl.store(output_ptr + pid_m, dist_sq)
+
+
+# --- Simplified HNSW Class (using the 1-vs-M kernel) ---
+class SimpleHNSW_for_ANN: # Renamed to avoid conflicts if run in same script
+    def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
+        self.dim = dim
+        self.M = M
+        self.ef_construction = ef_construction
+        self.ef_search = ef_search
+        self.mL = mL
+        self.vectors = torch.empty((0, dim), dtype=torch.float32, device=device)
+        self.graph = []
+        self.level_assignments = []
+        self.node_count = 0
+        self.entry_point = -1
+        self.max_level = -1
+        self.BLOCK_SIZE_D_DIST = 128 # Tunable param for the 1-vs-M kernel
+
+    def _get_level_for_new_node(self):
+        level = int(-math.log(random.uniform(0, 1)) * self.mL)
+        return level
+
+    def _distance(self, query_vec, candidate_indices):
+        """Internal distance calc using the 1-vs-M Triton kernel."""
+        if not isinstance(candidate_indices, list): candidate_indices = list(candidate_indices)
+        if not candidate_indices: return torch.empty(0, device=device)
+
+        num_candidates = len(candidate_indices)
+        query_vec, = _prepare_tensors(query_vec.flatten()) # Ensure flat, on GPU, float32
+        candidate_vectors = self.vectors[candidate_indices] # Assumes self.vectors is already prepared
+
+        distances_out = torch.empty(num_candidates, dtype=torch.float32, device=device)
+        grid = (num_candidates,)
+        l2_dist_kernel_1_vs_M[grid]( # Call the specific 1-vs-M kernel
+            query_vec, candidate_vectors, distances_out,
+            num_candidates, self.dim,
+            candidate_vectors.stride(0), candidate_vectors.stride(1),
+            BLOCK_SIZE_D=self.BLOCK_SIZE_D_DIST
+        )
+        return distances_out
+
+    # _search_layer, add_point, search_knn methods are identical to the
+    # previous HNSW example, just ensure they call self._distance which now
+    # correctly points to the 1-vs-M Triton kernel implementation.
+    # (Code omitted here for brevity - assume they are defined as before)
+    # ... (Paste _search_layer, add_point, search_knn implementations here) ...
+    def _search_layer(self, query_vec, entry_points, target_level, ef):
+        """Performs greedy search on a single layer (identical to previous example)."""
+        if self.entry_point == -1: return []
+        candidates = set(entry_points)
+        visited = set(entry_points)
+        initial_distances = self._distance(query_vec, list(entry_points))
+        candidate_heap = list(zip(initial_distances.tolist(), entry_points))
+        heapq.heapify(candidate_heap)
+        results_heap = [(-dist, node_id) for dist, node_id in candidate_heap]
+        heapq.heapify(results_heap)
+
+        while candidate_heap:
+            dist_candidate, current_node_id = heapq.heappop(candidate_heap)
+            if results_heap:
+                 dist_furthest_result = -results_heap[0][0]
+                 if dist_candidate > dist_furthest_result and len(results_heap) >= ef: break
+
+            try: neighbors = self.graph[target_level][current_node_id]
+            except IndexError: neighbors = []
+
+            unvisited_neighbors = [n for n in neighbors if n not in visited]
+            if unvisited_neighbors:
+                 visited.update(unvisited_neighbors)
+                 neighbor_distances = self._distance(query_vec, unvisited_neighbors)
+                 for neighbor_id, neighbor_dist_val in zip(unvisited_neighbors, neighbor_distances.tolist()):
+                      if len(results_heap) < ef or neighbor_dist_val < -results_heap[0][0]:
+                           if len(results_heap) >= ef: heapq.heappop(results_heap)
+                           heapq.heappush(results_heap, (-neighbor_dist_val, neighbor_id))
+                      heapq.heappush(candidate_heap, (neighbor_dist_val, neighbor_id))
+        final_results = sorted([(abs(neg_dist), node_id) for neg_dist, node_id in results_heap])
+        return final_results
+
+    def add_point(self, point_vec):
+        """Adds a single point to the graph (simplified, identical to previous example)."""
+        point_vec, = _prepare_tensors(point_vec.flatten()) # Prepare input
+        new_node_id = self.node_count
+        self.vectors = torch.cat((self.vectors, point_vec.unsqueeze(0)), dim=0)
+        self.node_count += 1
+        node_level = self._get_level_for_new_node()
+        self.level_assignments.append(node_level)
+        while node_level >= len(self.graph): self.graph.append([])
+        for lvl in range(len(self.graph)):
+             while len(self.graph[lvl]) <= new_node_id: self.graph[lvl].append([])
+
+        current_entry_point = self.entry_point
+        current_max_level = self.max_level
+        if current_entry_point == -1:
+            self.entry_point = new_node_id
+            self.max_level = node_level
+            return new_node_id
+
+        ep = [current_entry_point]
+        for level in range(current_max_level, node_level, -1):
+             search_results = self._search_layer(point_vec, ep, level, ef=1)
+             if not search_results: break
+             ep = [search_results[0][1]]
+
+        for level in range(min(node_level, current_max_level), -1, -1):
+            neighbors_found = self._search_layer(point_vec, ep, level, self.ef_construction)
+            selected_neighbor_ids = [nid for dist, nid in neighbors_found[:self.M]]
+            self.graph[level][new_node_id] = selected_neighbor_ids
+            for neighbor_id in selected_neighbor_ids:
+                 neighbor_connections = self.graph[level][neighbor_id]
+                 if len(neighbor_connections) < self.M: # Simple add, no pruning
+                      neighbor_connections.append(new_node_id)
+            ep = [nid for dist, nid in neighbors_found] # Update entry points for next level
+
+        if node_level > self.max_level:
+            self.max_level = node_level
+            self.entry_point = new_node_id
+        return new_node_id
+
+    def search_knn(self, query_vec, k):
+        """Searches for k nearest neighbors (identical to previous example)."""
+        if self.entry_point == -1: return []
+        query_vec, = _prepare_tensors(query_vec.flatten()) # Prepare query
+
+        ep = [self.entry_point]
+        current_max_level = self.max_level
+        for level in range(current_max_level, 0, -1):
+             search_results = self._search_layer(query_vec, ep, level, ef=1)
+             if not search_results: break
+             ep = [search_results[0][1]]
+        neighbors_found = self._search_layer(query_vec, ep, 0, self.ef_search)
+        return neighbors_found[:k]
+
+
+def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
+    """
+    Builds a simplified HNSW index for data A and performs approximate k-NN search
+    for queries X.
+
+    Args:
+        N_A (int): Number of database points.
+        D (int): Dimensionality.
+        A (torch.Tensor): Database vectors (N_A, D) on GPU.
+        X (torch.Tensor): Query vectors (Q, D) on GPU.
+        K (int): Number of neighbors to find.
+        M (int): HNSW parameter: max connections per layer.
+        ef_construction (int): HNSW parameter: construction beam width.
+        ef_search (int): HNSW parameter: search beam width.
+
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - topk_indices (torch.Tensor): Indices of the approximate K nearest neighbors (Q, K).
+            - topk_distances (torch.Tensor): Approx. squared L2 distances (Q, K).
+    """
+    A_prep, X_prep = _prepare_tensors(A, X)
+    Q = X_prep.shape[0]
+    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
+    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
+    assert X_prep.shape[1] == D, "D doesn't match X.shape[1]"
+    assert K > 0, "K must be positive"
+
+    print(f"Running ANN (HNSW): Q={Q}, N={N_A}, D={D}, K={K}")
+    print(f"HNSW Params: M={M}, efC={ef_construction}, efS={ef_search}")
+
+    # 1. Build the HNSW Index
+    start_build = time.time()
+    hnsw_index = SimpleHNSW_for_ANN(dim=D, M=M, ef_construction=ef_construction, ef_search=ef_search)
+    # Ensure A_prep is prepared *before* passing to add_point loop
+    hnsw_index.vectors = A_prep.clone() # Start with prepared data
+
+    # Add points (using pre-cloned data)
+    print("Building index...")
+    for i in range(N_A):
+        # We already cloned A_prep into hnsw_index.vectors.
+        # The add_point logic needs refining if we build incrementally vs copy all at once.
+        # For this structure, let's assume add_point just builds the graph links
+        # using the already present self.vectors tensor.
+        # We need to modify add_point slightly or call a separate build function.
+        # --> Let's stick to the original add_point logic for this example,
+        # which adds vectors one by one. This will be slow but follows the pattern.
+        # hnsw_index.add_point(A_prep[i]) # Original one-by-one add
+        # --> Simplified build for speed in this example: Just copy vectors, build graph later
+        # --> Reverting to original logic for clarity, even if slow build:
+        hnsw_index.add_point(A_prep[i]) # Call original add_point
+        if (i + 1) % (N_A // 10 + 1) == 0: # Progress indicator
+             print(f"  Added {i+1}/{N_A} points...")
+
+    end_build = time.time()
+    print(f"Index build time: {end_build - start_build:.2f} seconds")
+
+    # 2. Perform Search for each query
+    start_search = time.time()
+    all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device) # Use -1 for missing neighbors
+    all_distances = torch.full((Q, K), float('inf'), dtype=torch.float32, device=device)
+
+    print("Searching queries...")
+    for q_idx in range(Q):
+        # search_knn returns list of (dist, idx) tuples, sorted by dist
+        results = hnsw_index.search_knn(X_prep[q_idx], K)
+        num_results = len(results)
+        if num_results > 0:
+            q_dists = torch.tensor([res[0] for res in results], dtype=torch.float32, device=device)
+            q_indices = torch.tensor([res[1] for res in results], dtype=torch.int64, device=device)
+            all_distances[q_idx, :num_results] = q_dists
+            all_indices[q_idx, :num_results] = q_indices
+        if (q_idx + 1) % (Q // 10 + 1) == 0:
+             print(f"  Searched {q_idx+1}/{Q} queries...")
+
+    end_search = time.time()
+    print(f"ANN search time: {end_search - start_search:.4f} seconds")
+
+    return all_indices, all_distances
+
+# ============================================================================
+# Example Usage (Illustrative)
+# ============================================================================
+if __name__ == "__main__":
+    N_data = 5000
+    N_queries = 100
+    Dim = 128
+    K_val = 10
+
+    print("="*40)
+    print("Generating Data...")
+    print("="*40)
+    # Database vectors
+    A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
+    # Query vectors
+    X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
+
+
+    print("\n" + "="*40)
+    print("Testing distance_l2...")
+    print("="*40)
+    l2_dists = distance_l2(X_queries[:2], A_data[:5])
+    print("Sample L2 distances (squared) shape:", l2_dists.shape)
+    print(l2_dists)
+
+    print("\n" + "="*40)
+    print("Testing distance_cosine...")
+    print("="*40)
+    cos_dists = distance_cosine(X_queries[:2], A_data[:5])
+    print("Sample Cosine distances shape:", cos_dists.shape)
+    print(cos_dists)
+
+    print("\n" + "="*40)
+    print("Testing distance_manhattan...")
+    print("="*40)
+    man_dists = distance_manhattan(X_queries[:2], A_data[:5])
+    print("Sample Manhattan distances shape:", man_dists.shape)
+    print(man_dists)
+
+    print("\n" + "="*40)
+    print(f"Testing our_knn (K={K_val})...")
+    print("="*40)
+    knn_indices, knn_dists = our_knn(N_data, Dim, A_data, X_queries, K_val)
+    print("KNN results shape (Indices):", knn_indices.shape)
+    print("KNN results shape (Distances):", knn_dists.shape)
+    print("Sample KNN Indices (Query 0):\n", knn_indices[0])
+    print("Sample KNN Dists (Query 0):\n", knn_dists[0])
+
+
+    print("\n" + "="*40)
+    print(f"Testing our_kmeans (K=5)...")
+    print("="*40)
+    K_clusters = 5
+    kmeans_centroids, kmeans_assignments = our_kmeans(N_data, Dim, A_data, K_clusters)
+    print("KMeans centroids shape:", kmeans_centroids.shape)
+    print("KMeans assignments shape:", kmeans_assignments.shape)
+    print("Sample KMeans Assignments:\n", kmeans_assignments[:20])
+    # Verify counts
+    ids, counts = torch.unique(kmeans_assignments, return_counts=True)
+    print("Cluster counts:")
+    for id_val, count_val in zip(ids.tolist(), counts.tolist()):
+        print(f"  Cluster {id_val}: {count_val}")
+
+
+    print("\n" + "="*40)
+    print(f"Testing our_ann (HNSW, K={K_val})...")
+    print("="*40)
+    # Reduce HNSW params for quicker example run
+    ann_indices, ann_dists = our_ann(N_data, Dim, A_data, X_queries, K_val, M=10, ef_construction=50, ef_search=30)
+    print("ANN results shape (Indices):", ann_indices.shape)
+    print("ANN results shape (Distances):", ann_dists.shape)
+    print("Sample ANN Indices (Query 0):\n", ann_indices[0])
+    print("Sample ANN Dists (Query 0):\n", ann_dists[0])
+
+    # Optional: Compare ANN vs KNN recall for query 0
+    if N_queries > 0 and K_val > 0:
+        true_knn_ids = set(knn_indices[0].tolist())
+        approx_ann_ids = set(ann_indices[0].tolist())
+        # Remove potential -1 placeholders if K > actual neighbors found
+        approx_ann_ids.discard(-1)
+
+        recall = len(true_knn_ids.intersection(approx_ann_ids)) / K_val
+        print(f"\nANN Recall @ {K_val} for Query 0 (vs brute-force KNN): {recall:.2%}")
 '''
 def test_kmeans():
     N, D, A, K = testdata_kmeans("test_file.json")
@@ -125,7 +849,7 @@ def recall_rate(list1, list2):
     list2[K]: The top K nearest vectors ID
     """
     return len(set(list1) & set(list2)) / len(list1)
-'''
+
 def main():
     np.random.seed(0)
     #size = 1 << 20  # 1 million elements
@@ -173,3 +897,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
