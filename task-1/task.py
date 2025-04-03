@@ -393,40 +393,66 @@ def kmeans_update_kernel_part1(
     N, D, K,
     # --- Strides ---
     stride_an, stride_ad,
-    stride_ps_block, stride_ps_k, stride_ps_d,
-    stride_pc_block, stride_pc_k,
-    # --- Block Size ---
+    stride_ps_block, stride_ps_k, stride_ps_d, # Strides for partial_sums
+    stride_pc_block, stride_pc_k,              # Strides for partial_counts
+    # --- Block Sizes ---
     BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr, # ADDED BLOCK_SIZE_D for dimension iteration
 ):
-    """Calculates partial sums and counts using atomics."""
-    pid_n_block = tl.program_id(axis=0) # Block ID
+    """
+    Calculates partial sums and counts using atomics by iterating dimensions.
+    """
+    pid_n_block = tl.program_id(axis=0) # Block ID for points
+    # Calculate offsets for points handled by this block
     offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    mask_n = offs_n < N
+    mask_n = offs_n < N # Mask for valid points in this block
 
+    # Load assignments for this block (load once)
     assignments_ptrs = assignments_ptr + offs_n
-    assignments = tl.load(assignments_ptrs, mask=mask_n, other=-1) # Shape (BLOCK_SIZE_N,)
+    # Shape (BLOCK_SIZE_N,) ; load -1 for out-of-bounds points
+    assignments = tl.load(assignments_ptrs, mask=mask_n, other=-1)
+    # Create a combined mask for points that are valid AND have a valid assignment (>=0)
+    valid_assignment_mask = mask_n & (assignments >= 0)
 
-    A_block_ptrs = A_ptr + offs_n[:, None] * stride_an + tl.arange(0, D)[None, :] * stride_ad
+    # Iterate over dimensions in blocks to perform atomic adds for sums
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        # Calculate dimension offsets and mask for the current block
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < D
 
-    # Atomic updates for sums (dimension by dimension)
-    for d_idx in tl.static_range(D):
-        a_d = tl.load(A_block_ptrs + d_idx * stride_ad, mask=mask_n, other=0.0) # (BLOCK_SIZE_N,)
-        assigned_clusters = assignments # (BLOCK_SIZE_N,)
+        # Load data block A for these points and dimensions
+        # Pointer calculation needs base_ptr + row_offset + col_offset
+        # Shape (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        a_ptrs = A_ptr + offs_n[:, None] * stride_an + offs_d[None, :] * stride_ad
+        # Load safely using the combined valid_assignment_mask and dimension mask
+        # Only load data for points that have a valid assignment
+        a_vals = tl.load(a_ptrs, mask=valid_assignment_mask[:, None] & mask_d[None, :], other=0.0)
+
+        # Calculate target pointers for partial sums for this dimension block
+        # Need pointers corresponding to each element in a_vals (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        # Base: partial_sums_ptr
+        # Block offset: pid_n_block * stride_ps_block
+        # Cluster (row) offset: assignments[:, None] * stride_ps_k (broadcast assignments)
+        # Dimension (col) offset: offs_d[None, :] * stride_ps_d (broadcast dimension offsets)
         partial_sums_target_ptrs = (partial_sums_ptr +
-                                    pid_n_block * stride_ps_block +
-                                    assigned_clusters * stride_ps_k +
-                                    d_idx * stride_ps_d)
-        valid_update_mask = mask_n & (assigned_clusters >= 0)
-        tl.atomic_add(partial_sums_target_ptrs, a_d, mask=valid_update_mask)
+                                    pid_n_block * stride_ps_block +       # Select block row
+                                    assignments[:, None] * stride_ps_k + # Select cluster row (broadcast)
+                                    offs_d[None, :] * stride_ps_d)        # Select dimension cols (broadcast)
 
-    # Atomic updates for counts (once per point)
+        # Perform atomic add for the entire block loaded into a_vals
+        # Use the same mask as the load to ensure atomics only happen for valid elements
+        tl.atomic_add(partial_sums_target_ptrs, a_vals,
+                      mask=valid_assignment_mask[:, None] & mask_d[None, :])
+
+    # Atomic Add for Partial Counts (only needs to be done once per point)
+    # Calculate output pointer for partial counts based on block and assignment
+    # Target shape (BLOCK_SIZE_N,)
     partial_counts_target_ptrs = (partial_counts_ptr +
-                                  pid_n_block * stride_pc_block +
-                                  assignments * stride_pc_k)
-    valid_update_mask = mask_n & (assignments >= 0)
-    tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_update_mask)
+                                  pid_n_block * stride_pc_block +       # Select block row
+                                  assignments * stride_pc_k)           # Select cluster col based on assignment
 
-
+    # Add 1.0 for each valid point/assignment. Use the valid_assignment_mask directly.
+    tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_assignment_mask)
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
     Performs K-means clustering on data A using Triton kernels.
@@ -463,7 +489,8 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     BLOCK_SIZE_K_CHUNK_ASSIGN = 64 # Centroid chunking
     BLOCK_SIZE_N_UPDATE = 128
 # Define BLOCK_SIZE_D for kmeans_assign_kernel
-    BLOCK_SIZE_D_ASSIGN = DEFAULT_BLOCK_D # Use the same default as other kernels
+    BLOCK_SIZE_D_ASSIGN = DEFAULT_BLOCK_D
+    BLOCK_SIZE_D_UPDATE = DEFAULT_BLOCK_D # Define block size for update kernel as well
 
     grid_assign = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
     grid_update = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
@@ -481,21 +508,22 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
         BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
         BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN,
         BLOCK_SIZE_D=BLOCK_SIZE_D_ASSIGN
-    )
+        )
 
-        # --- 2. Update Step ---
         partial_sums = torch.zeros((num_blocks_n_update, K, D), dtype=torch.float32, device=device)
         partial_counts = torch.zeros((num_blocks_n_update, K), dtype=torch.float32, device=device)
 
         kmeans_update_kernel_part1[grid_update](
-            A_prep, assignments,
-            partial_sums, partial_counts,
-            N_A, D, K,
-            A_prep.stride(0), A_prep.stride(1),
-            partial_sums.stride(0), partial_sums.stride(1), partial_sums.stride(2),
-            partial_counts.stride(0), partial_counts.stride(1),
-            BLOCK_SIZE_N=BLOCK_SIZE_N_UPDATE
+        A_prep, assignments,
+        partial_sums, partial_counts,
+        N_A, D, K,
+        A_prep.stride(0), A_prep.stride(1),
+        partial_sums.stride(0), partial_sums.stride(1), partial_sums.stride(2),
+        partial_counts.stride(0), partial_counts.stride(1),
+        BLOCK_SIZE_N=BLOCK_SIZE_N_UPDATE,
+        BLOCK_SIZE_D=BLOCK_SIZE_D_UPDATE 
         )
+
 
         # Reduce partials
         final_sums = partial_sums.sum(dim=0)
