@@ -316,47 +316,73 @@ def kmeans_assign_kernel(
     # --- Dimensions ---
     N, D, K,
     # --- Strides ---
-    stride_an, stride_ad, # Strides for A
-    stride_ck, stride_cd, # Strides for centroids
-    # --- Block Sizes (Tuning parameters) ---
+    stride_an, stride_ad,
+    stride_ck, stride_cd,
+    # --- Block Sizes ---
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K_CHUNK: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr, # ADDED BLOCK_SIZE_D for dimension iteration
 ):
-    """Assigns each point in A to the nearest centroid (Squared L2)."""
-    pid_n = tl.program_id(axis=0) # ID for the N dimension block
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    mask_n = offs_n < N
-    A_block_ptrs = A_ptr + offs_n[:, None] * stride_an + tl.arange(0, D)[None, :] * stride_ad # (BLOCK_SIZE_N, D)
+    """Assigns each point in A to the nearest centroid (Squared L2) by iterating dimensions."""
+    pid_n_block = tl.program_id(axis=0) # ID for the N dimension block
+    offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) # Range for points in block
+    mask_n = offs_n < N # Mask for points in this block
 
+    # Initialize minimum distance and best assignment for points in this block
     min_dist_sq = tl.full((BLOCK_SIZE_N,), float('inf'), dtype=tl.float32)
     best_assignment = tl.zeros((BLOCK_SIZE_N,), dtype=tl.int32)
 
+    # Iterate through centroids in chunks for better cache (?) locality
     for k_start in range(0, K, BLOCK_SIZE_K_CHUNK):
         k_end = tl.minimum(k_start + BLOCK_SIZE_K_CHUNK, K)
-        offs_k = k_start + tl.arange(0, BLOCK_SIZE_K_CHUNK)
+        # Note: Using tl.arange here for k_idx loop is fine as BLOCK_SIZE_K_CHUNK is constexpr
+        # but a simple python range is often clearer for the outer loops.
 
+        # Iterate through each centroid within the current chunk
         for k_idx in range(BLOCK_SIZE_K_CHUNK):
             actual_k = k_start + k_idx
-            if actual_k < k_end:
-                # Load centroid k
-                current_centroid_ptr = centroids_ptr + actual_k * stride_ck + tl.arange(0, D) * stride_cd
-                centroid = tl.load(current_centroid_ptr) # Shape (D,)
+            if actual_k < k_end: # Check if this centroid index is valid for the chunk/K
+                # Accumulate distance for this centroid (actual_k) across all dimension blocks
+                current_dist_sq = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
 
-                # Load points for this block
-                points = tl.load(A_block_ptrs, mask=mask_n[:, None], other=0.0) # (BLOCK_SIZE_N, D)
+                # Iterate over dimensions in blocks using BLOCK_SIZE_D
+                for d_start in range(0, D, BLOCK_SIZE_D):
+                    # Create offsets for the current dimension block
+                    offs_d = d_start + tl.arange(0, BLOCK_SIZE_D) # Uses constexpr BLOCK_SIZE_D
+                    mask_d = offs_d < D # Mask for valid dimensions in this block
 
-                # Calculate Squared L2 Distance
-                diff = points - centroid[None, :]
-                dist_sq = tl.sum(diff * diff, axis=1) # Shape (BLOCK_SIZE_N,)
+                    # Load centroid block for dimension d
+                    # Pointer: base + centroid_row * stride_k + dim_offset * stride_d
+                    centroid_d_ptr = centroids_ptr + actual_k * stride_ck + offs_d * stride_cd
+                    # Load safely using mask; shape (BLOCK_SIZE_D,)
+                    centroid_vals = tl.load(centroid_d_ptr, mask=mask_d, other=0.0)
 
-                # Update Minimum
-                is_closer = dist_sq < min_dist_sq
-                min_dist_sq = tl.where(is_closer, dist_sq, min_dist_sq)
+                    # Load points block for dimension d
+                    # Base pointer for point row `n`: A_ptr + n * stride_an
+                    # Pointer for point `n`, dim `d`: base + d * stride_ad
+                    # Need shape (BLOCK_SIZE_N, BLOCK_SIZE_D)
+                    # Offset for points: offs_n[:, None] * stride_an
+                    # Offset for dims: offs_d[None, :] * stride_ad
+                    points_d_ptr = A_ptr + offs_n[:, None] * stride_an + offs_d[None, :] * stride_ad
+                    # Load safely using masks; shape (BLOCK_SIZE_N, BLOCK_SIZE_D)
+                    points_vals = tl.load(points_d_ptr, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+
+                    # Calculate difference squared for this dimension block
+                    # Broadcasting happens: (BLOCK_N, BLOCK_D) - (BLOCK_D,) -> (BLOCK_N, BLOCK_D)
+                    diff = points_vals - centroid_vals[None, :]
+                    # Sum squared diffs over the dimension block axis=1 -> (BLOCK_N,)
+                    current_dist_sq += tl.sum(diff * diff, axis=1)
+
+                # --- Update Minimum Distance and Assignment ---
+                # Compare accumulated distance for centroid 'actual_k' with the current minimum
+                is_closer = current_dist_sq < min_dist_sq
+                min_dist_sq = tl.where(is_closer, current_dist_sq, min_dist_sq)
                 best_assignment = tl.where(is_closer, actual_k, best_assignment)
 
+    # --- Store Results ---
+    # Store the best assignment found for each point in this block
     assignments_out_ptrs = assignments_ptr + offs_n
     tl.store(assignments_out_ptrs, best_assignment, mask=mask_n)
-
 @triton.jit
 def kmeans_update_kernel_part1(
     A_ptr,              # Pointer to data points (N, D)
@@ -436,6 +462,8 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     BLOCK_SIZE_N_ASSIGN = 128
     BLOCK_SIZE_K_CHUNK_ASSIGN = 64 # Centroid chunking
     BLOCK_SIZE_N_UPDATE = 128
+# Define BLOCK_SIZE_D for kmeans_assign_kernel
+    BLOCK_SIZE_D_ASSIGN = DEFAULT_BLOCK_D # Use the same default as other kernels
 
     grid_assign = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
     grid_update = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
@@ -444,15 +472,16 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     for i in range(max_iters):
         iter_start_time = time.time()
 
-        # --- 1. Assignment Step ---
+    # --- 1. Assignment Step ---
         kmeans_assign_kernel[grid_assign](
-            A_prep, centroids, assignments,
-            N_A, D, K,
-            A_prep.stride(0), A_prep.stride(1),
-            centroids.stride(0), centroids.stride(1),
-            BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
-            BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN
-        )
+        A_prep, centroids, assignments,
+        N_A, D, K,
+        A_prep.stride(0), A_prep.stride(1),
+        centroids.stride(0), centroids.stride(1),
+        BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
+        BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN,
+        BLOCK_SIZE_D=BLOCK_SIZE_D_ASSIGN
+    )
 
         # --- 2. Update Step ---
         partial_sums = torch.zeros((num_blocks_n_update, K, D), dtype=torch.float32, device=device)
