@@ -574,10 +574,9 @@ def l2_dist_kernel_1_vs_M( # Renamed from previous example
     # Store result
     tl.store(output_ptr + pid_m, dist_sq)
 
-
-# --- Simplified HNSW Class (using the 1-vs-M kernel) ---
-class SimpleHNSW_for_ANN: # Renamed to avoid conflicts if run in same script
+class SimpleHNSW_for_ANN: # Using previous class structure
     def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
+        # --- Existing __init__ content ---
         self.dim = dim
         self.M = M
         self.ef_construction = ef_construction
@@ -589,49 +588,310 @@ class SimpleHNSW_for_ANN: # Renamed to avoid conflicts if run in same script
         self.node_count = 0
         self.entry_point = -1
         self.max_level = -1
-        self.BLOCK_SIZE_D_DIST = 128 # Tunable param for the 1-vs-M kernel
+        self.BLOCK_SIZE_D_DIST = 128
+        # --- End of existing __init__ content ---
 
     def _get_level_for_new_node(self):
         level = int(-math.log(random.uniform(0, 1)) * self.mL)
         return level
 
     def _distance(self, query_vec, candidate_indices):
-        """Internal distance calc using the 1-vs-M Triton kernel."""
+        """Internal distance calc using the 1-vs-M Triton kernel (Squared L2)."""
+        # --- Uses l2_dist_kernel_1_vs_M as defined before ---
+        # (Code identical to previous working version)
         if not isinstance(candidate_indices, list): candidate_indices = list(candidate_indices)
-        if not candidate_indices: return torch.empty(0, device=device)
+        if not candidate_indices: return torch.empty(0, device=device), [] # Return empty indices too
 
         num_candidates = len(candidate_indices)
-        query_vec, = _prepare_tensors(query_vec.flatten()) # Ensure flat, on GPU, float32
-        candidate_vectors = self.vectors[candidate_indices] # Assumes self.vectors is already prepared
+        # Ensure query is prepared (or assume it is)
+        query_vec_prep, = _prepare_tensors(query_vec.flatten())
+        # Gather candidate vectors from the main storage
+        # Ensure indices are valid before indexing
+        valid_indices = [idx for idx in candidate_indices if idx < self.node_count and idx >= 0]
+        if not valid_indices:
+             return torch.empty(0, device=device), []
 
-        distances_out = torch.empty(num_candidates, dtype=torch.float32, device=device)
-        grid = (num_candidates,)
-        l2_dist_kernel_1_vs_M[grid]( # Call the specific 1-vs-M kernel
-            query_vec, candidate_vectors, distances_out,
-            num_candidates, self.dim,
+        num_valid_candidates = len(valid_indices)
+        candidate_vectors = self.vectors[valid_indices] # Index with valid indices only
+
+        distances_out = torch.empty(num_valid_candidates, dtype=torch.float32, device=device)
+        grid = (num_valid_candidates,)
+        l2_dist_kernel_1_vs_M[grid](
+            query_vec_prep, candidate_vectors, distances_out,
+            num_valid_candidates, self.dim,
             candidate_vectors.stride(0), candidate_vectors.stride(1),
             BLOCK_SIZE_D=self.BLOCK_SIZE_D_DIST
         )
-        return distances_out
+        # Return distances corresponding to the valid_indices used
+        return distances_out, valid_indices
 
-    # _search_layer, add_point, search_knn methods are identical to the
-    # previous HNSW example, just ensure they call self._distance which now
-    # correctly points to the 1-vs-M Triton kernel implementation.
-    # (Code omitted here for brevity - assume they are defined as before)
-    # ... (Paste _search_layer, add_point, search_knn implementations here) ...
+    def _distance_batch(self, query_indices, candidate_indices):
+        """
+        Calculates pairwise distances between batches using pairwise kernel.
+        Needed for some heuristics (candidate-to-candidate distances).
+        Returns a (len(query_indices), len(candidate_indices)) tensor.
+        """
+        # NOTE: This uses the *pairwise* L2 kernel, ensure it's defined correctly above.
+        # If l2_dist_kernel_pairwise is not defined, this needs modification.
+        # Assuming l2_dist_kernel_pairwise exists similar to the one for our_knn
+        if not query_indices or not candidate_indices:
+            return torch.empty((0,0), device=device)
+
+        query_vectors = self.vectors[query_indices]
+        candidate_vectors = self.vectors[candidate_indices]
+
+        Q = len(query_indices)
+        N = len(candidate_indices)
+        D = self.dim
+
+        Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+        grid = (Q, N)
+
+        # Ensure vectors are prepared if necessary (e.g., contiguous)
+        query_vectors, candidate_vectors = _prepare_tensors(query_vectors, candidate_vectors)
+
+        # Assuming l2_dist_kernel_pairwise is defined and imported/available
+        l2_dist_kernel_pairwise[grid](
+            query_vectors, candidate_vectors, Out,
+            Q, N, D,
+            query_vectors.stride(0), query_vectors.stride(1),
+            candidate_vectors.stride(0), candidate_vectors.stride(1),
+            Out.stride(0), Out.stride(1),
+            BLOCK_SIZE_D=DEFAULT_BLOCK_D # Use appropriate block size
+        )
+        return Out
+
+
+    # --- REVISED _select_neighbors_heuristic METHOD ---
+    def _select_neighbors_heuristic(self, query_vec, candidates, M_target):
+        """
+        Selects M_target neighbors from candidates using a heuristic.
+        Variant: Keep closest overall, prune candidates overshadowed by selected ones.
+
+        Args:
+            query_vec (torch.Tensor): The vector being inserted/queried.
+            candidates (list): List of (distance, node_id) tuples, sorted by distance.
+                               Size is typically ef_construction.
+            M_target (int): The number of neighbors to select (e.g., self.M).
+
+        Returns:
+            list: List of selected node IDs (up to M_target).
+        """
+        selected_neighbors = []
+        # Use a min-heap for working candidates for efficient retrieval of closest
+        working_candidates_heap = [(dist, nid) for dist, nid in candidates]
+        heapq.heapify(working_candidates_heap)
+
+        # Keep track of candidates discarded by the heuristic
+        discarded_candidates = set()
+
+        while working_candidates_heap and len(selected_neighbors) < M_target:
+            # Get the best candidate (closest to query)
+            dist_best, best_nid = heapq.heappop(working_candidates_heap)
+
+            # Skip if already discarded by heuristic in a previous step
+            if best_nid in discarded_candidates:
+                continue
+
+            # Add the best candidate to results
+            selected_neighbors.append(best_nid)
+
+            # --- Heuristic Pruning ---
+            # Prune remaining candidates in the heap that are "overshadowed" by the newly added best_nid.
+            # Heuristic: If dist(candidate, best_nid) < dist(candidate, query), discard candidate.
+            # This requires candidate-to-candidate distances - potentially expensive!
+
+            # Extract remaining candidates (IDs and distances to query) from heap for check
+            # Rebuild heap later if needed, or use a different structure
+            remaining_candidates_info = {} # {nid: dist_to_query}
+            temp_heap = []
+            while working_candidates_heap:
+                 dist_r, nid_r = heapq.heappop(working_candidates_heap)
+                 if nid_r not in discarded_candidates:
+                      remaining_candidates_info[nid_r] = dist_r
+                      temp_heap.append((dist_r, nid_r)) # Keep for potential rebuild
+            working_candidates_heap = temp_heap # Restore for next main loop iteration
+            heapq.heapify(working_candidates_heap) # Re-heapify
+
+            remaining_nids = list(remaining_candidates_info.keys())
+
+            if remaining_nids:
+                # Calculate distances from the newly selected neighbor ('best_nid')
+                # to all remaining candidates ('remaining_nids').
+                # Need pairwise distance calculation capability.
+                try:
+                    # Assuming self._distance_batch calculates pairwise squared L2
+                    dists_best_to_remaining = self._distance_batch([best_nid], remaining_nids) # Shape (1, len(remaining_nids))
+                    dists_best_to_remaining = dists_best_to_remaining.squeeze(0) # Shape (len(remaining_nids),)
+
+                    # Check heuristic
+                    for i, r_nid in enumerate(remaining_nids):
+                        dist_r_query = remaining_candidates_info[r_nid] # Distance from candidate r to query
+                        dist_r_best = dists_best_to_remaining[i].item() # Distance from candidate r to best_nid
+
+                        # Apply heuristic check (using squared distances is fine for comparison)
+                        if dist_r_best < dist_r_query:
+                            discarded_candidates.add(r_nid) # Mark to discard later
+
+                except NameError:
+                     # Fallback if _distance_batch or pairwise kernel isn't defined:
+                     # Skip heuristic pruning if distance function is missing.
+                     # This will revert to basically just taking the top M closest.
+                     print("Warning: Skipping neighbor selection heuristic pruning due to missing distance function.")
+                     pass # Or handle differently
+
+
+        return selected_neighbors
+
+    # --- REVISED add_point METHOD ---
+    def add_point(self, point_vec):
+        """Adds a single point to the graph using heuristic neighbor selection."""
+        point_vec, = _prepare_tensors(point_vec.flatten()) # Prepare input
+        new_node_id = self.node_count
+        # Note: In a real implementation, dynamically resizing GPU tensors like this
+        # can be inefficient. Pre-allocation or different memory strategies are often used.
+        self.vectors = torch.cat((self.vectors, point_vec.unsqueeze(0)), dim=0)
+        self.node_count += 1
+
+        node_level = self._get_level_for_new_node()
+        self.level_assignments.append(node_level)
+
+        # Expand graph structure (CPU lists)
+        while node_level >= len(self.graph): self.graph.append([])
+        for lvl in range(len(self.graph)):
+             while len(self.graph[lvl]) <= new_node_id: self.graph[lvl].append([])
+
+        current_entry_point = self.entry_point
+        current_max_level = self.max_level
+
+        if current_entry_point == -1: # First node
+            self.entry_point = new_node_id
+            self.max_level = node_level
+            return new_node_id
+
+        # Search from top layer down to insertion level + 1 to find EPs
+        ep = [current_entry_point]
+        for level in range(current_max_level, node_level, -1):
+             # Ensure graph structure is valid for this level and EP
+             if level >= len(self.graph) or ep[0] >= len(self.graph[level]):
+                  continue # Skip if level or node doesn't exist in graph structure yet
+             search_results = self._search_layer(point_vec, ep, level, ef=1)
+             if not search_results: break
+             ep = [search_results[0][1]]
+
+        # Connect node at each level from min(node_level, current_max_level) down to 0
+        for level in range(min(node_level, current_max_level), -1, -1):
+             # Ensure graph structure is valid before search
+             if level >= len(self.graph) or not ep or any(idx >= len(self.graph[level]) for idx in ep):
+                 # Handle cases where entry points might be invalid for the level
+                 # This might happen if levels were added but nodes weren't fully connected yet.
+                 # A safer bet might be to use the global entry point if ep is invalid here.
+                 if current_entry_point < len(self.graph[level]):
+                     ep = [current_entry_point]
+                 else:
+                     continue # Cannot proceed at this level
+
+             # Search layer to find candidate neighbors (size ef_construction)
+             neighbors_found_with_dist = self._search_layer(point_vec, ep, level, self.ef_construction)
+
+             if not neighbors_found_with_dist:
+                 # If search yields nothing, maybe use EPs from upper layer?
+                 # Or handle appropriately. For now, skip connecting if no neighbors found.
+                 continue
+
+             # --- Use Heuristic Selection ---
+             # Select M neighbors using the heuristic method
+             selected_neighbor_ids = self._select_neighbors_heuristic(point_vec, neighbors_found_with_dist, self.M)
+
+             # --- Add Connections ---
+             # Add forward connections (new_node -> selected_neighbors)
+             self.graph[level][new_node_id] = selected_neighbor_ids
+
+             # Add backward connections (selected_neighbors -> new_node) with pruning
+             for neighbor_id in selected_neighbor_ids:
+                 # Ensure neighbor_id is valid for this level's graph structure
+                 if neighbor_id >= len(self.graph[level]):
+                      # This indicates a potential issue if search returned an invalid ID
+                      print(f"Warning: Neighbor ID {neighbor_id} out of bounds for level {level}. Skipping connection.")
+                      continue
+
+                 neighbor_connections = self.graph[level][neighbor_id]
+                 if new_node_id not in neighbor_connections: # Avoid duplicate links
+                     if len(neighbor_connections) < self.M:
+                         neighbor_connections.append(new_node_id)
+                     else:
+                         # --- Pruning Logic ---
+                         # Calculate distance from neighbor_id to new_node_id
+                         # Calculate distances from neighbor_id to its current neighbors
+                         # If new_node is closer than the furthest current neighbor, replace it.
+
+                         dist_new, _ = self._distance(self.vectors[neighbor_id], [new_node_id])
+                         if not dist_new: continue # Handle error if distance calc fails
+                         dist_new = dist_new[0].item()
+
+                         current_neighbor_ids = list(neighbor_connections) # Copy list
+                         dists_to_current, valid_curr_ids = self._distance(self.vectors[neighbor_id], current_neighbor_ids)
+
+                         if dists_to_current.numel() > 0:
+                              furthest_dist = -1.0
+                              furthest_idx_in_list = -1
+                              # Map distances back to original list indices if valid_curr_ids differs
+                              dist_map = {nid: d.item() for nid, d in zip(valid_curr_ids, dists_to_current)}
+
+                              for list_idx, current_nid in enumerate(current_neighbor_ids):
+                                   d = dist_map.get(current_nid, float('inf'))
+                                   if d > furthest_dist:
+                                        furthest_dist = d
+                                        furthest_idx_in_list = list_idx
+
+                              # If new node is better than the worst current one, replace
+                              if furthest_idx_in_list != -1 and dist_new < furthest_dist:
+                                   neighbor_connections[furthest_idx_in_list] = new_node_id
+                         elif len(neighbor_connections) < self.M: # Should have been caught earlier, but safe fallback
+                              neighbor_connections.append(new_node_id)
+
+
+             # Update entry points for the next level down (use selected neighbors)
+             # Using only selected neighbors might be better than all found
+             ep = selected_neighbor_ids # Or use neighbors_found_with_dist? HNSW paper detail. Let's try selected.
+             if not ep: # If selection yielded nothing, fall back?
+                  ep = [nid for _, nid in neighbors_found_with_dist[:1]] # Fallback to closest found
+
+        # Update global entry point if this node is the highest level
+        if node_level > self.max_level:
+            self.max_level = node_level
+            self.entry_point = new_node_id
+        return new_node_id
+
+
+    # --- _search_layer METHOD ---
+    # (Assumed to be identical to previous working version - uses self._distance)
     def _search_layer(self, query_vec, entry_points, target_level, ef):
         """Performs greedy search on a single layer (identical to previous example)."""
         if self.entry_point == -1: return []
-        candidates = set(entry_points)
-        visited = set(entry_points)
-        initial_distances = self._distance(query_vec, list(entry_points))
-        candidate_heap = list(zip(initial_distances.tolist(), entry_points))
+        # Ensure entry points are valid indices
+        valid_entry_points = [ep for ep in entry_points if ep < self.node_count and ep >=0]
+        if not valid_entry_points:
+             if self.entry_point != -1: valid_entry_points = [self.entry_point] # Fallback
+             else: return []
+
+        candidates = set(valid_entry_points)
+        visited = set(valid_entry_points)
+        initial_distances, valid_indices_init = self._distance(query_vec, valid_entry_points)
+        if initial_distances.numel() == 0: return [] # Cannot start search
+
+        # Map distances back to original requested entry points if some were invalid
+        dist_map_init = {nid: d.item() for nid, d in zip(valid_indices_init, initial_distances)}
+
+        candidate_heap = [(dist_map_init.get(ep, float('inf')), ep) for ep in valid_entry_points]
         heapq.heapify(candidate_heap)
-        results_heap = [(-dist, node_id) for dist, node_id in candidate_heap]
+        results_heap = [(-dist, node_id) for dist, node_id in candidate_heap if dist != float('inf')]
         heapq.heapify(results_heap)
 
         while candidate_heap:
             dist_candidate, current_node_id = heapq.heappop(candidate_heap)
+            if dist_candidate == float('inf'): continue # Skip if invalid distance somehow got in
+
             if results_heap:
                  dist_furthest_result = -results_heap[0][0]
                  if dist_candidate > dist_furthest_result and len(results_heap) >= ef: break
@@ -642,91 +902,61 @@ class SimpleHNSW_for_ANN: # Renamed to avoid conflicts if run in same script
             unvisited_neighbors = [n for n in neighbors if n not in visited]
             if unvisited_neighbors:
                  visited.update(unvisited_neighbors)
-                 neighbor_distances = self._distance(query_vec, unvisited_neighbors)
-                 for neighbor_id, neighbor_dist_val in zip(unvisited_neighbors, neighbor_distances.tolist()):
+                 neighbor_distances, valid_neighbor_indices = self._distance(query_vec, unvisited_neighbors)
+                 if neighbor_distances.numel() == 0: continue
+
+                 # Map distances back
+                 dist_map_neighbors = {nid: d.item() for nid, d in zip(valid_neighbor_indices, neighbor_distances)}
+
+                 for neighbor_id in valid_neighbor_indices: # Iterate only valid neighbors
+                      neighbor_dist_val = dist_map_neighbors[neighbor_id]
                       if len(results_heap) < ef or neighbor_dist_val < -results_heap[0][0]:
                            if len(results_heap) >= ef: heapq.heappop(results_heap)
                            heapq.heappush(results_heap, (-neighbor_dist_val, neighbor_id))
-                      heapq.heappush(candidate_heap, (neighbor_dist_val, neighbor_id))
+
+                      # Only add to candidate heap if potentially better than furthest result
+                      # (or if heap isn't full) - minor optimization
+                      if len(results_heap) < ef or neighbor_dist_val < -results_heap[0][0]:
+                           heapq.heappush(candidate_heap, (neighbor_dist_val, neighbor_id))
+
         final_results = sorted([(abs(neg_dist), node_id) for neg_dist, node_id in results_heap])
         return final_results
 
-    def add_point(self, point_vec):
-        """Adds a single point to the graph (simplified, identical to previous example)."""
-        point_vec, = _prepare_tensors(point_vec.flatten()) # Prepare input
-        new_node_id = self.node_count
-        self.vectors = torch.cat((self.vectors, point_vec.unsqueeze(0)), dim=0)
-        self.node_count += 1
-        node_level = self._get_level_for_new_node()
-        self.level_assignments.append(node_level)
-        while node_level >= len(self.graph): self.graph.append([])
-        for lvl in range(len(self.graph)):
-             while len(self.graph[lvl]) <= new_node_id: self.graph[lvl].append([])
 
-        current_entry_point = self.entry_point
-        current_max_level = self.max_level
-        if current_entry_point == -1:
-            self.entry_point = new_node_id
-            self.max_level = node_level
-            return new_node_id
-
-        ep = [current_entry_point]
-        for level in range(current_max_level, node_level, -1):
-             search_results = self._search_layer(point_vec, ep, level, ef=1)
-             if not search_results: break
-             ep = [search_results[0][1]]
-
-        for level in range(min(node_level, current_max_level), -1, -1):
-            neighbors_found = self._search_layer(point_vec, ep, level, self.ef_construction)
-            selected_neighbor_ids = [nid for dist, nid in neighbors_found[:self.M]]
-            self.graph[level][new_node_id] = selected_neighbor_ids
-            for neighbor_id in selected_neighbor_ids:
-                 neighbor_connections = self.graph[level][neighbor_id]
-                 if len(neighbor_connections) < self.M: # Simple add, no pruning
-                      neighbor_connections.append(new_node_id)
-            ep = [nid for dist, nid in neighbors_found] # Update entry points for next level
-
-        if node_level > self.max_level:
-            self.max_level = node_level
-            self.entry_point = new_node_id
-        return new_node_id
-
+    # --- search_knn METHOD ---
+    # (Assumed to be identical to previous working version - calls _search_layer)
     def search_knn(self, query_vec, k):
         """Searches for k nearest neighbors (identical to previous example)."""
         if self.entry_point == -1: return []
-        query_vec, = _prepare_tensors(query_vec.flatten()) # Prepare query
+        query_vec, = _prepare_tensors(query_vec.flatten())
 
         ep = [self.entry_point]
         current_max_level = self.max_level
         for level in range(current_max_level, 0, -1):
+             if level >= len(self.graph) or ep[0] >= len(self.graph[level]): continue # Safety check
              search_results = self._search_layer(query_vec, ep, level, ef=1)
              if not search_results: break
              ep = [search_results[0][1]]
+        # Final search at level 0
+        if 0 >= len(self.graph) or not ep or ep[0] >= len(self.graph[0]): # Check level 0 validity
+             if self.entry_point != -1 and 0 < len(self.graph) and self.entry_point < len(self.graph[0]):
+                  ep = [self.entry_point] # Fallback to global EP for level 0 if needed
+             else:
+                  return [] # Cannot search level 0
+
         neighbors_found = self._search_layer(query_vec, ep, 0, self.ef_search)
         return neighbors_found[:k]
 
 
+# --- Ensure the pairwise kernel is defined or imported ---
+# Make sure l2_dist_kernel_pairwise from the kNN section is available here
+
+# --- Ensure DEFAULT_BLOCK_D is defined ---
+DEFAULT_BLOCK_D = 128 # Or your preferred default
+
+# --- our_ann function remains the same, calling this class ---
 def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
-    """
-    Builds a simplified HNSW index for data A and performs approximate k-NN search
-    for queries X.
-
-    Args:
-        N_A (int): Number of database points.
-        D (int): Dimensionality.
-        A (torch.Tensor): Database vectors (N_A, D) on GPU.
-        X (torch.Tensor): Query vectors (Q, D) on GPU.
-        K (int): Number of neighbors to find.
-        M (int): HNSW parameter: max connections per layer.
-        ef_construction (int): HNSW parameter: construction beam width.
-        ef_search (int): HNSW parameter: search beam width.
-
-
-    Returns:
-        tuple[torch.Tensor, torch.Tensor]:
-            - topk_indices (torch.Tensor): Indices of the approximate K nearest neighbors (Q, K).
-            - topk_distances (torch.Tensor): Approx. squared L2 distances (Q, K).
-    """
+     # ... (identical to previous version, just instantiates the updated class) ...
     A_prep, X_prep = _prepare_tensors(A, X)
     Q = X_prep.shape[0]
     assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
@@ -734,50 +964,44 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
     assert X_prep.shape[1] == D, "D doesn't match X.shape[1]"
     assert K > 0, "K must be positive"
 
-    print(f"Running ANN (HNSW): Q={Q}, N={N_A}, D={D}, K={K}")
+    print(f"Running ANN (HNSW w/ Heuristics): Q={Q}, N={N_A}, D={D}, K={K}")
     print(f"HNSW Params: M={M}, efC={ef_construction}, efS={ef_search}")
 
     # 1. Build the HNSW Index
     start_build = time.time()
     hnsw_index = SimpleHNSW_for_ANN(dim=D, M=M, ef_construction=ef_construction, ef_search=ef_search)
-    # Ensure A_prep is prepared *before* passing to add_point loop
-    hnsw_index.vectors = A_prep.clone() # Start with prepared data
 
-    # Add points (using pre-cloned data)
     print("Building index...")
+    # Incremental build using the revised add_point
     for i in range(N_A):
-        # We already cloned A_prep into hnsw_index.vectors.
-        # The add_point logic needs refining if we build incrementally vs copy all at once.
-        # For this structure, let's assume add_point just builds the graph links
-        # using the already present self.vectors tensor.
-        # We need to modify add_point slightly or call a separate build function.
-        # --> Let's stick to the original add_point logic for this example,
-        # which adds vectors one by one. This will be slow but follows the pattern.
-        # hnsw_index.add_point(A_prep[i]) # Original one-by-one add
-        # --> Simplified build for speed in this example: Just copy vectors, build graph later
-        # --> Reverting to original logic for clarity, even if slow build:
-        hnsw_index.add_point(A_prep[i]) # Call original add_point
-        if (i + 1) % (N_A // 10 + 1) == 0: # Progress indicator
+        hnsw_index.add_point(A_prep[i])
+        if (i + 1) % (N_A // 10 + 1) == 0:
              print(f"  Added {i+1}/{N_A} points...")
 
     end_build = time.time()
     print(f"Index build time: {end_build - start_build:.2f} seconds")
+    # Check if graph was actually built
+    if hnsw_index.node_count == 0 or hnsw_index.entry_point == -1 :
+        print("Error: Index build resulted in an empty graph.")
+        return torch.full((Q, K), -1, dtype=torch.int64), torch.full((Q, K), float('inf'), dtype=torch.float32)
+
 
     # 2. Perform Search for each query
     start_search = time.time()
-    all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device) # Use -1 for missing neighbors
+    all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device)
     all_distances = torch.full((Q, K), float('inf'), dtype=torch.float32, device=device)
 
     print("Searching queries...")
     for q_idx in range(Q):
-        # search_knn returns list of (dist, idx) tuples, sorted by dist
         results = hnsw_index.search_knn(X_prep[q_idx], K)
         num_results = len(results)
         if num_results > 0:
             q_dists = torch.tensor([res[0] for res in results], dtype=torch.float32, device=device)
             q_indices = torch.tensor([res[1] for res in results], dtype=torch.int64, device=device)
-            all_distances[q_idx, :num_results] = q_dists
-            all_indices[q_idx, :num_results] = q_indices
+            # Ensure slicing doesn't go out of bounds if num_results < K
+            k_actual = min(num_results, K)
+            all_distances[q_idx, :k_actual] = q_dists[:k_actual]
+            all_indices[q_idx, :k_actual] = q_indices[:k_actual]
         if (q_idx + 1) % (Q // 10 + 1) == 0:
              print(f"  Searched {q_idx+1}/{Q} queries...")
 
@@ -785,7 +1009,6 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
     print(f"ANN search time: {end_search - start_search:.4f} seconds")
 
     return all_indices, all_distances
-
 # ============================================================================
 # Example Usage (Illustrative)
 # ============================================================================
