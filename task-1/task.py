@@ -383,7 +383,7 @@ def kmeans_assign_kernel(
     # Store the best assignment found for each point in this block
     assignments_out_ptrs = assignments_ptr + offs_n
     tl.store(assignments_out_ptrs, best_assignment, mask=mask_n)
-@triton.jit
+"""@triton.jit
 def kmeans_update_kernel_part1(
     A_ptr,              # Pointer to data points (N, D)
     assignments_ptr,    # Pointer to assignments (N,)
@@ -399,10 +399,7 @@ def kmeans_update_kernel_part1(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
 ):
-    """
-    Calculates partial sums and counts using atomics by iterating dimensions.
-    (mem_odr removed due to TypeError in installed Triton version)
-    """
+   
     pid_n_block = tl.program_id(axis=0) # Block ID for points
     offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     mask_n = offs_n < N
@@ -437,13 +434,15 @@ def kmeans_update_kernel_part1(
 
     # Add 1.0 for each valid point/assignment (without mem_odr)
     tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_assignment_mask) # Removed mem_odr
+    """
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
-    Performs K-means clustering on data A using Triton kernels.
+    Performs K-means clustering on data A using Triton kernel for assignment
+    and PyTorch scatter_add_ for the update step.
 
     Args:
-        N_A (int): Number of data points (should match A.shape[0]).
-        D (int): Dimensionality (should match A.shape[1]).
+        N_A (int): Number of data points.
+        D (int): Dimensionality.
         A (torch.Tensor): Data points (N_A, D) on GPU.
         K (int): Number of clusters.
         max_iters (int): Maximum number of iterations.
@@ -452,7 +451,7 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     Returns:
         tuple[torch.Tensor, torch.Tensor]:
             - centroids (torch.Tensor): Final centroids (K, D).
-            - assignments (torch.Tensor): Final cluster assignment for each point (N_A,).
+            - assignments (torch.Tensor): Final cluster assignment (N_A,).
     """
     A_prep, = _prepare_tensors(A)
     assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
@@ -460,72 +459,75 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     assert K > 0, "K must be positive"
     assert K <= N_A, "K cannot be larger than the number of data points"
 
-    print(f"Running K-Means: N={N_A}, D={D}, K={K}")
+    print(f"Running K-Means (Update with PyTorch): N={N_A}, D={D}, K={K}")
     start_time_total = time.time()
 
     # --- Initialization ---
     initial_indices = torch.randperm(N_A, device=device)[:K]
-    centroids = A_prep[initial_indices].clone() # Shape (K, D)
-    assignments = torch.empty(N_A, dtype=torch.int32, device=device)
+    centroids = A_prep[initial_indices].clone()
+    assignments = torch.empty(N_A, dtype=torch.int64, device=device) # Use int64 for scatter_add_ index
 
-    # --- Triton Kernel Launch Configuration ---
+    # --- Triton Kernel Launch Configuration (Only for Assignment) ---
     BLOCK_SIZE_N_ASSIGN = 128
-    BLOCK_SIZE_K_CHUNK_ASSIGN = 64 # Centroid chunking
-    BLOCK_SIZE_N_UPDATE = 128
-# Define BLOCK_SIZE_D for kmeans_assign_kernel
+    BLOCK_SIZE_K_CHUNK_ASSIGN = 64
     BLOCK_SIZE_D_ASSIGN = DEFAULT_BLOCK_D
-    BLOCK_SIZE_D_UPDATE = DEFAULT_BLOCK_D # Define block size for update kernel as well
 
     grid_assign = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
-    grid_update = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
-    num_blocks_n_update = triton.cdiv(N_A, BLOCK_SIZE_N_UPDATE)
 
     for i in range(max_iters):
         iter_start_time = time.time()
 
-    # --- 1. Assignment Step ---
+        # --- 1. Assignment Step (Uses Triton Kernel) ---
+        # Ensure assignments output tensor is int32 for the kernel if needed, then cast
+        assignments_int32 = torch.empty(N_A, dtype=torch.int32, device=device)
         kmeans_assign_kernel[grid_assign](
-        A_prep, centroids, assignments,
-        N_A, D, K,
-        A_prep.stride(0), A_prep.stride(1),
-        centroids.stride(0), centroids.stride(1),
-        BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
-        BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN,
-        BLOCK_SIZE_D=BLOCK_SIZE_D_ASSIGN
+            A_prep, centroids, assignments_int32, # Use int32 tensor here
+            N_A, D, K,
+            A_prep.stride(0), A_prep.stride(1),
+            centroids.stride(0), centroids.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
+            BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN,
+            BLOCK_SIZE_D=BLOCK_SIZE_D_ASSIGN
         )
+        # Cast assignments to int64 for scatter_add_ index
+        assignments = assignments_int32.to(torch.int64)
+        # Synchronize needed? PyTorch usually handles it, but maybe add for safety before PyTorch ops
+        # torch.cuda.synchronize()
 
-        partial_sums = torch.zeros((num_blocks_n_update, K, D), dtype=torch.float32, device=device)
-        partial_counts = torch.zeros((num_blocks_n_update, K), dtype=torch.float32, device=device)
+        # --- 2. Update Step (Uses PyTorch scatter_add_) ---
+        update_start_time = time.time()
 
-        kmeans_update_kernel_part1[grid_update](
-        A_prep, assignments,
-        partial_sums, partial_counts,
-        N_A, D, K,
-        A_prep.stride(0), A_prep.stride(1),
-        partial_sums.stride(0), partial_sums.stride(1), partial_sums.stride(2),
-        partial_counts.stride(0), partial_counts.stride(1),
-        BLOCK_SIZE_N=BLOCK_SIZE_N_UPDATE,
-        BLOCK_SIZE_D=BLOCK_SIZE_D_UPDATE 
-        )
+        new_sums = torch.zeros_like(centroids) # Shape (K, D)
+        cluster_counts = torch.zeros(K, dtype=torch.float32, device=device) # Shape (K,)
 
+        # Expand assignments to match the dimensions of A_prep for scatter_add_ on sums
+        # index tensor needs same number of dimensions as src tensor (A_prep)
+        idx_expand = assignments.unsqueeze(1).expand(N_A, D)
 
-        # Reduce partials
-        final_sums = partial_sums.sum(dim=0)
-        final_counts = partial_counts.sum(dim=0)
+        # Add data points to corresponding centroid sums
+        new_sums.scatter_add_(dim=0, index=idx_expand, src=A_prep)
+
+        # Add 1 to counts for each data point's assigned cluster
+        cluster_counts.scatter_add_(dim=0, index=assignments, src=torch.ones_like(assignments, dtype=torch.float32))
 
         # Calculate new centroids, handle empty clusters
-        final_counts_safe = final_counts.unsqueeze(1).clamp(min=1.0)
-        new_centroids = final_sums / final_counts_safe
-        empty_cluster_mask = (final_counts == 0)
+        # Clamp counts to minimum 1 to avoid division by zero
+        final_counts_safe = cluster_counts.clamp(min=1.0)
+        new_centroids = new_sums / final_counts_safe.unsqueeze(1) # Use broadcasting
+
         # Keep old centroid if cluster becomes empty
+        empty_cluster_mask = (cluster_counts == 0)
+        # Use torch.where for efficient conditional assignment if needed, direct masking often works
         new_centroids[empty_cluster_mask] = centroids[empty_cluster_mask]
+
+        update_time = time.time() - update_start_time
 
         # --- Check Convergence ---
         centroid_diff = torch.norm(new_centroids - centroids)
         centroids = new_centroids # Update centroids
 
         iter_end_time = time.time()
-        print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff:.4f} | Time: {iter_end_time - iter_start_time:.4f}s")
+        print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff:.4f} | Assign Time: {update_start_time - iter_start_time:.4f}s | Update Time: {update_time:.4f}s")
 
         if centroid_diff < tol:
             print(f"Converged after {i+1} iterations.")
@@ -537,8 +539,8 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     total_time = time.time() - start_time_total
     print(f"Total K-Means time: {total_time:.4f}s")
 
+    # Return int64 assignments consistent with internal use
     return centroids, assignments
-
 
 # ============================================================================
 # Task 2.2: Approximate Nearest Neighbors (Simplified HNSW)
