@@ -400,8 +400,8 @@ def kmeans_update_kernel_part1(
     BLOCK_SIZE_D: tl.constexpr,
 ):
     """
-    Calculates partial sums and counts using atomics by iterating dimensions,
-    using relaxed memory order for compatibility.
+    Calculates partial sums and counts using atomics by iterating dimensions.
+    (mem_odr removed due to TypeError in installed Triton version)
     """
     pid_n_block = tl.program_id(axis=0) # Block ID for points
     offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -426,19 +426,17 @@ def kmeans_update_kernel_part1(
                                     assignments[:, None] * stride_ps_k +
                                     offs_d[None, :] * stride_ps_d)
 
-        # Perform atomic add for the sums block with RELAXED memory order
+        # Perform atomic add for the sums block (without mem_odr)
         tl.atomic_add(partial_sums_target_ptrs, a_vals,
-                      mask=valid_assignment_mask[:, None] & mask_d[None, :],
-                      mem_odr="relaxed") # <--- Specify relaxed memory order
+                      mask=valid_assignment_mask[:, None] & mask_d[None, :]) # Removed mem_odr
 
     # Atomic Add for Partial Counts (only needs to be done once per point)
     partial_counts_target_ptrs = (partial_counts_ptr +
                                   pid_n_block * stride_pc_block +
                                   assignments * stride_pc_k)
 
-    # Add 1.0 for each valid point/assignment with RELAXED memory order
-    tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_assignment_mask,
-                  mem_odr="relaxed") # <--- Specify relaxed memory order
+    # Add 1.0 for each valid point/assignment (without mem_odr)
+    tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_assignment_mask) # Removed mem_odr
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
     Performs K-means clustering on data A using Triton kernels.
