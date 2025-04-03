@@ -393,66 +393,52 @@ def kmeans_update_kernel_part1(
     N, D, K,
     # --- Strides ---
     stride_an, stride_ad,
-    stride_ps_block, stride_ps_k, stride_ps_d, # Strides for partial_sums
-    stride_pc_block, stride_pc_k,              # Strides for partial_counts
+    stride_ps_block, stride_ps_k, stride_ps_d,
+    stride_pc_block, stride_pc_k,
     # --- Block Sizes ---
     BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr, # ADDED BLOCK_SIZE_D for dimension iteration
+    BLOCK_SIZE_D: tl.constexpr,
 ):
     """
-    Calculates partial sums and counts using atomics by iterating dimensions.
+    Calculates partial sums and counts using atomics by iterating dimensions,
+    using relaxed memory order for compatibility.
     """
     pid_n_block = tl.program_id(axis=0) # Block ID for points
-    # Calculate offsets for points handled by this block
     offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    mask_n = offs_n < N # Mask for valid points in this block
+    mask_n = offs_n < N
 
-    # Load assignments for this block (load once)
     assignments_ptrs = assignments_ptr + offs_n
-    # Shape (BLOCK_SIZE_N,) ; load -1 for out-of-bounds points
     assignments = tl.load(assignments_ptrs, mask=mask_n, other=-1)
-    # Create a combined mask for points that are valid AND have a valid assignment (>=0)
     valid_assignment_mask = mask_n & (assignments >= 0)
 
-    # Iterate over dimensions in blocks to perform atomic adds for sums
+    # Iterate over dimensions in blocks for sums
     for d_start in range(0, D, BLOCK_SIZE_D):
-        # Calculate dimension offsets and mask for the current block
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
         mask_d = offs_d < D
 
-        # Load data block A for these points and dimensions
-        # Pointer calculation needs base_ptr + row_offset + col_offset
-        # Shape (BLOCK_SIZE_N, BLOCK_SIZE_D)
+        # Load data block A
         a_ptrs = A_ptr + offs_n[:, None] * stride_an + offs_d[None, :] * stride_ad
-        # Load safely using the combined valid_assignment_mask and dimension mask
-        # Only load data for points that have a valid assignment
         a_vals = tl.load(a_ptrs, mask=valid_assignment_mask[:, None] & mask_d[None, :], other=0.0)
 
-        # Calculate target pointers for partial sums for this dimension block
-        # Need pointers corresponding to each element in a_vals (BLOCK_SIZE_N, BLOCK_SIZE_D)
-        # Base: partial_sums_ptr
-        # Block offset: pid_n_block * stride_ps_block
-        # Cluster (row) offset: assignments[:, None] * stride_ps_k (broadcast assignments)
-        # Dimension (col) offset: offs_d[None, :] * stride_ps_d (broadcast dimension offsets)
+        # Calculate target pointers for partial sums
         partial_sums_target_ptrs = (partial_sums_ptr +
-                                    pid_n_block * stride_ps_block +       # Select block row
-                                    assignments[:, None] * stride_ps_k + # Select cluster row (broadcast)
-                                    offs_d[None, :] * stride_ps_d)        # Select dimension cols (broadcast)
+                                    pid_n_block * stride_ps_block +
+                                    assignments[:, None] * stride_ps_k +
+                                    offs_d[None, :] * stride_ps_d)
 
-        # Perform atomic add for the entire block loaded into a_vals
-        # Use the same mask as the load to ensure atomics only happen for valid elements
+        # Perform atomic add for the sums block with RELAXED memory order
         tl.atomic_add(partial_sums_target_ptrs, a_vals,
-                      mask=valid_assignment_mask[:, None] & mask_d[None, :])
+                      mask=valid_assignment_mask[:, None] & mask_d[None, :],
+                      mem_odr="relaxed") # <--- Specify relaxed memory order
 
     # Atomic Add for Partial Counts (only needs to be done once per point)
-    # Calculate output pointer for partial counts based on block and assignment
-    # Target shape (BLOCK_SIZE_N,)
     partial_counts_target_ptrs = (partial_counts_ptr +
-                                  pid_n_block * stride_pc_block +       # Select block row
-                                  assignments * stride_pc_k)           # Select cluster col based on assignment
+                                  pid_n_block * stride_pc_block +
+                                  assignments * stride_pc_k)
 
-    # Add 1.0 for each valid point/assignment. Use the valid_assignment_mask directly.
-    tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_assignment_mask)
+    # Add 1.0 for each valid point/assignment with RELAXED memory order
+    tl.atomic_add(partial_counts_target_ptrs, 1.0, mask=valid_assignment_mask,
+                  mem_odr="relaxed") # <--- Specify relaxed memory order
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
     Performs K-means clustering on data A using Triton kernels.
