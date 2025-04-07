@@ -1042,6 +1042,12 @@ if __name__ == "__main__":
     A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
     # Query vectors
     X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
+    dlpack_A = torch.to_dlpack(A_data)
+    dlpack_X = torch.to_dlpack(X_queries)
+
+# 2. Import DLPack capsule into CuPy array
+    A_data_cp = cp.from_dlpack(dlpack_A)
+    X_queries_cp = cp.from_dlpack(dlpack_X)
 
     start_time = time.time()
     print("\n" + "="*40)
@@ -1092,7 +1098,7 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_dot...")
     print("="*40)
-    dot2_dists = distance_dot2(X_queries[:2], A_data[:5])
+    dot2_dists = distance_dot2(X_queries_cp[:2], A_data_cp[:5])
     print("Sample dot distances (squared) shape:", dot2_dists.shape)
     print(dot2_dists)
     end_time = time.time()
@@ -1103,7 +1109,7 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_l2...")
     print("="*40)
-    l22_dists = distance_l22(X_queries[:2], A_data[:5])
+    l22_dists = distance_l22(X_queries_cp[:2], A_data_cp[:5])
     print("Sample L2 distances (squared) shape:", l22_dists.shape)
     print(l22_dists)
     end_time = time.time()
@@ -1114,7 +1120,7 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_cosine...")
     print("="*40)
-    cos_dists2 = distance_cosine2(X_queries[:2], A_data[:5])
+    cos_dists2 = distance_cosine2(X_queries_cp[:2], A_data_cp[:5])
     print("Sample Cosine distances shape:", cos_dists2.shape)
     print(cos_dists2)
     end_time = time.time()
@@ -1125,7 +1131,7 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_manhattan...")
     print("="*40)
-    man_dists2 = distance_manhattan2(X_queries[:2], A_data[:5])
+    man_dists2 = distance_manhattan2(X_queries_cp[:2], A_data_cp[:5])
     print("Sample Manhattan distances shape:", man_dists2.shape)
     print(man_dists2)
     end_time = time.time()
