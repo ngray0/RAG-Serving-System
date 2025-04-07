@@ -271,7 +271,7 @@ def distance_dot2(X, Y):
     # X_cp shape: (N, D), Y_cp shape: (M, D)
     # Output shape: (N, M)
     print(f"Calculating pairwise dot products for shapes: {X_cp.shape} and {Y_cp.shape}")
-    return cp.einsum('ik,ik->ij', X, Y)
+    return cp.einsum('ik,jk->ij', X, Y)
 
 def distance_manhattan2(X, Y):
     return cp.sum(cp.abs(X - Y), axis=1)
