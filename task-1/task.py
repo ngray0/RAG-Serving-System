@@ -5,6 +5,7 @@ import math
 import heapq # For HNSW priority queues
 import random
 import time
+import cupy as cp
 
 # --- Ensure GPU is available ---
 if not torch.cuda.is_available():
@@ -254,6 +255,22 @@ def distance_manhattan(X, A):
         BLOCK_SIZE_D=DEFAULT_BLOCK_D
     )
     return Out
+
+def distance_cosine2(X, Y):
+    norm_X = cp.linalg.norm(X, axis=1) 
+    norm_Y = cp.linalg.norm(Y, axis=1)
+    cosine_similarity = cp.einsum('ij,ij->i', X, Y) / (norm_X * norm_Y)
+    return 1 - cosine_similarity
+
+def distance_l22(X, Y):
+    return cp.linalg.norm(X - Y, axis=1)
+
+def distance_dot2(X, Y):
+    return cp.einsum('ij,ij->i', X, Y)
+
+def distance_manhattan2(X, Y):
+    return cp.sum(cp.abs(X - Y), axis=1)
+
 
 # ============================================================================
 # Task 1.2: k-Nearest Neighbors (Brute Force)
@@ -1026,27 +1043,95 @@ if __name__ == "__main__":
     # Query vectors
     X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
 
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot_dists = distance_dot(X_queries[:2], A_data[:5])
+    print("Sample dot distances (squared) shape:", dot_dists.shape)
+    print(dot_dists)
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
 
+
+    start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_l2...")
     print("="*40)
     l2_dists = distance_l2(X_queries[:2], A_data[:5])
     print("Sample L2 distances (squared) shape:", l2_dists.shape)
     print(l2_dists)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
 
+
+    start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_cosine...")
     print("="*40)
     cos_dists = distance_cosine(X_queries[:2], A_data[:5])
     print("Sample Cosine distances shape:", cos_dists.shape)
     print(cos_dists)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
 
+
+    start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_manhattan...")
     print("="*40)
     man_dists = distance_manhattan(X_queries[:2], A_data[:5])
     print("Sample Manhattan distances shape:", man_dists.shape)
     print(man_dists)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+
+
+    start_time = time.time()
+
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot2_dists = distance_dot2(X_queries[:2], A_data[:5])
+    print("Sample dot distances (squared) shape:", dot2_dists.shape)
+    print(dot2_dists)
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
+
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_l2...")
+    print("="*40)
+    l22_dists = distance_l22(X_queries[:2], A_data[:5])
+    print("Sample L2 distances (squared) shape:", l22_dists.shape)
+    print(l22_dists)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_cosine...")
+    print("="*40)
+    cos_dists2 = distance_cosine2(X_queries[:2], A_data[:5])
+    print("Sample Cosine distances shape:", cos_dists2.shape)
+    print(cos_dists2)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_manhattan...")
+    print("="*40)
+    man_dists2 = distance_manhattan2(X_queries[:2], A_data[:5])
+    print("Sample Manhattan distances shape:", man_dists2.shape)
+    print(man_dists2)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+
+
 
     print("\n" + "="*40)
     print(f"Testing our_knn (K={K_val})...")
