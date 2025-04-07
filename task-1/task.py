@@ -107,6 +107,85 @@ def dot_kernel_pairwise_tiled(
     out_ptrs = Out_ptr + (offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn)
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
+# --- NEW Optimized Tiled Manhattan (L1) Distance Kernel ---
+@triton.autotune(
+    configs=[
+        # Similar configs to dot product, adjust if needed based on L1 characteristics
+        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 2}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 4}),
+    ],
+    key=['Q', 'N', 'D'], # Dimensions influencing performance
+)
+@triton.jit
+def manhattan_kernel_pairwise_tiled(
+    X_ptr, A_ptr, Out_ptr,           # Data pointers
+    Q, N, D,                         # Matrix dimensions
+    stride_xq, stride_xd,            # Strides for X (row, col)
+    stride_an, stride_ad,            # Strides for A (row, col)
+    stride_outq, stride_outn,        # Strides for Out (row, col)
+    BLOCK_Q: tl.constexpr,           # Tile size for Q dimension
+    BLOCK_N: tl.constexpr,           # Tile size for N dimension
+    BLOCK_K: tl.constexpr,           # Tile size for D dimension (often called K)
+):
+    """
+    Calculates pairwise Manhattan (L1) distance using tiling:
+    Out[q, n] = sum(abs(X[q, :] - A[n, :]))
+    Each program instance computes a BLOCK_Q x BLOCK_N tile of the output.
+    """
+    # 1. Program ID and Offsets
+    pid_q_block = tl.program_id(axis=0)
+    pid_n_block = tl.program_id(axis=1)
+    offs_q = pid_q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # 2. Initialize Accumulator Tile for L1 distances
+    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float32)
+
+    # 3. Loop over the Dimension D (K dimension) in blocks of BLOCK_K
+    for k_start in range(0, D, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+
+        # --- Load X tile ---
+        x_ptrs = X_ptr + (offs_q[:, None] * stride_xq + offs_k[None, :] * stride_xd)
+        q_mask = offs_q[:, None] < Q
+        k_mask_x = offs_k[None, :] < D
+        x_mask = q_mask & k_mask_x
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0) # Shape (BLOCK_Q, BLOCK_K)
+
+        # --- Load A tile ---
+        a_ptrs = A_ptr + (offs_n[:, None] * stride_an + offs_k[None, :] * stride_ad)
+        n_mask = offs_n[:, None] < N
+        k_mask_a = offs_k[None, :] < D
+        a_mask = n_mask & k_mask_a
+        a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0) # Shape (BLOCK_N, BLOCK_K)
+
+        # --- Compute Absolute Differences and Sum ---
+        # Use broadcasting to calculate pairwise differences within tiles
+        # x_tile: (BLOCK_Q, BLOCK_K) -> (BLOCK_Q, 1, BLOCK_K)
+        # a_tile: (BLOCK_N, BLOCK_K) -> (1, BLOCK_N, BLOCK_K)
+        # Difference: (BLOCK_Q, BLOCK_N, BLOCK_K)
+        diff = x_tile[:, None, :] - a_tile[None, :, :]
+        abs_diff = tl.abs(diff)
+
+        # Sum absolute differences over the K dimension block (axis=2)
+        # Result shape: (BLOCK_Q, BLOCK_N)
+        accumulator += tl.sum(abs_diff, axis=2)
+
+    # 4. Store the Resulting Tile
+    out_ptrs = Out_ptr + (offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn)
+    out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, accumulator, mask=out_mask)
+
 
 
 # --- Manhattan Distance Kernel (Simple, Non-Tiled) ---
@@ -234,6 +313,30 @@ def _prepare_tensors(*tensors, target_device):
         # Kernels often benefit from contiguous memory
         prepared.append(t.contiguous())
     return prepared
+# --- NEW Launcher for Tiled Manhattan Distance ---
+def distance_manhattan_triton(X, A, **kwargs):
+    """Computes pairwise Manhattan (L1) distance using the tiled Triton kernel."""
+    target_device = X.device
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+    # print(f"Calculating pairwise Manhattan (Tiled Triton Kernel) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
+
+    Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
+    BLOCK_Q = kwargs.get('BLOCK_Q', DEFAULT_BLOCK_Q)
+    BLOCK_N = kwargs.get('BLOCK_N', DEFAULT_BLOCK_N)
+    grid = (ceil_div(Q, BLOCK_Q), ceil_div(N, BLOCK_N))
+    # print(f"Launching Triton Kernel manhattan_kernel_pairwise_tiled with grid={grid}") # Optional verbose
+
+    manhattan_kernel_pairwise_tiled[grid](
+        X_prep, A_prep, Out,
+        Q, N, D,
+        X_prep.stride(0), X_prep.stride(1), A_prep.stride(0), A_prep.stride(1),
+        Out.stride(0), Out.stride(1),
+        **kwargs # Pass autotuner kwargs like BLOCK_Q, BLOCK_N, BLOCK_K etc.
+    )
+    return Out
 
 # ============================================================================
 # Python Distance Function Wrappers using Triton / PyTorch
@@ -369,7 +472,72 @@ def distance_manhattan(X, A):
     )
     return Out
 
+def distance_cosine2(X, Y, epsilon=1e-8):
+   
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    print(f"Calculating pairwise Cosine for shapes: {X_cp.shape} and {Y_cp.shape}")
 
+    dot_products = X_cp @ Y_cp.T
+
+    norm_X = cp.linalg.norm(X_cp, axis=1, keepdims=True)
+    norm_Y = cp.linalg.norm(Y_cp, axis=1, keepdims=True)
+
+    norm_product = norm_X @ norm_Y.T
+
+    cosine_similarity = dot_products / (norm_product + epsilon)
+
+    cosine_similarity = cp.clip(cosine_similarity, -1.0, 1.0)
+
+    cosine_distance = 1.0 - cosine_similarity
+
+    return cosine_distance
+def distance_manhattan2(X, Y):
+  
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    print(f"Calculating pairwise Manhattan for shapes: {X_cp.shape} and {Y_cp.shape}")
+
+    X_reshaped = X_cp[:, None, :]
+    Y_reshaped = Y_cp[None, :, :]
+
+    abs_diff = cp.abs(X_reshaped - Y_reshaped)
+
+    manhattan_dists = cp.sum(abs_diff, axis=2)
+    return manhattan_dists
+
+def distance_l22(X, Y):
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    print(f"Calculating pairwise L2 for shapes: {X_cp.shape} and {Y_cp.shape}")
+
+    # Calculate squared L2 norms for each row. keepdims=True is important for broadcasting.
+    X_norm_sq = cp.sum(X_cp**2, axis=1, keepdims=True)  # Shape (N, 1)
+    Y_norm_sq = cp.sum(Y_cp**2, axis=1, keepdims=True)  # Shape (M, 1)
+
+    # Calculate all pairwise dot products: X @ Y.T
+    # Y_cp.T has shape (D, M)
+    dot_products = X_cp @ Y_cp.T  # Shape (N, M)
+
+    # Calculate squared L2 distances using broadcasting:
+    # ||X||^2              (N, 1) broadcasts to (N, M)
+    # - 2 * (X @ Y.T)     (N, M)
+    # + ||Y||^2.T         (M, 1).T -> (1, M) broadcasts to (N, M)
+    dist_sq = X_norm_sq - 2 * dot_products + Y_norm_sq.T
+
+    # Handle potential small negative values due to floating point inaccuracies
+    dist_sq = cp.maximum(0, dist_sq)
+
+    # Return L2 distance (square root of squared distance)
+    return cp.sqrt(dist_sq) # Shape (N, M)
+
+def distance_dot2(X, Y):
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    # X_cp shape: (N, D), Y_cp shape: (M, D)
+    # Output shape: (N, M)
+    print(f"Calculating pairwise dot products for shapes: {X_cp.shape} and {Y_cp.shape}")
+    return X_cp @ Y_cp.T
 # ============================================================================
 # Task 1.2: k-Nearest Neighbors (Brute Force)
 # ============================================================================
@@ -903,6 +1071,7 @@ if __name__ == "__main__":
     end_bench_time = time.time()
     avg_time = (end_bench_time - start_bench_time) / num_runs
     print(f"Average execution time ({num_runs} runs): {avg_time:.4f} seconds")
+    print(dot_kernel_pairwise_tiled.best_config)
 
     # --- Test Triton L2 ---
     start_time = time.time()
@@ -945,7 +1114,7 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_manhattan (Triton)...")
     print("="*40)
-    man_dists = distance_manhattan(X_queries, A_data)
+    man_dists = distance_manhattan_triton(X_queries, A_data)
     print("Manhattan distances shape:", man_dists.shape)
     print("Sample (first 2x5):\n", man_dists[:2,:5])
     end_time = time.time()
@@ -953,10 +1122,62 @@ if __name__ == "__main__":
     num_runs = 10
     start_bench_time = time.time()
     for _ in range(num_runs):
-        _ = distance_manhattan(X_queries, A_data)
+        _ = distance_manhattan_triton(X_queries, A_data)
     end_bench_time = time.time()
     avg_time = (end_bench_time - start_bench_time) / num_runs
     print(f"Average execution time ({num_runs} runs): {avg_time:.4f} seconds")
+
+    dlpack_A = torch.to_dlpack(A_data)
+    dlpack_X = torch.to_dlpack(X_queries)
+
+# 2. Import DLPack capsule into CuPy array
+    A_data_cp = cp.from_dlpack(dlpack_A)
+    X_queries_cp = cp.from_dlpack(dlpack_X)
+    print("CuPy testing....")
+  
+    start_time = time.time()
+
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot2_dists = distance_dot2(X_queries_cp, A_data_cp)
+    print("Sample dot distances (squared) shape:", dot2_dists.shape)
+    print(dot2_dists)
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
+
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_l2...")
+    print("="*40)
+    l22_dists = distance_l22(X_queries_cp, A_data_cp)
+    print("Sample L2 distances (squared) shape:", l22_dists.shape)
+    print(l22_dists)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_cosine...")
+    print("="*40)
+    cos_dists2 = distance_cosine2(X_queries_cp, A_data_cp)
+    print("Sample Cosine distances shape:", cos_dists2.shape)
+    print(cos_dists2)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_manhattan...")
+    print("="*40)
+    man_dists2 = distance_manhattan2(X_queries_cp, A_data_cp)
+    print("Sample Manhattan distances shape:", man_dists2.shape)
+    print(man_dists2)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
 
     # --- Test k-NN ---
     print("\n" + "="*40)
@@ -1000,84 +1221,19 @@ if __name__ == "__main__":
         approx_ann_ids.discard(-1)
         recall = len(true_knn_ids.intersection(approx_ann_ids)) / K_val
         print(f"\nANN Recall @ {K_val} for Query 0 (vs brute-force KNN): {recall:.2%}")
-"""
+'''
 def distance_cosine2(X, Y):
     norm_X = cp.linalg.norm(X, axis=1) 
     norm_Y = cp.linalg.norm(Y, axis=1)
     cosine_similarity = cp.einsum('ik,ik->ij', X, Y) / (norm_X * norm_Y)
     return 1 - cosine_similarity
-
-def distance_cosine2(X, Y, epsilon=1e-8):
-   
-    X_cp = cp.asarray(X)
-    Y_cp = cp.asarray(Y)
-    print(f"Calculating pairwise Cosine for shapes: {X_cp.shape} and {Y_cp.shape}")
-
-    dot_products = X_cp @ Y_cp.T
-
-    norm_X = cp.linalg.norm(X_cp, axis=1, keepdims=True)
-    norm_Y = cp.linalg.norm(Y_cp, axis=1, keepdims=True)
-
-    norm_product = norm_X @ norm_Y.T
-
-    cosine_similarity = dot_products / (norm_product + epsilon)
-
-    cosine_similarity = cp.clip(cosine_similarity, -1.0, 1.0)
-
-    cosine_distance = 1.0 - cosine_similarity
-
-    return cosine_distance
-def distance_manhattan2(X, Y):
-  
-    X_cp = cp.asarray(X)
-    Y_cp = cp.asarray(Y)
-    print(f"Calculating pairwise Manhattan for shapes: {X_cp.shape} and {Y_cp.shape}")
-
-    X_reshaped = X_cp[:, None, :]
-    Y_reshaped = Y_cp[None, :, :]
-
-    abs_diff = cp.abs(X_reshaped - Y_reshaped)
-
-    manhattan_dists = cp.sum(abs_diff, axis=2)
-    return manhattan_dists
-
-def distance_l22(X, Y):
-    X_cp = cp.asarray(X)
-    Y_cp = cp.asarray(Y)
-    print(f"Calculating pairwise L2 for shapes: {X_cp.shape} and {Y_cp.shape}")
-
-    # Calculate squared L2 norms for each row. keepdims=True is important for broadcasting.
-    X_norm_sq = cp.sum(X_cp**2, axis=1, keepdims=True)  # Shape (N, 1)
-    Y_norm_sq = cp.sum(Y_cp**2, axis=1, keepdims=True)  # Shape (M, 1)
-
-    # Calculate all pairwise dot products: X @ Y.T
-    # Y_cp.T has shape (D, M)
-    dot_products = X_cp @ Y_cp.T  # Shape (N, M)
-
-    # Calculate squared L2 distances using broadcasting:
-    # ||X||^2              (N, 1) broadcasts to (N, M)
-    # - 2 * (X @ Y.T)     (N, M)
-    # + ||Y||^2.T         (M, 1).T -> (1, M) broadcasts to (N, M)
-    dist_sq = X_norm_sq - 2 * dot_products + Y_norm_sq.T
-
-    # Handle potential small negative values due to floating point inaccuracies
-    dist_sq = cp.maximum(0, dist_sq)
-
-    # Return L2 distance (square root of squared distance)
-    return cp.sqrt(dist_sq) # Shape (N, M)
-
-def distance_dot2(X, Y):
-    X_cp = cp.asarray(X)
-    Y_cp = cp.asarray(Y)
-    # X_cp shape: (N, D), Y_cp shape: (M, D)
-    # Output shape: (N, M)
-    print(f"Calculating pairwise dot products for shapes: {X_cp.shape} and {Y_cp.shape}")
-    return X_cp @ Y_cp.T
+'''
 
 
+'''
 def distance_manhattan2(X, Y):
     return cp.sum(cp.abs(X - Y), axis=1)
-"""
+'''
 
 '''
 if __name__ == "__main__":
