@@ -760,7 +760,7 @@ if __name__ == "__main__":
     # Benchmark
     num_runs = 10
     start_bench_time = time.time()
-    for _ in range(num_runs): _ = distance_manhattan_triton(X_queries, A_data)
+    for _ in range(num_runs): _ = distance_manhattan_triton(X_queries, A_data, BLOCK_Q=16, BLOCK_N=16, BLOCK_K=16)
     end_bench_time = time.time()
     avg_time = (end_bench_time - start_bench_time) / num_runs
     print(f"Average Manhattan execution time ({num_runs} runs): {avg_time:.4f} seconds")
