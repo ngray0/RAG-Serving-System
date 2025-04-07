@@ -259,14 +259,14 @@ def distance_manhattan(X, A):
 def distance_cosine2(X, Y):
     norm_X = cp.linalg.norm(X, axis=1) 
     norm_Y = cp.linalg.norm(Y, axis=1)
-    cosine_similarity = cp.einsum('ij,ij->i', X, Y) / (norm_X * norm_Y)
+    cosine_similarity = cp.einsum('ik,ik->ij', X, Y) / (norm_X * norm_Y)
     return 1 - cosine_similarity
 
 def distance_l22(X, Y):
     return cp.linalg.norm(X - Y, axis=1)
 
 def distance_dot2(X, Y):
-    return cp.einsum('ij,ij->i', X, Y)
+    return cp.einsum('ik,ik->ij', X, Y)
 
 def distance_manhattan2(X, Y):
     return cp.sum(cp.abs(X - Y), axis=1)
