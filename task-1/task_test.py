@@ -853,8 +853,8 @@ if __name__ == "__main__":
     print("="*40)
     ann_indices, ann_dists = our_ann(N_data, Dim, A_data, X_queries, K_val,
                              M=32,              # Keep M for now
-                             ef_construction=200, # Keep efC for now
-                             ef_search=400) 
+                             ef_construction=300, # Keep efC for now
+                             ef_search=800) 
     print("ANN results shape (Indices):", ann_indices.shape)
     print("ANN results shape (Distances - Squared L2):", ann_dists.shape) # HNSW returns Squared L2
     # print("Sample ANN Indices (Query 0):\n", ann_indices[0]) # Optional print
