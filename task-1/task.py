@@ -266,6 +266,11 @@ def distance_l22(X, Y):
     return cp.linalg.norm(X - Y, axis=1)
 
 def distance_dot2(X, Y):
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    # X_cp shape: (N, D), Y_cp shape: (M, D)
+    # Output shape: (N, M)
+    print(f"Calculating pairwise dot products for shapes: {X_cp.shape} and {Y_cp.shape}")
     return cp.einsum('ik,ik->ij', X, Y)
 
 def distance_manhattan2(X, Y):
