@@ -700,6 +700,7 @@ if __name__ == "__main__":
     end_bench_time = time.time()
     avg_time = (end_bench_time - start_bench_time) / num_runs
     print(f"Average Dot execution time ({num_runs} runs): {avg_time:.4f} seconds")
+    print(dot_kernel_pairwise_tiled.best_config)
 
     # --- Test Triton L2 ---
     start_time = time.time()
@@ -737,6 +738,7 @@ if __name__ == "__main__":
     end_bench_time = time.time()
     avg_time = (end_bench_time - start_bench_time) / num_runs
     print(f"Average Cosine execution time ({num_runs} runs): {avg_time:.4f} seconds")
+    print("Best:", dot_kernel_pairwise_tiled.best_config)
 
     # --- Test NEW Tiled Triton Manhattan ---
     start_time = time.time()
@@ -756,6 +758,7 @@ if __name__ == "__main__":
     end_time = time.time()
     print(f"Manhattan distance (Tiled Triton) computation time: {end_time - start_time:.4f} seconds")
     # Benchmark
+    print("Best",manhattan_kernel_pairwise_tiled.best_config)
     num_runs = 10
     start_bench_time = time.time()
     for _ in range(num_runs): _ = distance_manhattan_triton(X_queries, A_data)
