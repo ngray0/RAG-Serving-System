@@ -255,15 +255,71 @@ def distance_manhattan(X, A):
         BLOCK_SIZE_D=DEFAULT_BLOCK_D
     )
     return Out
-
+"""
 def distance_cosine2(X, Y):
     norm_X = cp.linalg.norm(X, axis=1) 
     norm_Y = cp.linalg.norm(Y, axis=1)
     cosine_similarity = cp.einsum('ik,ik->ij', X, Y) / (norm_X * norm_Y)
     return 1 - cosine_similarity
+"""
+def distance_cosine2(X, Y, epsilon=1e-8):
+   
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    print(f"Calculating pairwise Cosine for shapes: {X_cp.shape} and {Y_cp.shape}")
+
+    dot_products = X_cp @ Y_cp.T
+
+    norm_X = cp.linalg.norm(X_cp, axis=1, keepdims=True)
+    norm_Y = cp.linalg.norm(Y_cp, axis=1, keepdims=True)
+
+    norm_product = norm_X @ norm_Y.T
+
+    cosine_similarity = dot_products / (norm_product + epsilon)
+
+    cosine_similarity = cp.clip(cosine_similarity, -1.0, 1.0)
+
+    cosine_distance = 1.0 - cosine_similarity
+
+    return cosine_distance
+def distance_manhattan2(X, Y):
+  
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    print(f"Calculating pairwise Manhattan for shapes: {X_cp.shape} and {Y_cp.shape}")
+
+    X_reshaped = X_cp[:, None, :]
+    Y_reshaped = Y_cp[None, :, :]
+
+    abs_diff = cp.abs(X_reshaped - Y_reshaped)
+
+    manhattan_dists = cp.sum(abs_diff, axis=2)
+    return manhattan_dists
 
 def distance_l22(X, Y):
-    return cp.linalg.norm(X - Y, axis=1)
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    print(f"Calculating pairwise L2 for shapes: {X_cp.shape} and {Y_cp.shape}")
+
+    # Calculate squared L2 norms for each row. keepdims=True is important for broadcasting.
+    X_norm_sq = cp.sum(X_cp**2, axis=1, keepdims=True)  # Shape (N, 1)
+    Y_norm_sq = cp.sum(Y_cp**2, axis=1, keepdims=True)  # Shape (M, 1)
+
+    # Calculate all pairwise dot products: X @ Y.T
+    # Y_cp.T has shape (D, M)
+    dot_products = X_cp @ Y_cp.T  # Shape (N, M)
+
+    # Calculate squared L2 distances using broadcasting:
+    # ||X||^2              (N, 1) broadcasts to (N, M)
+    # - 2 * (X @ Y.T)     (N, M)
+    # + ||Y||^2.T         (M, 1).T -> (1, M) broadcasts to (N, M)
+    dist_sq = X_norm_sq - 2 * dot_products + Y_norm_sq.T
+
+    # Handle potential small negative values due to floating point inaccuracies
+    dist_sq = cp.maximum(0, dist_sq)
+
+    # Return L2 distance (square root of squared distance)
+    return cp.sqrt(dist_sq) # Shape (N, M)
 
 def distance_dot2(X, Y):
     X_cp = cp.asarray(X)
@@ -271,10 +327,12 @@ def distance_dot2(X, Y):
     # X_cp shape: (N, D), Y_cp shape: (M, D)
     # Output shape: (N, M)
     print(f"Calculating pairwise dot products for shapes: {X_cp.shape} and {Y_cp.shape}")
-    return cp.einsum('ik,jk->ij', X, Y)
+    return X_cp @ Y_cp.T
+"""
 
 def distance_manhattan2(X, Y):
     return cp.sum(cp.abs(X - Y), axis=1)
+"""
 
 
 # ============================================================================
