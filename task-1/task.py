@@ -914,6 +914,13 @@ if __name__ == "__main__":
     print("Sample (first 2x5):\n", l2_dists[:2,:5])
     end_time = time.time()
     print(f"L2 distance (Triton) computation time: {end_time - start_time:.4f} seconds")
+    num_runs = 10
+    start_bench_time = time.time()
+    for _ in range(num_runs):
+        _ = distance_l2_triton(X_queries, A_data)
+    end_bench_time = time.time()
+    avg_time = (end_bench_time - start_bench_time) / num_runs
+    print(f"Average execution time ({num_runs} runs): {avg_time:.4f} seconds")
 
     # --- Test Triton Cosine ---
     start_time = time.time()
@@ -925,6 +932,13 @@ if __name__ == "__main__":
     print("Sample (first 2x5):\n", cos_dists[:2,:5])
     end_time = time.time()
     print(f"Cosine distance (Triton) computation time: {end_time - start_time:.4f} seconds")
+    num_runs = 10
+    start_bench_time = time.time()
+    for _ in range(num_runs):
+        _ = distance_cosine_triton(X_queries, A_data)
+    end_bench_time = time.time()
+    avg_time = (end_bench_time - start_bench_time) / num_runs
+    print(f"Average execution time ({num_runs} runs): {avg_time:.4f} seconds")
 
     # --- Test Triton Manhattan ---
     start_time = time.time()
@@ -936,6 +950,13 @@ if __name__ == "__main__":
     print("Sample (first 2x5):\n", man_dists[:2,:5])
     end_time = time.time()
     print(f"Manhattan distance (Triton) computation time: {end_time - start_time:.4f} seconds")
+    num_runs = 10
+    start_bench_time = time.time()
+    for _ in range(num_runs):
+        _ = distance_manhattan(X_queries, A_data)
+    end_bench_time = time.time()
+    avg_time = (end_bench_time - start_bench_time) / num_runs
+    print(f"Average execution time ({num_runs} runs): {avg_time:.4f} seconds")
 
     # --- Test k-NN ---
     print("\n" + "="*40)
