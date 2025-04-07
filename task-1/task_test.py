@@ -746,12 +746,12 @@ if __name__ == "__main__":
     print("="*40)
     # Run with fixed small blocks first to ensure it works without autotune potentially breaking it
     # Comment out the @triton.autotune above manhattan_kernel_pairwise_tiled when using fixed blocks
-    # print("Running Manhattan with fixed small blocks (16x16x16) for debugging...")
-    # man_dists = distance_manhattan_triton(X_queries, A_data, BLOCK_Q=16, BLOCK_N=16, BLOCK_K=16)
+    print("Running Manhattan with fixed small blocks (16x16x16) for debugging...")
+    man_dists = distance_manhattan_triton(X_queries, A_data, BLOCK_Q=16, BLOCK_N=16, BLOCK_K=16)
     # If the above works, re-enable autotune on the kernel and run normally:
     print("Running Manhattan with autotune...")
-    _ = distance_manhattan_triton(X_queries[:2], A_data[:5]) # Warm-up/autotune trigger small
-    man_dists = distance_manhattan_triton(X_queries, A_data) # Run on full data
+   # _ = distance_manhattan_triton(X_queries[:2], A_data[:5]) # Warm-up/autotune trigger small
+   # man_dists = distance_manhattan_triton(X_queries, A_data) # Run on full data
     print("Manhattan distances shape:", man_dists.shape)
     print("Sample (first 2x5):\n", man_dists[:2,:5])
     end_time = time.time()
