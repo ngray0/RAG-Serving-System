@@ -717,20 +717,28 @@ if __name__ == "__main__":
     print("Testing distance_dot_triton...")
     print("="*40)
     _ = distance_dot_triton(X_queries[:2], A_data[:5]) # Warm-up/autotune trigger small
+    torch.cuda.synchronize()
     dot_dists = distance_dot_triton(X_queries, A_data) # Run on full data
     print("Dot distances shape:", dot_dists.shape)
     print("Sample (first 2x5):\n", dot_dists[:2,:5])
     end_time = time.time()
     print(f"Dot distance (Triton) computation time: {end_time - start_time:.4f} seconds")
+    torch.cuda.synchronize()
     # Benchmark
     num_runs = 10
-    start_bench_time = time.time()
-    for _ in range(num_runs): _ = distance_dot_triton(X_queries, A_data)
-    end_bench_time = time.time()
-    avg_time = (end_bench_time - start_bench_time) / num_runs
-    print(f"Average Dot execution time ({num_runs} runs): {avg_time:.4f} seconds")
-    print(dot_kernel_pairwise_tiled.best_config)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
 
+    for _ in range(num_runs): _ = distance_dot_triton(X_queries, A_data)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event) # Time in milliseconds
+    avg_time_ms = elapsed_time_ms / num_runs
+    avg_time_s = avg_time_ms / 1000.0
+    print(f"Average Dot execution time {avg_time_s:.6f} seconds ({avg_time_ms:.4f} ms) seconds")
+    print(dot_kernel_pairwise_tiled.best_config)
+    
     # --- Test Triton L2 ---
     start_time = time.time()
     print("\n" + "="*40)
@@ -742,12 +750,19 @@ if __name__ == "__main__":
     end_time = time.time()
     print(f"L2 distance (Triton) computation time: {end_time - start_time:.4f} seconds")
     # Benchmark L2
+    torch.cuda.synchronize()
     num_runs = 10
-    start_bench_time = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+
     for _ in range(num_runs): _ = distance_l2_triton(X_queries, A_data)
-    end_bench_time = time.time()
-    avg_time = (end_bench_time - start_bench_time) / num_runs
-    print(f"Average L2 execution time ({num_runs} runs): {avg_time:.4f} seconds")
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event) # Time in milliseconds
+    avg_time_ms = elapsed_time_ms / num_runs
+    avg_time_s = avg_time_ms / 1000.0
+    print(f"Average L2 execution time {avg_time_s:.6f} seconds ({avg_time_ms:.4f} ms) seconds")
 
 
     # --- Test Triton Cosine ---
@@ -759,16 +774,23 @@ if __name__ == "__main__":
     print("Cosine distances shape:", cos_dists.shape)
     print("Sample (first 2x5):\n", cos_dists[:2,:5])
     end_time = time.time()
+    torch.cuda.synchronize()
     print(f"Cosine distance (Triton) computation time: {end_time - start_time:.4f} seconds")
     # Benchmark Cosine
     num_runs = 10
-    start_bench_time = time.time()
-    for _ in range(num_runs): _ = distance_cosine_triton(X_queries, A_data)
-    end_bench_time = time.time()
-    avg_time = (end_bench_time - start_bench_time) / num_runs
-    print(f"Average Cosine execution time ({num_runs} runs): {avg_time:.4f} seconds")
-    print("Best:", dot_kernel_pairwise_tiled.best_config)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
 
+    for _ in range(num_runs): _ = distance_cosine_triton(X_queries, A_data)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event) # Time in milliseconds
+    avg_time_ms = elapsed_time_ms / num_runs
+    avg_time_s = avg_time_ms / 1000.0
+    print(f"Average Cosine execution time {avg_time_s:.6f} seconds ({avg_time_ms:.4f} ms) seconds")
+    print("Best:", dot_kernel_pairwise_tiled.best_config)
+    torch.cuda.synchronize()
     # --- Test NEW Tiled Triton Manhattan ---
     start_time = time.time()
     print("\n" + "="*40)
@@ -780,8 +802,9 @@ if __name__ == "__main__":
    # man_dists = distance_manhattan_triton(X_queries, A_data, BLOCK_Q=16, BLOCK_N=16, BLOCK_K=16)
     # If the above works, re-enable autotune on the kernel and run normally:
     print("Running Manhattan with autotune...")
-   # _ = distance_manhattan_triton(X_queries[:2], A_data[:5]) # Warm-up/autotune trigger small
+    _ = distance_manhattan_triton(X_queries[:2], A_data[:5]) # Warm-up/autotune trigger small
     man_dists = distance_manhattan_triton(X_queries, A_data) # Run on full data
+    torch.cuda.synchronize()
     print("Manhattan distances shape:", man_dists.shape)
     print("Sample (first 2x5):\n", man_dists[:2,:5])
     end_time = time.time()
@@ -789,11 +812,17 @@ if __name__ == "__main__":
     # Benchmark
     print("Best",manhattan_kernel_pairwise_tiled.best_config)
     num_runs = 10
-    start_bench_time = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+
     for _ in range(num_runs): _ = distance_manhattan_triton(X_queries, A_data)
-    end_bench_time = time.time()
-    avg_time = (end_bench_time - start_bench_time) / num_runs
-    print(f"Average Manhattan execution time ({num_runs} runs): {avg_time:.4f} seconds")
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event) # Time in milliseconds
+    avg_time_ms = elapsed_time_ms / num_runs
+    avg_time_s = avg_time_ms / 1000.0
+    print(f"Average Manhattan execution time {avg_time_s:.6f} seconds ({avg_time_ms:.4f} ms) seconds")
 
     # --- Test k-NN ---
     print("\n" + "="*40)
@@ -823,7 +852,9 @@ if __name__ == "__main__":
     print(f"Testing our_ann (HNSW, K={K_val})...")
     print("="*40)
     ann_indices, ann_dists = our_ann(N_data, Dim, A_data, X_queries, K_val,
-                                 M=32, ef_construction=200, ef_search=100)
+                             M=32,              # Keep M for now
+                             ef_construction=200, # Keep efC for now
+                             ef_search=400) 
     print("ANN results shape (Indices):", ann_indices.shape)
     print("ANN results shape (Distances - Squared L2):", ann_dists.shape) # HNSW returns Squared L2
     # print("Sample ANN Indices (Query 0):\n", ann_indices[0]) # Optional print
