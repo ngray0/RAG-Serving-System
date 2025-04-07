@@ -20,7 +20,7 @@ print(f"Using device: {device}")
 # ============================================================================
 DEFAULT_BLOCK_Q = 32
 DEFAULT_BLOCK_N = 64
-DEFAULT_BLOCK_K = 64 # Block size for the reduction dimension D
+DEFAULT_BLOCK_K = 64 # Block size for the reduction dimension D (used by all tiled kernels)
 
 def ceil_div(a, b):
     return (a + b - 1) // b
@@ -28,7 +28,6 @@ def ceil_div(a, b):
 # --- Optimized Tiled Dot Product Kernel ---
 @triton.autotune(
     configs=[
-        # Basic configs with varying block sizes
         triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 2}),
         triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
         triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
@@ -39,7 +38,6 @@ def ceil_div(a, b):
         triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
         triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
         triton.Config({'BLOCK_Q': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
-        # Add num_stages variations
         triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
         triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 4}),
     ],
@@ -89,7 +87,7 @@ def dot_kernel_pairwise_tiled(
     tl.store(out_ptrs, accumulator, mask=out_mask)
 
 
-# --- NEW Optimized Tiled Manhattan (L1) Distance Kernel ---
+# --- Optimized Tiled Manhattan (L1) Distance Kernel ---
 @triton.autotune(
     configs=[
         # Similar configs to dot product, adjust if needed based on L1 characteristics
@@ -154,8 +152,11 @@ def manhattan_kernel_pairwise_tiled(
         # --- Compute Absolute Differences and Sum ---
         # Use broadcasting to calculate pairwise differences within tiles
         # x_tile: (BLOCK_Q, BLOCK_K) -> (BLOCK_Q, 1, BLOCK_K)
-        # a_tile: (BLOCK_N, BLOCK_K) -> (1, BLOCK_N, BLOCK_K)
-        # Difference: (BLOCK_Q, BLOCK_N, BLOCK_K)
+        # a_tile: (BLOCK_N, BLOCK_K) -> Transpose needed for broadcasting: (1, BLOCK_N, BLOCK_K) ?
+        # Let's load A transposed conceptually. Load a_tile as (BLOCK_K, BLOCK_N)
+        # No, the previous load loads A as (BLOCK_N, BLOCK_K). Correct.
+        # Broadcast: x_tile[:, None, :] - a_tile[None, :, :]
+        #   -> (BLOCK_Q, 1, BLOCK_K) - (1, BLOCK_N, BLOCK_K) -> (BLOCK_Q, BLOCK_N, BLOCK_K)
         diff = x_tile[:, None, :] - a_tile[None, :, :]
         abs_diff = tl.abs(diff)
 
@@ -311,7 +312,6 @@ def distance_cosine_triton(X, A, epsilon=1e-8, **kwargs):
     cosine_distance = 1.0 - cosine_similarity
     return cosine_distance
 
-# --- NEW Launcher for Tiled Manhattan Distance ---
 def distance_manhattan_triton(X, A, **kwargs):
     """Computes pairwise Manhattan (L1) distance using the tiled Triton kernel."""
     target_device = X.device
@@ -327,13 +327,19 @@ def distance_manhattan_triton(X, A, **kwargs):
     grid = (ceil_div(Q, BLOCK_Q), ceil_div(N, BLOCK_N))
     # print(f"Launching Triton Kernel manhattan_kernel_pairwise_tiled with grid={grid}") # Optional verbose
 
+    # Add synchronization for debugging hangs
     manhattan_kernel_pairwise_tiled[grid](
         X_prep, A_prep, Out,
         Q, N, D,
         X_prep.stride(0), X_prep.stride(1), A_prep.stride(0), A_prep.stride(1),
         Out.stride(0), Out.stride(1),
-        **kwargs # Pass autotuner kwargs like BLOCK_Q, BLOCK_N, BLOCK_K etc.
+        # Pass fixed block sizes for debugging, comment out autotune on kernel
+        # BLOCK_Q=16, BLOCK_N=16, BLOCK_K=16
+        # Or pass from autotuner via kwargs if autotune is enabled
+         **kwargs
     )
+    # Try uncommenting synchronize if debugging hangs persists
+    # torch.cuda.synchronize()
     return Out
 
 # ============================================================================
@@ -347,21 +353,12 @@ def our_knn(N_A, D, A, X, K):
     target_device = X.device
     A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
     Q = X_prep.shape[0]
-    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
-    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
-    assert X_prep.shape[1] == D, "D doesn't match X.shape[1]"
-    assert K > 0, "K must be positive"
-    assert K <= N_A, "K cannot be larger than the number of database points"
+    assert A_prep.shape[0] == N_A and A_prep.shape[1] == D and X_prep.shape[1] == D and K > 0 and K <= N_A
 
     print(f"Running k-NN: Q={Q}, N={N_A}, D={D}, K={K}")
     start_time = time.time()
-
-    # 1. Calculate all pairwise L2 distances using the new Triton+PyTorch function
     all_distances = distance_l2_triton(X_prep, A_prep) # Shape (Q, N_A) -> Returns actual L2
-
-    # 2. Find the top K smallest distances for each query
     topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
-
     end_time = time.time()
     print(f"k-NN computation time: {end_time - start_time:.4f} seconds")
     return topk_indices, topk_distances
@@ -386,7 +383,7 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     grid_assign = lambda meta: (triton.cdiv(N_A, meta['BLOCK_SIZE_N']),)
 
     for i in range(max_iters):
-        iter_start_time = time.time()
+        #iter_start_time = time.time() # Optional timing
         assignments_int32 = torch.empty(N_A, dtype=torch.int32, device=device)
         kmeans_assign_kernel[grid_assign](
             A_prep, centroids, assignments_int32,
@@ -395,7 +392,7 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
             BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN, BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN, BLOCK_SIZE_D=BLOCK_SIZE_D_ASSIGN
         )
         assignments = assignments_int32.to(torch.int64)
-        update_start_time = time.time()
+        #update_start_time = time.time() # Optional timing
         new_sums = torch.zeros_like(centroids)
         cluster_counts = torch.zeros(K, dtype=torch.float32, device=device)
         idx_expand = assignments.unsqueeze(1).expand(N_A, D)
@@ -405,7 +402,7 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
         new_centroids = new_sums / final_counts_safe.unsqueeze(1)
         empty_cluster_mask = (cluster_counts == 0)
         new_centroids[empty_cluster_mask] = centroids[empty_cluster_mask]
-        update_time = time.time() - update_start_time
+        #update_time = time.time() - update_start_time # Optional timing
         centroid_diff = torch.norm(new_centroids - centroids)
         centroids = new_centroids
         # print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff:.4f} | Assign Time: {update_start_time - iter_start_time:.4f}s | Update Time: {update_time:.4f}s") # Optional verbose
@@ -418,6 +415,7 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
 # ============================================================================
 # Task 2.2: Approximate Nearest Neighbors (Simplified HNSW)
 # ============================================================================
+# (Using the HNSW class provided in the previous version)
 class SimpleHNSW_for_ANN:
     # Uses l2_dist_kernel_1_vs_M and distance_l2_triton internally now
     def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
@@ -467,24 +465,19 @@ class SimpleHNSW_for_ANN:
             return torch.empty((len(query_indices), len(candidate_indices)), device=device)
         target_device = self.vectors.device
 
-        # Basic filtering, more robust checks might be needed
         valid_query_indices = [idx for idx in query_indices if idx < self.node_count and idx >= 0]
         valid_candidate_indices = [idx for idx in candidate_indices if idx < self.node_count and idx >= 0]
         if not valid_query_indices or not valid_candidate_indices:
-            # Decide return shape: maybe (0, 0) or match input lens with inf?
              return torch.empty((len(valid_query_indices), len(valid_candidate_indices)), device=target_device)
 
         query_vectors = self.vectors[valid_query_indices]
         candidate_vectors = self.vectors[valid_candidate_indices]
-        # Use the primary optimized L2 function
         pairwise_l2_distances = distance_l2_triton(query_vectors, candidate_vectors)
-        # Note: This returns actual L2. Callers might need adjustment if they expect squared L2.
         return pairwise_l2_distances # Shape (len(valid_query), len(valid_candidate))
 
     def _select_neighbors_heuristic(self, query_vec, candidates, M_target):
         """Selects M_target neighbors (implementation using squared L2 internally)."""
         selected_neighbors = []
-        # Candidates are (squared_dist, node_id) from _search_layer
         working_candidates_heap = [(dist, nid) for dist, nid in candidates]
         heapq.heapify(working_candidates_heap)
         discarded_candidates = set()
@@ -494,7 +487,6 @@ class SimpleHNSW_for_ANN:
             if best_nid in discarded_candidates: continue
             selected_neighbors.append(best_nid)
 
-            # --- Heuristic Pruning ---
             remaining_candidates_info = {}
             temp_heap = []
             while working_candidates_heap:
@@ -507,18 +499,16 @@ class SimpleHNSW_for_ANN:
             remaining_nids = list(remaining_candidates_info.keys())
 
             if remaining_nids:
-                # _distance_batch returns actual L2, square it for comparison
-                dists_best_to_remaining = self._distance_batch([best_nid], remaining_nids) # (1, len(remaining))
+                dists_best_to_remaining = self._distance_batch([best_nid], remaining_nids) # Actual L2
                 if dists_best_to_remaining.numel() > 0:
                     dists_best_to_remaining_sq = (dists_best_to_remaining**2).squeeze(0) # Squared L2
 
                     for i, r_nid in enumerate(remaining_nids):
                         dist_r_query_sq = remaining_candidates_info[r_nid] # Already squared L2
-                        if i < len(dists_best_to_remaining_sq): # Check bounds
+                        if i < len(dists_best_to_remaining_sq):
                            dist_r_best_sq = dists_best_to_remaining_sq[i].item()
                            if dist_r_best_sq < dist_r_query_sq:
                                discarded_candidates.add(r_nid)
-                        # else: handle index error if shapes mismatch - indicates issue in _distance_batch return
         return selected_neighbors
 
     def add_point(self, point_vec):
@@ -545,7 +535,7 @@ class SimpleHNSW_for_ANN:
         ep = [current_entry_point]
         for level in range(current_max_level, node_level, -1):
              if level >= len(self.graph) or not ep or ep[0] >= len(self.graph[level]): continue
-             search_results = self._search_layer(point_vec_prep, ep, level, ef=1)
+             search_results = self._search_layer(point_vec_prep, ep, level, ef=1) # Uses squared L2
              if not search_results: break
              ep = [search_results[0][1]]
 
@@ -554,7 +544,7 @@ class SimpleHNSW_for_ANN:
                  if current_entry_point < len(self.graph[level]): ep = [current_entry_point]
                  else: continue
 
-             neighbors_found_with_dist_sq = self._search_layer(point_vec_prep, ep, level, self.ef_construction)
+             neighbors_found_with_dist_sq = self._search_layer(point_vec_prep, ep, level, self.ef_construction) # Uses squared L2
              if not neighbors_found_with_dist_sq: continue
              selected_neighbor_ids = self._select_neighbors_heuristic(point_vec_prep, neighbors_found_with_dist_sq, self.M)
              self.graph[level][new_node_id] = selected_neighbor_ids
@@ -595,14 +585,12 @@ class SimpleHNSW_for_ANN:
              if self.entry_point != -1: valid_entry_points = [self.entry_point]
              else: return []
 
-        # _distance returns (squared_distances, valid_indices)
-        initial_distances_sq, valid_indices_init = self._distance(query_vec, valid_entry_points)
+        initial_distances_sq, valid_indices_init = self._distance(query_vec, valid_entry_points) # Squared L2
         if initial_distances_sq.numel() == 0: return []
 
         dist_map_init = {nid: d.item() for nid, d in zip(valid_indices_init, initial_distances_sq)}
         candidate_heap = [(dist_map_init.get(ep, float('inf')), ep) for ep in valid_entry_points]
         heapq.heapify(candidate_heap)
-        # Results heap stores (-squared_dist, node_id) for max-heap behavior
         results_heap = [(-dist_sq, node_id) for dist_sq, node_id in candidate_heap if dist_sq != float('inf')]
         heapq.heapify(results_heap)
         visited = set(valid_entry_points)
@@ -619,8 +607,7 @@ class SimpleHNSW_for_ANN:
             unvisited_neighbors = [n for n in neighbors if n not in visited]
             if unvisited_neighbors:
                  visited.update(unvisited_neighbors)
-                 # _distance returns (squared_distances, valid_indices)
-                 neighbor_distances_sq, valid_neighbor_indices = self._distance(query_vec, unvisited_neighbors)
+                 neighbor_distances_sq, valid_neighbor_indices = self._distance(query_vec, unvisited_neighbors) # Squared L2
                  if neighbor_distances_sq.numel() == 0: continue
 
                  dist_map_neighbors = {nid: d.item() for nid, d in zip(valid_neighbor_indices, neighbor_distances_sq)}
@@ -643,13 +630,13 @@ class SimpleHNSW_for_ANN:
         current_max_level = self.max_level
         for level in range(current_max_level, 0, -1):
              if level >= len(self.graph) or not ep or ep[0] >= len(self.graph[level]): continue
-             search_results = self._search_layer(query_vec_prep, ep, level, ef=1)
+             search_results = self._search_layer(query_vec_prep, ep, level, ef=1) # Squared L2
              if not search_results: break
              ep = [search_results[0][1]]
         if 0 >= len(self.graph) or not ep or ep[0] >= len(self.graph[0]):
              if self.entry_point != -1 and 0 < len(self.graph) and self.entry_point < len(self.graph[0]): ep = [self.entry_point]
              else: return []
-        neighbors_found = self._search_layer(query_vec_prep, ep, 0, self.ef_search)
+        neighbors_found = self._search_layer(query_vec_prep, ep, 0, self.ef_search) # Squared L2
         return neighbors_found[:k] # Returns (squared_dist, node_id)
 
 # --- our_ann function remains the same, calling this class ---
@@ -674,7 +661,7 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
           results = hnsw_index.search_knn(X_prep[i], K) # Returns (squared_dist, node_id)
           num_results = len(results); k_actual = min(num_results, K)
           if num_results > 0:
-               all_distances[i, :k_actual] = torch.tensor([res[0] for res in results[:k_actual]], device=device)
+               all_distances[i, :k_actual] = torch.tensor([res[0] for res in results[:k_actual]], device=device) # Store squared L2
                all_indices[i, :k_actual] = torch.tensor([res[1] for res in results[:k_actual]], device=device)
           # if (i+1)%(Q//10+1)==0: print(f"  Searched {i+1}/{Q}...")
      end_search = time.time()
@@ -713,7 +700,7 @@ if __name__ == "__main__":
     for _ in range(num_runs): _ = distance_dot_triton(X_queries, A_data)
     end_bench_time = time.time()
     avg_time = (end_bench_time - start_bench_time) / num_runs
-    print(f"Average execution time ({num_runs} runs): {avg_time:.4f} seconds")
+    print(f"Average Dot execution time ({num_runs} runs): {avg_time:.4f} seconds")
 
     # --- Test Triton L2 ---
     start_time = time.time()
@@ -725,6 +712,14 @@ if __name__ == "__main__":
     print("Sample (first 2x5):\n", l2_dists[:2,:5])
     end_time = time.time()
     print(f"L2 distance (Triton) computation time: {end_time - start_time:.4f} seconds")
+    # Benchmark L2
+    num_runs = 10
+    start_bench_time = time.time()
+    for _ in range(num_runs): _ = distance_l2_triton(X_queries, A_data)
+    end_bench_time = time.time()
+    avg_time = (end_bench_time - start_bench_time) / num_runs
+    print(f"Average L2 execution time ({num_runs} runs): {avg_time:.4f} seconds")
+
 
     # --- Test Triton Cosine ---
     start_time = time.time()
@@ -736,12 +731,25 @@ if __name__ == "__main__":
     print("Sample (first 2x5):\n", cos_dists[:2,:5])
     end_time = time.time()
     print(f"Cosine distance (Triton) computation time: {end_time - start_time:.4f} seconds")
+    # Benchmark Cosine
+    num_runs = 10
+    start_bench_time = time.time()
+    for _ in range(num_runs): _ = distance_cosine_triton(X_queries, A_data)
+    end_bench_time = time.time()
+    avg_time = (end_bench_time - start_bench_time) / num_runs
+    print(f"Average Cosine execution time ({num_runs} runs): {avg_time:.4f} seconds")
 
     # --- Test NEW Tiled Triton Manhattan ---
     start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_manhattan_triton...")
     print("="*40)
+    # Run with fixed small blocks first to ensure it works without autotune potentially breaking it
+    # Comment out the @triton.autotune above manhattan_kernel_pairwise_tiled when using fixed blocks
+    # print("Running Manhattan with fixed small blocks (16x16x16) for debugging...")
+    # man_dists = distance_manhattan_triton(X_queries, A_data, BLOCK_Q=16, BLOCK_N=16, BLOCK_K=16)
+    # If the above works, re-enable autotune on the kernel and run normally:
+    print("Running Manhattan with autotune...")
     _ = distance_manhattan_triton(X_queries[:2], A_data[:5]) # Warm-up/autotune trigger small
     man_dists = distance_manhattan_triton(X_queries, A_data) # Run on full data
     print("Manhattan distances shape:", man_dists.shape)
