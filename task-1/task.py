@@ -17,6 +17,116 @@ print(f"Using device: {device}")
 # ============================================================================
 # Triton Distance Kernels (Pairwise: Q queries vs N database points)
 # ============================================================================
+DEFAULT_BLOCK_Q = 32
+DEFAULT_BLOCK_N = 64
+DEFAULT_BLOCK_K = 64
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+@triton.autotune(
+    configs=[
+        # Basic configs with varying block sizes
+        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 2}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
+        # Add num_stages variations
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
+        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 3, 'num_warps': 4}),
+    ],
+    key=['Q', 'N', 'D'], # Dimensions influencing performance
+)
+@triton.jit
+def dot_kernel_pairwise_tiled(
+    X_ptr, A_ptr, Out_ptr,           # Data pointers
+    Q, N, D,                         # Matrix dimensions
+    stride_xq, stride_xd,            # Strides for X (row, col)
+    stride_an, stride_ad,            # Strides for A (row, col) - Note: A is (N, D)
+    stride_outq, stride_outn,        # Strides for Out (row, col)
+    BLOCK_Q: tl.constexpr,           # Tile size for Q dimension
+    BLOCK_N: tl.constexpr,           # Tile size for N dimension
+    BLOCK_K: tl.constexpr,           # Tile size for D dimension (often called K)
+):
+    """
+    Calculates pairwise dot product using tiling: Out[q, n] = dot(X[q, :], A[n, :])
+    This is equivalent to MatMul: Out = X @ A.T
+    Each program instance computes a BLOCK_Q x BLOCK_N tile of the output.
+    """
+    # 1. Program ID and Offsets
+    pid_q_block = tl.program_id(axis=0)  # Block index along Q dimension
+    pid_n_block = tl.program_id(axis=1)  # Block index along N dimension
+
+    # Calculate offsets for the current block this program will compute
+    offs_q = pid_q_block * BLOCK_Q + tl.arange(0, BLOCK_Q) # Shape (BLOCK_Q,)
+    offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N) # Shape (BLOCK_N,)
+
+    # 2. Initialize Accumulator Tile
+    # Stores the intermediate results for the output tile
+    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float32)
+
+    # 3. Loop over the Dimension D (K dimension) in blocks of BLOCK_K
+    for k_start in range(0, D, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K) # Shape (BLOCK_K,)
+
+        # --- Load X tile ---
+        # Pointers for the X tile: Shape (BLOCK_Q, BLOCK_K)
+        # Base + offset_q * stride_row + offset_k * stride_col
+        x_ptrs = X_ptr + (offs_q[:, None] * stride_xq + offs_k[None, :] * stride_xd)
+        # Boundary masks
+        q_mask = offs_q[:, None] < Q
+        k_mask_x = offs_k[None, :] < D
+        x_mask = q_mask & k_mask_x
+        # Load the tile, masking out-of-bounds elements
+        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0) # Shape (BLOCK_Q, BLOCK_K)
+
+        # --- Load A tile ---
+        # We need A.T for the matmul. So we load a (BLOCK_N, BLOCK_K) tile from A.
+        # Pointers for the A tile: Shape (BLOCK_N, BLOCK_K)
+        # Base + offset_n * stride_row + offset_k * stride_col
+        a_ptrs = A_ptr + (offs_n[:, None] * stride_an + offs_k[None, :] * stride_ad)
+        # Boundary masks
+        n_mask = offs_n[:, None] < N
+        k_mask_a = offs_k[None, :] < D
+        a_mask = n_mask & k_mask_a
+        # Load the tile, masking out-of-bounds elements
+        a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0) # Shape (BLOCK_N, BLOCK_K)
+
+        # --- Compute Matrix Multiplication for the tiles ---
+        # We want X[q, k] * A[n, k] summed over k. This is X @ A.T
+        # So, compute tl.dot(x_tile, transpose(a_tile))
+        # a_tile is (BLOCK_N, BLOCK_K), so transpose(a_tile) is (BLOCK_K, BLOCK_N)
+        # Result = (BLOCK_Q, BLOCK_K) @ (BLOCK_K, BLOCK_N) -> (BLOCK_Q, BLOCK_N)
+        accumulator += tl.dot(x_tile, tl.trans(a_tile))
+
+    # 4. Store the Resulting Tile
+    # Calculate output pointers for the BLOCK_Q x BLOCK_N tile
+    out_ptrs = Out_ptr + (offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn)
+    # Create boundary mask for storing
+    out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, accumulator, mask=out_mask)
+
+
+# --- Helper function (assuming device is defined globally or passed) ---
+def _prepare_tensors(*tensors, target_device):
+    """Ensure tensors are float32, contiguous, and on the correct device."""
+    prepared = []
+    for t in tensors:
+        if not isinstance(t, torch.Tensor):
+            # Be careful creating new tensors, might change original context
+            t = torch.tensor(t, dtype=torch.float32, device=target_device)
+        if t.device != target_device:
+            t = t.to(target_device)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
+        # Kernels often benefit from contiguous memory
+        prepared.append(t.contiguous())
+    return prepared
 
 @triton.jit
 def l2_dist_kernel_pairwise(
@@ -149,9 +259,8 @@ def manhattan_dist_kernel_pairwise(
 # ============================================================================
 # Default block size for dimension splitting in kernels (can be tuned)
 DEFAULT_BLOCK_D = 128
-
+"""
 def _prepare_tensors(*tensors):
-    """Ensure tensors are float32, contiguous, and on the correct device."""
     prepared = []
     for t in tensors:
         if not isinstance(t, torch.Tensor):
@@ -163,6 +272,40 @@ def _prepare_tensors(*tensors):
         # Kernels often benefit from contiguous memory
         prepared.append(t.contiguous())
     return prepared
+"""
+def distance_dot_triton(X, A, **kwargs):
+    """Computes pairwise dot product (X @ A.T) using Triton kernel."""
+    target_device = X.device # Assume X dictates the device
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    # Allocate output tensor
+    Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
+
+    # Calculate grid size based on output shape and block sizes
+    # Use autotuner defaults or kwargs for block sizes
+    BLOCK_Q = kwargs.get('BLOCK_Q', DEFAULT_BLOCK_Q)
+    BLOCK_N = kwargs.get('BLOCK_N', DEFAULT_BLOCK_N)
+
+    grid = (ceil_div(Q, BLOCK_Q), ceil_div(N, BLOCK_N))
+    print(f"Launching Triton Kernel dot_kernel_pairwise_tiled with grid={grid}")
+
+    # Launch the kernel
+    dot_kernel_pairwise_tiled[grid](
+        X_prep, A_prep, Out,           # Data pointers
+        Q, N, D,                         # Matrix dimensions
+        X_prep.stride(0), X_prep.stride(1), # X strides
+        A_prep.stride(0), A_prep.stride(1), # A strides
+        Out.stride(0), Out.stride(1),      # Out strides
+        # Block sizes are passed via autotuner/kwargs, kernel gets them via constexpr
+        # BLOCK_Q=BLOCK_Q, BLOCK_N=BLOCK_N, BLOCK_K=DEFAULT_BLOCK_K # Not needed for @triton.autotune
+        **kwargs # Pass autotuner kwargs like BLOCK_Q, BLOCK_N, BLOCK_K etc.
+    )
+
+    # Return raw dot product
+    return Out
 
 def distance_l2(X, A):
     """Computes pairwise squared L2 distance using Triton kernel."""
@@ -1116,7 +1259,7 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_dot...")
     print("="*40)
-    dot_dists = distance_dot(X_queries[:2], A_data[:5])
+    dot_dists = distance_dot_triton(X_queries[:2], A_data[:5])
     print("Sample dot distances (squared) shape:", dot_dists.shape)
     print(dot_dists)
     end_time = time.time()
