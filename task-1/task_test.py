@@ -86,7 +86,7 @@ def dot_kernel_pairwise_tiled(
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
 
-
+'''
 # --- Optimized Tiled Manhattan (L1) Distance Kernel ---
 @triton.autotune(
     configs=[
@@ -106,6 +106,7 @@ def dot_kernel_pairwise_tiled(
     ],
     key=['Q', 'N', 'D'], # Dimensions influencing performance
 )
+'''
 @triton.jit
 def manhattan_kernel_pairwise_tiled(
     X_ptr, A_ptr, Out_ptr,           # Data pointers
