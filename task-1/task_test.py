@@ -1,11 +1,18 @@
 # task-1/task.py
 import torch
+print("load")
 import triton
+print("loading")
 import triton.language as tl
+print("Loading.")
 import math
+print("Loading..")
 import heapq # For HNSW priority queues
+print("Loading...")
 import random
+print("Loading....")
 import time
+print("Loading......")
 # Removed: import cupy as cp - CuPy is no longer used
 
 # --- Ensure GPU is available ---
