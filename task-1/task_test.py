@@ -693,8 +693,10 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
                all_indices[i, :k_actual] = torch.tensor([res[1] for res in results[:k_actual]], device=device)
           # if (i+1)%(Q//10+1)==0: print(f"  Searched {i+1}/{Q}...")
      end_search = time.time()
+     build_time = end_build - start_build
+     search_time = end_search - start_search
      print(f"ANN search time: {end_search - start_search:.4f} seconds")
-     return all_indices, all_distances # Returns indices and SQUARED L2 distances
+     return all_indices, all_distances, build_time, search_time # Returns indices and SQUARED L2 distances
 
 # ============================================================================
 # Example Usage (Modified)
@@ -846,6 +848,63 @@ if __name__ == "__main__":
     ids, counts = torch.unique(kmeans_assignments, return_counts=True)
     print("Cluster counts:")
     for id_val, count_val in zip(ids.tolist(), counts.tolist()): print(f"  Cluster {id_val}: {count_val}")
+    print("\n" + "="*40)
+    print(f"Starting ANN Hyperparameter Tuning (K={K_val})...")
+    print("="*40)
+
+    # Define parameter ranges to test
+    # Adjust these lists based on how wide you want to search
+    m_options = [16, 32, 64]
+    efc_options = [100, 200, 400] # efConstruction
+    efs_options = [50, 100, 200, 400, 800] # efSearch
+
+    results_log = [] # To store results
+
+    # --- Get KNN results for Query 0 once ---
+    # Assumes knn_indices is already calculated from the KNN test block
+    if N_queries > 0 and K_val > 0 and 'knn_indices' in locals():
+        true_knn_ids_q0 = set(knn_indices[0].tolist())
+    else:
+        true_knn_ids_q0 = set() # Cannot calculate recall
+
+    # --- Loop through hyperparameters ---
+    for m_val in m_options:
+        for efc_val in efc_options:
+            for efs_val in efs_options:
+                print(f"\n--- Testing M={m_val}, efC={efc_val}, efS={efs_val} ---")
+
+                # Call the modified our_ann function
+                ann_indices, ann_dists, build_time, search_time = our_ann(
+                    N_data, Dim, A_data, X_queries, K_val,
+                    M=m_val, ef_construction=efc_val, ef_search=efs_val
+                )
+
+                # Calculate recall for Query 0
+                recall_q0 = float('nan') # Default if cannot calculate
+                if N_queries > 0 and K_val > 0 and true_knn_ids_q0:
+                    approx_ann_ids_q0 = set(ann_indices[0].tolist())
+                    approx_ann_ids_q0.discard(-1) # Remove placeholders
+                    recall_q0 = len(true_knn_ids_q0.intersection(approx_ann_ids_q0)) / K_val
+
+                # Log results
+                results_log.append({
+                    'M': m_val, 'efC': efc_val, 'efS': efs_val,
+                    'build_time': build_time, 'search_time': search_time, 'recall_q0': recall_q0
+                })
+                print(f"    Result: Build={build_time:.2f}s, Search={search_time:.4f}s, Recall@10(Q0)={recall_q0:.2%}")
+                # Optional: Add a small delay if needed, e.g. time.sleep(1)
+
+    # --- Print Summary ---
+    print("\n" + "="*40)
+    print("ANN Hyperparameter Test Summary:")
+    print("="*40)
+    # Sort results perhaps by recall or search time
+    results_log.sort(key=lambda r: (r.get('recall_q0', 0), -r.get('search_time', float('inf'))), reverse=True) # Sort by recall (desc), then search time (asc)
+
+    for res in results_log:
+         print(f"M={res['M']:<3d}, efC={res['efC']:<4d}, efS={res['efS']:<4d} -> "
+               f"Build={res['build_time']:.2f}s, Search={res['search_time']:.4f}s, "
+               f"Recall(Q0)={res['recall_q0']:.2%}")
 
     # --- Test ANN (HNSW) ---
     print("\n" + "="*40)
