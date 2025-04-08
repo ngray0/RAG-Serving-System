@@ -1087,6 +1087,7 @@ if __name__ == "__main__":
     print("Sample ANN Dists (Query 0):\n", ann_dists[0])
 
     # Optional: Compare ANN vs KNN recall for query 0
+    """
     if N_queries > 0 and K_val > 0:
         true_knn_ids = set(knn_indices[0].tolist())
         approx_ann_ids = set(ann_indices[0].tolist())
@@ -1095,6 +1096,29 @@ if __name__ == "__main__":
 
         recall = len(true_knn_ids.intersection(approx_ann_ids)) / K_val
         print(f"\nANN Recall @ {K_val} for Query 0 (vs brute-force KNN): {recall:.2%}")
+    """
+    if N_queries > 0 and K_val > 0 and 'knn_indices' in locals() and 'ann_indices' in locals():
+        total_intersect = 0
+    # Loop through all queries
+        for i in range(N_queries):
+        # Get true KNN neighbors for query i
+            true_knn_ids = set(knn_indices[i].cpu().tolist())
+        # Get approximate ANN neighbors for query i
+            approx_ann_ids = set(ann_indices[i].cpu().tolist())
+        # Remove potential -1 placeholders from ANN results
+            approx_ann_ids.discard(-1)
+        # Add the number of overlapping neighbors to the total
+            total_intersect += len(true_knn_ids.intersection(approx_ann_ids))
+
+    # Calculate average recall across all queries
+        if N_queries * K_val > 0:
+            avg_recall = total_intersect / (N_queries * K_val)
+            print(f"\nAverage ANN Recall @ {K_val} (vs brute-force KNN): {avg_recall:.2%}")
+        else:
+            print("\nCannot calculate average recall (N_queries or K_val is zero).")
+
+    elif 'knn_indices' not in locals() or 'ann_indices' not in locals():
+        print("\nCannot calculate recall: KNN or ANN results not available.")
 '''
 def test_kmeans():
     N, D, A, K = testdata_kmeans("test_file.json")
