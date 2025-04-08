@@ -446,6 +446,25 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     total_time = time.time() - start_time_total
     print(f"Total K-Means time: {total_time:.4f}s")
     return centroids, assignments
+def distance_l2_squared_triton(X, A, **kwargs):
+    """
+    Computes pairwise SQUARED L2 distances using the tiled dot product kernel
+    and PyTorch operations for norms. (No final sqrt)
+    """
+    target_device = X.device
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    dot_products = distance_dot_triton(X_prep, A_prep, **kwargs) # (Q, N)
+    X_norm_sq = torch.sum(X_prep**2, axis=1, keepdims=True)  # (Q, 1)
+    A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # (N, 1)
+    # ||x - a||^2 = ||x||^2 - 2<x, a> + ||a||^2
+    dist_sq = X_norm_sq - 2 * dot_products + A_norm_sq.T # (Q, N)
+    dist_sq.clamp_(min=0.0) # Ensure non-negative due to potential float errors
+    # NO SQRT HERE
+    return dist_sq
 
 # ============================================================================
 # Task 2.2: Approximate Nearest Neighbors (Simplified HNSW)
@@ -493,57 +512,138 @@ class SimpleHNSW_for_ANN:
 
     def _distance_batch(self, query_indices, candidate_indices):
         """
-        Calculates pairwise L2 distances between batches using distance_l2_triton.
-        Returns actual L2 distances.
+        Calculates pairwise SQUARED L2 distances between batches using
+        distance_l2_squared_triton.
+        Returns SQUARED L2 distances.
         """
         if not query_indices or not candidate_indices:
-            return torch.empty((len(query_indices), len(candidate_indices)), device=device)
+            return torch.empty((len(query_indices), len(candidate_indices)), device=self.vectors.device)
         target_device = self.vectors.device
 
+        # Ensure indices are valid before slicing
         valid_query_indices = [idx for idx in query_indices if idx < self.node_count and idx >= 0]
         valid_candidate_indices = [idx for idx in candidate_indices if idx < self.node_count and idx >= 0]
+
         if not valid_query_indices or not valid_candidate_indices:
+             # Return shape consistent with potentially empty input lists
+             # Note: If query_indices was non-empty but all invalid, this returns 0 rows.
+             # If candidate_indices was non-empty but all invalid, this returns 0 columns.
              return torch.empty((len(valid_query_indices), len(valid_candidate_indices)), device=target_device)
 
         query_vectors = self.vectors[valid_query_indices]
         candidate_vectors = self.vectors[valid_candidate_indices]
-        pairwise_l2_distances = distance_l2_triton(query_vectors, candidate_vectors)
-        return pairwise_l2_distances # Shape (len(valid_query), len(valid_candidate))
+
+        # Use the new function returning squared distances
+        pairwise_l2_distances_sq = distance_l2_squared_triton(query_vectors, candidate_vectors)
+
+        # The result should already match the shape based on valid indices.
+        # If the original indices contained invalid ones, the output tensor size
+        # will be smaller than len(query_indices) x len(candidate_indices).
+        # This seems acceptable as the caller needs to handle the mapping back if necessary.
+        return pairwise_l2_distances_sq
 
     def _select_neighbors_heuristic(self, query_vec, candidates, M_target):
-        """Selects M_target neighbors (implementation using squared L2 internally)."""
+        """Selects M_target neighbors (implementation now consistently using squared L2)."""
         selected_neighbors = []
-        working_candidates_heap = [(dist, nid) for dist, nid in candidates]
+        # candidates is expected to be list of (dist_sq, nid) tuples
+        working_candidates_heap = [(dist_sq, nid) for dist_sq, nid in candidates]
         heapq.heapify(working_candidates_heap)
-        discarded_candidates = set()
+        # Use a separate heap for results to easily track the best M
+        # Store as (-dist_sq, nid) for max-heap behavior on distance
+        result_heap = []
+
+        # Keep track of candidates considered to avoid redundant distance calcs if possible
+        candidate_pool = {nid: dist_sq for dist_sq, nid in candidates}
+        processed_for_discard = set() # Nodes whose neighbors were checked for pruning
 
         while working_candidates_heap and len(selected_neighbors) < M_target:
+            # Get the closest candidate not yet selected or discarded
             dist_best_sq, best_nid = heapq.heappop(working_candidates_heap)
-            if best_nid in discarded_candidates: continue
-            selected_neighbors.append(best_nid)
 
-            remaining_candidates_info = {}
-            temp_heap = []
-            while working_candidates_heap:
-                 dist_r_sq, nid_r = heapq.heappop(working_candidates_heap)
-                 if nid_r not in discarded_candidates:
-                      remaining_candidates_info[nid_r] = dist_r_sq
-                      temp_heap.append((dist_r_sq, nid_r))
-            working_candidates_heap = temp_heap
-            heapq.heapify(working_candidates_heap)
-            remaining_nids = list(remaining_candidates_info.keys())
+            # Skip if already added to results or previously discarded
+            # Need a way to track discarded efficiently, maybe just check if in result_heap?
+            # Or maintain a discarded set if the heuristic becomes more complex.
+            # For now, let's rely on result_heap check.
+            is_selected = any(nid == best_nid for _, nid in result_heap)
+            if is_selected:
+                continue
 
-            if remaining_nids:
-                dists_best_to_remaining = self._distance_batch([best_nid], remaining_nids) # Actual L2
-                if dists_best_to_remaining.numel() > 0:
-                    dists_best_to_remaining_sq = (dists_best_to_remaining**2).squeeze(0) # Squared L2
+            # Add to results (using negative distance for max-heap)
+            heapq.heappush(result_heap, (-dist_best_sq, best_nid))
+            if len(result_heap) > M_target:
+                 heapq.heappop(result_heap) # Remove the furthest
 
-                    for i, r_nid in enumerate(remaining_nids):
-                        dist_r_query_sq = remaining_candidates_info[r_nid] # Already squared L2
-                        if i < len(dists_best_to_remaining_sq):
-                           dist_r_best_sq = dists_best_to_remaining_sq[i].item()
-                           if dist_r_best_sq < dist_r_query_sq:
-                               discarded_candidates.add(r_nid)
+            # Heuristic part: Prune candidates based on the newly selected best_nid
+            # This part of the original heuristic is complex and potentially slow/buggy.
+            # Let's comment out the complex pruning within the selection for now
+            # and rely on the simpler approach of just keeping the best M_target overall.
+            # If recall is still low after other changes, this heuristic could be revisited
+            # or replaced with the standard HNSW 'select_simple'.
+
+            # --- Start: Complex Pruning Logic (Commented Out for Simplification) ---
+            # remaining_candidates_info = {}
+            # temp_heap = []
+            # # Rebuild the working heap without the current best_nid
+            # # This is inefficient; better to just iterate pool if needed
+            # while working_candidates_heap:
+            #      dist_r_sq, nid_r = heapq.heappop(working_candidates_heap)
+            #      # Check if nid_r is among the current best M_target in result_heap
+            #      is_in_results = any(r_nid == nid_r for _, r_nid in result_heap)
+            #      if not is_in_results: # Only consider pruning those not firmly selected yet
+            #          remaining_candidates_info[nid_r] = dist_r_sq
+            #          temp_heap.append((dist_r_sq, nid_r))
+            #
+            # working_candidates_heap = temp_heap
+            # heapq.heapify(working_candidates_heap) # Re-heapify remaining
+            # remaining_nids = list(remaining_candidates_info.keys())
+            #
+            # if remaining_nids and best_nid not in processed_for_discard:
+            #     processed_for_discard.add(best_nid)
+            #     # Calculate distances from the newly selected node to remaining candidates
+            #     # _distance_batch now returns SQUARED L2
+            #     dists_best_to_remaining_sq = self._distance_batch([best_nid], remaining_nids)
+            #
+            #     if dists_best_to_remaining_sq.numel() > 0:
+            #         dists_best_to_remaining_sq = dists_best_to_remaining_sq.squeeze(0) # Shape (len(remaining_nids),)
+            #
+            #         discarded_in_this_round = set()
+            #         for i, r_nid in enumerate(remaining_nids):
+            #             dist_r_query_sq = remaining_candidates_info[r_nid] # Squared L2
+            #             if i < len(dists_best_to_remaining_sq):
+            #                dist_r_best_sq = dists_best_to_remaining_sq[i].item() # Squared L2
+            #                # Heuristic: if candidate r_nid is closer to best_nid than to query,
+            #                # it might be redundant.
+            #                if dist_r_best_sq < dist_r_query_sq:
+            #                    discarded_in_this_round.add(r_nid)
+            #
+            #         # Rebuild heap *again* excluding discarded nodes (very inefficient)
+            #         # This complexity suggests replacing the heuristic might be better.
+            #         new_heap = [(d_sq, n_id) for d_sq, n_id in working_candidates_heap if n_id not in discarded_in_this_round]
+            #         heapq.heapify(new_heap)
+            #         working_candidates_heap = new_heap
+            # --- End: Complex Pruning Logic ---
+
+
+        # Extract the final selected neighbors from the result heap
+        selected_neighbors = sorted([nid for neg_dist_sq, nid in result_heap])
+
+        # Fallback / Ensure M neighbors if possible:
+        # If fewer than M found, fill with the best from the initial candidates
+        if len(selected_neighbors) < M_target:
+             initial_candidates_sorted = sorted(candidates, key=lambda x: x[0]) # Sort by dist_sq
+             needed = M_target - len(selected_neighbors)
+             existing_selected = set(selected_neighbors)
+             added_count = 0
+             for dist_sq, nid in initial_candidates_sorted:
+                 if added_count >= needed: break
+                 if nid not in existing_selected:
+                     selected_neighbors.append(nid)
+                     existing_selected.add(nid)
+                     added_count += 1
+             # Ensure correct length if not enough unique candidates exist overall
+             selected_neighbors = selected_neighbors[:M_target]
+
+
         return selected_neighbors
 
     def add_point(self, point_vec):
@@ -861,7 +961,7 @@ if __name__ == "__main__":
 
     # Define parameter ranges to test
     # Adjust these lists based on how wide you want to search
-    m_options = [16, 32, 64]
+    m_options = [32, 16, 64]
     efc_options = [100, 200, 400] # efConstruction
     efs_options = [50, 100, 200, 400, 800] # efSearch
 
