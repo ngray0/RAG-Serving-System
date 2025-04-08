@@ -7,11 +7,14 @@ import numpy as np
 from typing import List, Dict, Any
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datasets import load_dataset
+import datetime
 
 from benchmarks.metrics.collector import MetricsCollector
 
-QUERIES_FILE = "data/short_facts_queries.json"
+QUERIES_FILE = "data/squad_queries.json"
 
 def generate_trace(pattern: str, rps: int, duration: int, seed: int = None) -> List[int]:
     """
@@ -83,8 +86,41 @@ def load_test_data():
         print(f"An error occurred loading queries: {e}")
         sys.exit(1)
 
+def send_request(endpoint, query, timeout, metrics, request_id, timestamp_data):
+    """Send a single request to the server"""
+    # Record actual request time (relative to test start)
+    timestamp_data["actual_sent_time"] = time.time()
+    
+    metrics.record_request_start(request_id)
+    
+    try:
+        response = requests.post(
+            f"{endpoint}/rag",
+            json={"query": query},
+            timeout=timeout
+        )
+        
+        success = response.status_code == 200
+        metrics.record_request_end(request_id, success)
+        
+        # Record completion time
+        timestamp_data["completion_time"] = time.time()
+        
+        if not success:
+            print(f"Request failed with status code: {response.status_code}")
+            
+    except Exception as e:
+        print(f"Request error: {e}")
+        metrics.record_request_end(request_id, False)
+        
+        # Still record completion time even if there was an error
+        timestamp_data["completion_time"] = time.time()
+
 def run_load_test(args):
     """Run load test with specified parameters"""
+    # Create the output directory if it doesn't exist
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    
     # Generate trace based on specified pattern
     trace = generate_trace(
         pattern=args.pattern,
@@ -97,11 +133,19 @@ def run_load_test(args):
     
     queries = load_test_data()
     
-    # Initialise metrics collector
+    # Initialize metrics collector
     metrics = MetricsCollector()
+    
+    # Create thread pool
+    max_workers = min(32, len(trace))  # Cap at 32 threads or number of requests
+    executor = ThreadPoolExecutor(max_workers=max_workers)
     
     # Execute requests according to trace
     start_time = time.time()
+    futures = []
+    
+    # Track actual timestamps for each request
+    timestamp_tracking = []
     
     for i, request_time in enumerate(trace):
         # Calculate delay until next request
@@ -117,29 +161,75 @@ def run_load_test(args):
         # Select query
         query = queries[i % len(queries)]
         
-        # Record request start
-        metrics.record_request_start(request_id)
+        # Create timestamp data for this request
+        timestamp_data = {
+            "request_id": request_id,
+            "query_index": i,
+            "planned_time_ms": request_time,
+            "scheduled_time": time.time() - start_time
+        }
+        timestamp_tracking.append(timestamp_data)
         
-        # Send request
-        try:
-            response = requests.post(
-                f"{args.endpoint}/rag",
-                json={"query": query},  
-                timeout=args.timeout
-            )
-            
-            success = response.status_code == 200
-            metrics.record_request_end(request_id, success)
-            print(response)
-            if not success:
-                print(f"Request failed with status code: {response.status_code}")
-                
-        except Exception as e:
-            print(f"Request error: {e}")
-            metrics.record_request_end(request_id, False)
+        # Submit request to thread pool
+        future = executor.submit(
+            send_request, 
+            args.endpoint, 
+            query, 
+            args.timeout, 
+            metrics, 
+            request_id,
+            timestamp_data  # Pass the timestamp data to record actual times
+        )
+        futures.append(future)
+    
+    # Wait for all requests to complete
+    for future in futures:
+        future.result()
+    
+    # Calculate actual test duration
+    actual_duration = time.time() - start_time
+    print(f"Test completed in {actual_duration:.2f} seconds (planned: {args.duration} seconds)")
     
     # Save metrics
     metrics.save_results(args.output)
+    
+    # Save timestamp data to a separate file
+    timestamp_file = os.path.splitext(args.output)[0] + "_timestamps.json"
+    
+    # Calculate some statistics for the timestamp data
+    for data in timestamp_tracking:
+        # Calculate delays and execution time
+        if "actual_sent_time" in data:
+            data["actual_sent_time_relative"] = data["actual_sent_time"] - start_time
+            data["scheduling_delay_ms"] = (data["scheduled_time"] - data["planned_time_ms"]/1000) * 1000
+        
+        if "completion_time" in data and "actual_sent_time" in data:
+            data["execution_time"] = data["completion_time"] - data["actual_sent_time"]
+    
+    # Save detailed timestamp data
+    with open(timestamp_file, 'w') as f:
+        json.dump({
+            "test_info": {
+                "pattern": args.pattern,
+                "rps": args.rps,
+                "duration": args.duration,
+                "actual_duration": actual_duration,
+                "timestamp": datetime.datetime.now().isoformat()
+            },
+            "requests": timestamp_tracking
+        }, f, indent=2)
+    
+    print(f"Detailed timestamp data saved to {timestamp_file}")
+    
+    # Print summary statistics
+    results = metrics.calculate_metrics()
+    print("\nTest Results Summary:")
+    print(f"Total Requests:      {results['total_requests']}")
+    print(f"Successful Requests: {results['successful_requests']}")
+    print(f"Failed Requests:     {results['failed_requests']}")
+    print(f"Actual Throughput:   {results['throughput']:.2f} req/sec")
+    print(f"Mean Latency:        {results['latency']['mean']:.2f} sec")
+    print(f"P95 Latency:         {results['latency']['p95']:.2f} sec")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run load test for RAG service")

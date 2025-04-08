@@ -6,8 +6,8 @@ import uvicorn
 from pydantic import BaseModel
 import json
 
-DOCUMENT_TEXT_FILE = 'data/short_facts_contexts.json'
-DOCUMENT_EMBEDDINGS_FILE = 'data/short_facts_embeddings.npy'
+DOCUMENT_TEXT_FILE = 'data/squad_contexts.json'
+DOCUMENT_EMBEDDINGS_FILE = 'data/squad_embeddings.npy'
 
 app = FastAPI()
 # Example documents in memory
@@ -67,7 +67,8 @@ def rag_pipeline(query: str, k: int = 2) -> str:
     prompt = f"Question: {query}\nContext:\n{context}\nAnswer:"
     
     # Step 3: LLM Output
-    generated = chat_pipeline(prompt, max_length=50, do_sample=True)[0]["generated_text"]
+    generated = chat_pipeline(prompt, max_new_tokens=25, do_sample=True)[0]["generated_text"]
+
     return generated
 
 # Define request model
