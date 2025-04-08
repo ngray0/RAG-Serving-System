@@ -465,7 +465,21 @@ def distance_l2_squared_triton(X, A, **kwargs):
     dist_sq.clamp_(min=0.0) # Ensure non-negative due to potential float errors
     # NO SQRT HERE
     return dist_sq
-
+def _prepare_tensors2(*tensors):
+    """Ensure tensors are float32, contiguous, and on the correct device."""
+    prepared = []
+    # Assume 'device' is globally available or passed appropriately
+    global device
+    for t in tensors:
+        if not isinstance(t, torch.Tensor):
+            t = torch.tensor(t, dtype=torch.float32, device=device)
+        if t.device != device:
+            t = t.to(device)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
+        # Kernels often benefit from contiguous memory
+        prepared.append(t.contiguous())
+    return prepared
 DEFAULT_BLOCK_D = 128
 @triton.jit
 def l2_dist_kernel_pairwise(
@@ -536,11 +550,11 @@ class SimpleHNSW_for_ANN:
         if not isinstance(candidate_indices, list): candidate_indices = list(candidate_indices)
         if not candidate_indices: return torch.empty(0, device=device), []
         target_device = query_vec.device if isinstance(query_vec, torch.Tensor) else self.vectors.device
-        query_vec_prep, = _prepare_tensors(query_vec.flatten(), target_device=target_device)
+        query_vec_prep, = _prepare_tensors2(query_vec.flatten(), target_device=target_device)
         valid_indices = [idx for idx in candidate_indices if idx < self.node_count and idx >= 0]
         if not valid_indices: return torch.empty(0, device=device), []
         num_valid_candidates = len(valid_indices)
-        candidate_vectors, = _prepare_tensors(self.vectors[valid_indices], target_device=target_device)
+        candidate_vectors, = _prepare_tensors2(self.vectors[valid_indices], target_device=target_device)
         distances_out = torch.empty(num_valid_candidates, dtype=torch.float32, device=device)
         grid = (num_valid_candidates,)
         l2_dist_kernel_1_vs_M[grid](
@@ -574,7 +588,7 @@ class SimpleHNSW_for_ANN:
         grid = (Q, N)
 
         # Ensure vectors are prepared if necessary (e.g., contiguous)
-        query_vectors, candidate_vectors = _prepare_tensors(query_vectors, candidate_vectors)
+        query_vectors, candidate_vectors = _prepare_tensors2(query_vectors, candidate_vectors)
 
         # Assuming l2_dist_kernel_pairwise is defined and imported/available
         l2_dist_kernel_pairwise[grid](
@@ -671,7 +685,7 @@ class SimpleHNSW_for_ANN:
     def add_point(self, point_vec):
         """Adds a single point to the graph."""
         target_device = self.vectors.device if self.node_count > 0 else device
-        point_vec_prep, = _prepare_tensors(point_vec.flatten(), target_device=target_device)
+        point_vec_prep, = _prepare_tensors2(point_vec.flatten(), target_device=target_device)
         new_node_id = self.node_count
 
         if self.node_count == 0: self.vectors = point_vec_prep.unsqueeze(0)
@@ -782,7 +796,7 @@ class SimpleHNSW_for_ANN:
     def search_knn(self, query_vec, k):
         """Searches for k nearest neighbors (returns squared L2 dists)."""
         if self.entry_point == -1: return []
-        query_vec_prep, = _prepare_tensors(query_vec.flatten(), target_device=self.vectors.device)
+        query_vec_prep, = _prepare_tensors2(query_vec.flatten(), target_device=self.vectors.device)
         ep = [self.entry_point]
         current_max_level = self.max_level
         for level in range(current_max_level, 0, -1):
@@ -799,7 +813,7 @@ class SimpleHNSW_for_ANN:
 # --- our_ann function remains the same, calling this class ---
 def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
      target_device = X.device
-     A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
+     A_prep, X_prep = _prepare_tensors2(A, X, target_device=target_device)
      Q = X_prep.shape[0]
      assert A_prep.shape[0]==N_A and A_prep.shape[1]==D and X_prep.shape[1]==D and K>0
      print(f"Running ANN (HNSW): Q={Q}, N={N_A}, D={D}, K={K}, M={M}, efC={ef_construction}, efS={ef_search}")
