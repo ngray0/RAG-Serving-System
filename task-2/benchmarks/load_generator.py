@@ -12,9 +12,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datasets import load_dataset
 import datetime
 
-from benchmarks.metrics.collector import MetricsCollector
+from metrics.collector import MetricsCollector
 
-QUERIES_FILE = "data/squad_queries.json"
+QUERIES_FILE = "data/short_facts_queries.json"
 
 def generate_trace(pattern: str, rps: int, duration: int, seed: int = None) -> List[int]:
     """
@@ -51,7 +51,7 @@ def generate_trace(pattern: str, rps: int, duration: int, seed: int = None) -> L
             
     elif pattern == "poisson":
         # poisson distributed requests
-        rate_ms = rps / 1000  # miliseconds
+        rate_ms = rps / 1000 
         intervals = np.random.exponential(1 / rate_ms, total_requests)
         current_time = 0.0
         for i in range(total_requests):
@@ -87,38 +87,89 @@ def load_test_data():
         sys.exit(1)
 
 def send_request(endpoint, query, timeout, metrics, request_id, timestamp_data):
-    """Send a single request to the server"""
-    # Record actual request time (relative to test start)
+    """Send a request and poll for the result"""
+    # Record actual request time
     timestamp_data["actual_sent_time"] = time.time()
     
     metrics.record_request_start(request_id)
     
     try:
+        # Step 1: Submit the request
         response = requests.post(
             f"{endpoint}/rag",
             json={"query": query},
-            timeout=timeout
+            timeout=30
         )
         
-        success = response.status_code == 200
-        metrics.record_request_end(request_id, success)
-        
-        # Record completion time
-        timestamp_data["completion_time"] = time.time()
-        
-        if not success:
+        if response.status_code != 200:
             print(f"Request failed with status code: {response.status_code}")
+            metrics.record_request_end(request_id, False)
+            timestamp_data["error"] = f"HTTP {response.status_code}"
+            timestamp_data["completion_time"] = time.time()
+            return
             
+        # Extract the request ID from the response
+        try:
+            response_data = response.json()
+            server_request_id = response_data.get("request_id")
+            if not server_request_id:
+                raise ValueError("No request_id in response")
+        except Exception as e:
+            print(f"Failed to parse response: {e}")
+            metrics.record_request_end(request_id, False)
+            timestamp_data["error"] = f"Parse error: {str(e)}"
+            timestamp_data["completion_time"] = time.time()
+            return
+            
+        # Step 2: Poll for the result
+        start_poll_time = time.time()
+        poll_interval = 0.1  # seconds between polls
+        
+        while True:
+            #check if exceeded timeout
+            if time.time() - start_poll_time > timeout:
+                print(f"Polling timed out after {timeout} seconds")
+                metrics.record_request_end(request_id, False)
+                timestamp_data["error"] = "polling_timeout"
+                timestamp_data["completion_time"] = time.time()
+                return
+                
+            # Poll for the result
+            poll_response = requests.get(
+                f"{endpoint}/rag/result/{server_request_id}",
+                timeout=10
+            )
+            
+            if poll_response.status_code != 200:
+                print(f"Poll failed with status code: {poll_response.status_code}")
+                continue
+                
+            try:
+                poll_data = poll_response.json()
+                status = poll_data.get("status")
+                
+                if status == "complete":
+                    timestamp_data["completion_time"] = time.time()
+                    timestamp_data["result"] = poll_data.get("result")
+                    metrics.record_request_end(request_id, True)
+                    return
+                    
+                # If still processing, wait and try again
+                time.sleep(poll_interval)
+                
+            except Exception as e:
+                print(f"Failed to parse poll response: {e}")
+                continue
+                
     except Exception as e:
         print(f"Request error: {e}")
         metrics.record_request_end(request_id, False)
-        
-        # Still record completion time even if there was an error
+        timestamp_data["error"] = str(e)
         timestamp_data["completion_time"] = time.time()
 
 def run_load_test(args):
     """Run load test with specified parameters"""
-    # Create the output directory if it doesn't exist
+
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     
     # Generate trace based on specified pattern
@@ -132,19 +183,16 @@ def run_load_test(args):
     print(f"Generated trace with {len(trace)} requests using {args.pattern} pattern")
     
     queries = load_test_data()
-    
-    # Initialize metrics collector
+
     metrics = MetricsCollector()
     
     # Create thread pool
-    max_workers = min(32, len(trace))  # Cap at 32 threads or number of requests
+    max_workers = min(32, len(trace)) 
     executor = ThreadPoolExecutor(max_workers=max_workers)
     
-    # Execute requests according to trace
     start_time = time.time()
     futures = []
     
-    # Track actual timestamps for each request
     timestamp_tracking = []
     
     for i, request_time in enumerate(trace):
@@ -155,13 +203,10 @@ def run_load_test(args):
         if delay > 0:
             time.sleep(delay)
         
-        # Generate request ID
         request_id = str(uuid.uuid4())
         
-        # Select query
         query = queries[i % len(queries)]
-        
-        # Create timestamp data for this request
+    
         timestamp_data = {
             "request_id": request_id,
             "query_index": i,
@@ -178,7 +223,7 @@ def run_load_test(args):
             args.timeout, 
             metrics, 
             request_id,
-            timestamp_data  # Pass the timestamp data to record actual times
+            timestamp_data  
         )
         futures.append(future)
     
@@ -190,15 +235,10 @@ def run_load_test(args):
     actual_duration = time.time() - start_time
     print(f"Test completed in {actual_duration:.2f} seconds (planned: {args.duration} seconds)")
     
-    # Save metrics
     metrics.save_results(args.output)
-    
-    # Save timestamp data to a separate file
     timestamp_file = os.path.splitext(args.output)[0] + "_timestamps.json"
     
-    # Calculate some statistics for the timestamp data
     for data in timestamp_tracking:
-        # Calculate delays and execution time
         if "actual_sent_time" in data:
             data["actual_sent_time_relative"] = data["actual_sent_time"] - start_time
             data["scheduling_delay_ms"] = (data["scheduled_time"] - data["planned_time_ms"]/1000) * 1000
@@ -221,7 +261,7 @@ def run_load_test(args):
     
     print(f"Detailed timestamp data saved to {timestamp_file}")
     
-    # Print summary statistics
+    # summary output stats
     results = metrics.calculate_metrics()
     print("\nTest Results Summary:")
     print(f"Total Requests:      {results['total_requests']}")

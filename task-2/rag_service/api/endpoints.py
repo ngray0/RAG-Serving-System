@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from typing import Dict, Any
 
 from rag_service.api.models import QueryRequest, QueryResponse
-from rag_service.queue.request_queue import RequestQueue
+from rag_service.core.request_queue import RequestQueue
 
 def create_api(request_queue: RequestQueue):
     """Create the FastAPI application with endpoints"""
@@ -13,14 +13,22 @@ def create_api(request_queue: RequestQueue):
         # Add request to the queue
         request_id = request_queue.add_request(payload.query, payload.k)
         
-        # Wait for the result
-        result = request_queue.get_result(request_id)
+        # Return a request ID immediately for polling
+        return {
+            "request_id": request_id,
+            "status": "processing"
+        }
+
+    @app.get("/rag/result/{request_id}")
+    async def get_result(request_id: str):
+        # Check for the result
+        result = request_queue.get_result(request_id, timeout=0.1)
         
         if result is None:
-            raise HTTPException(status_code=408, detail="Request timed out")
+            return {"status": "processing"}
         
         return {
-            "query": payload.query,
+            "status": "complete",
             "result": result
         }
     
@@ -29,3 +37,6 @@ def create_api(request_queue: RequestQueue):
         return {"status": "healthy"}
     
     return app
+
+
+    

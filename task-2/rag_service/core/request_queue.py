@@ -54,5 +54,5 @@ class RequestQueue:
                     result = self.results[request_id]
                     del self.results[request_id]  # Clean up
                     return result
-            time.sleep(0.1)  # Check again after a short delay
+            time.sleep(0.05)  # Check again after a short delay
         return None  # Timeout
