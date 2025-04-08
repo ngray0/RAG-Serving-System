@@ -150,7 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--duration", type=int, default=60, help="Test duration in seconds (duration * rps = total requests)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds")
-    parser.add_argument("--output", type=str, default="load_test_results.json", help="Output file for results")
+    parser.add_argument("--output", type=str, default="benchmarks/results/load_test_results.json", help="Output file for results")
     
     args = parser.parse_args()
     run_load_test(args)
