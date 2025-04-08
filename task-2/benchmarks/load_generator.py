@@ -11,7 +11,7 @@ from datasets import load_dataset
 
 from benchmarks.metrics.collector import MetricsCollector
 
-QUERIES_FILE = "data/squad_queries.json"
+QUERIES_FILE = "data/short_facts_queries.json"
 
 def generate_trace(pattern: str, rps: int, duration: int, seed: int = None) -> List[int]:
     """
@@ -124,13 +124,13 @@ def run_load_test(args):
         try:
             response = requests.post(
                 f"{args.endpoint}/rag",
-                json={"query": query, "request_id": request_id},
+                json={"query": query},  
                 timeout=args.timeout
             )
             
             success = response.status_code == 200
             metrics.record_request_end(request_id, success)
-            
+            print(response)
             if not success:
                 print(f"Request failed with status code: {response.status_code}")
                 
@@ -146,8 +146,8 @@ if __name__ == "__main__":
     parser.add_argument("--endpoint", default="http://localhost:8000", help="API endpoint")
     parser.add_argument("--pattern", choices=["uniform", "poisson", "random"], default="uniform", 
                         help="Pattern for generating request trace")
-    parser.add_argument("--rps", type=int, default=5, help="Requests per second (this is an average and will act according to each distribution)")
-    parser.add_argument("--duration", type=int, default=60, help="Test duration in seconds")
+    parser.add_argument("--rps", type=int, default=5, help="Requests per second")
+    parser.add_argument("--duration", type=int, default=60, help="Test duration in seconds (duration * rps = total requests)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--timeout", type=int, default=30, help="Request timeout in seconds")
     parser.add_argument("--output", type=str, default="load_test_results.json", help="Output file for results")
