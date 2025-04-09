@@ -672,12 +672,17 @@ if __name__ == "__main__":
     end_time = time.time()
     print("Hierarchy", (end_time-start_time)/N_queries)
     start_time = time.time()
+    
+    knn_indices,_ = our_knn(N_data, Dim, A_data, X_queries, K_val)
+            
+    end_time = time.time()
+    print("Triton", (end_time-start_time)/N_queries)
+    start_time = time.time()
     for i in range(N_queries):
         query_vector = X_queries[i] # Get the i-th query vector (shape will be (D,))
         try:
         # Call the function with a single query vector
             knn_indices,_ = our_knn(N_data, Dim, A_data, query_vector, K_val)
-            all_knn_indices.append(cp.asnumpy(knn_indices)) # Store result (optional: convert to numpy)
         # Optional: Add print statement for progress
         # if (i+1) % 10 == 0: print(f"Processed query {i+1}/{N_queries}")
         except Exception as e:
@@ -685,6 +690,7 @@ if __name__ == "__main__":
             all_knn_indices.append(None) # Or handle error differently
     end_time = time.time()
     print("Triton", (end_time-start_time)/N_queries)
+
     
 
     print("Finished processing all queries.")
