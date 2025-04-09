@@ -1174,7 +1174,7 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_manhattan...")
     print("="*40)
-    man_dists = distance_manhattan_triton(X_queries[:2], A_data[:5])
+    man_dists = distance_manhattan_triton(X_queries, A_data)
     end_time = time.time()
     print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample Manhattan distances shape:", man_dists.shape)
