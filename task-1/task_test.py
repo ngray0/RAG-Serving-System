@@ -380,7 +380,7 @@ def distance_manhattan_triton(X, A, **kwargs):
 # ============================================================================
 # Task 1.2: k-Nearest Neighbors (Brute Force)
 # ============================================================================
-def our_knn(N_A, D, A, X, K):
+def our_knn2(N_A, D, A, X, K):
     """
     Finds the K nearest neighbors in A for each query vector in X using
     brute-force pairwise L2 distance calculation (via distance_l2_triton).
@@ -396,6 +396,47 @@ def our_knn(N_A, D, A, X, K):
     topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
     end_time = time.time()
     print(f"k-NN computation time: {end_time - start_time:.4f} seconds")
+    return topk_indices, topk_distances
+def our_knn(N_A, D, A, X, K):
+    """
+    Finds the K nearest neighbors in A for each query vector in X using
+    brute-force pairwise L2 distance calculation.
+
+    Args:
+        N_A (int): Number of database points (should match A.shape[0]).
+        D (int): Dimensionality (should match A.shape[1] and X.shape[1]).
+        A (torch.Tensor): Database vectors (N_A, D) on GPU.
+        X (torch.Tensor): Query vectors (Q, D) on GPU.
+        K (int): Number of neighbors to find.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - topk_indices (torch.Tensor): Indices of the K nearest neighbors (Q, K).
+            - topk_distances (torch.Tensor): Squared L2 distances of the K nearest neighbors (Q, K).
+    """
+    A_prep, X_prep = _prepare_tensors(A, X)
+    Q = X_prep.shape[0]
+    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
+    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
+    assert X_prep.shape[1] == D, "D doesn't match X.shape[1]"
+    assert K > 0, "K must be positive"
+    assert K <= N_A, "K cannot be larger than the number of database points"
+
+
+    print(f"Running k-NN: Q={Q}, N={N_A}, D={D}, K={K}")
+    start_time = time.time()
+
+    # 1. Calculate all pairwise squared L2 distances
+    #    distance_l2 returns squared L2 distances
+    all_distances = distance_l2_triton(X_prep, A_prep) # Shape (Q, N_A)
+
+    # 2. Find the top K smallest distances for each query
+    #    largest=False gives smallest distances (nearest neighbors)
+    topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
+
+    end_time = time.time()
+    print(f"k-NN computation time: {end_time - start_time:.4f} seconds")
+
     return topk_indices, topk_distances
 
 # ============================================================================
@@ -1208,8 +1249,25 @@ if __name__ == "__main__":
     # print("Sample ANN Dists (Query 0):\n", ann_dists[0]) # Optional print
 
     # --- Recall Calculation ---
-    if N_queries > 0 and K_val > 0:
-        true_knn_ids = set(knn_indices[0].tolist())
-        approx_ann_ids = set(ann_indices[0].tolist()); approx_ann_ids.discard(-1)
-        recall = len(true_knn_ids.intersection(approx_ann_ids)) / K_val
-        print(f"\nANN Recall @ {K_val} for Query 0 (vs brute-force KNN): {recall:.2%}")
+    if N_queries > 0 and K_val > 0 and 'knn_indices' in locals() and 'ann_indices' in locals():
+        total_intersect = 0
+    # Loop through all queries
+        for i in range(N_queries):
+        # Get true KNN neighbors for query i
+            true_knn_ids = set(knn_indices[i].cpu().tolist())
+        # Get approximate ANN neighbors for query i
+            approx_ann_ids = set(ann_indices[i].cpu().tolist())
+        # Remove potential -1 placeholders from ANN results
+            approx_ann_ids.discard(-1)
+        # Add the number of overlapping neighbors to the total
+            total_intersect += len(true_knn_ids.intersection(approx_ann_ids))
+
+    # Calculate average recall across all queries
+        if N_queries * K_val > 0:
+            avg_recall = total_intersect / (N_queries * K_val)
+            print(f"\nAverage ANN Recall @ {K_val} (vs brute-force KNN): {avg_recall:.2%}")
+        else:
+            print("\nCannot calculate average recall (N_queries or K_val is zero).")
+
+    elif 'knn_indices' not in locals() or 'ann_indices' not in locals():
+        print("\nCannot calculate recall: KNN or ANN results not available.")
