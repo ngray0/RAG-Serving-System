@@ -119,7 +119,7 @@ def dot_kernel_pairwise(
     pid_q = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    dot_prod = tl.zeros((), dtype=tl.float32)
+    dot_prod = tl.zeros((), dtype=tl.float64)
     for d_start in range(0, D, BLOCK_SIZE_D):
         d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
@@ -382,7 +382,7 @@ def distance_dot2(X, A):
     N, D_A = A_prep.shape
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
 
-    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+    Out = torch.empty((Q, N), dtype=torch.float64, device=device)
     grid = (Q, N)
     dot_kernel_pairwise[grid](
         X_prep, A_prep, Out,
@@ -1428,13 +1428,13 @@ if __name__ == "__main__":
 # Compare results
     rtol = 1e-5
     atol = 1e-6
-    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products).to(torch.float32), rtol=rtol, atol=atol)
+    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products).to(torch.float64), rtol=rtol, atol=atol)
 
     if are_dots_close:
         print("Dot product verification successful: distance_dot_triton matches torch.matmul.")
     else:
         print("Dot product verification FAILED: distance_dot_triton does NOT match torch.matmul.")
-        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products).to(torch.float32)))
+        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products).to(torch.float64)))
         print(f"Maximum absolute difference in dot products: {max_diff_dot.item()}")
     # Consider printing samples if failed
     # print("GPU DOT:", gpu_dot_products.cpu()[0,:5])
