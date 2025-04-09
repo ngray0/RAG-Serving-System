@@ -28,7 +28,7 @@ print(f"Using device: {device}")
 DEFAULT_BLOCK_Q = 32
 DEFAULT_BLOCK_N = 64
 DEFAULT_BLOCK_D = 128
-DEFAULT_BLOCK_K = 64 # Block size for the reduction dimension D (used by all tiled kernels)
+DEFAULT_BLOCK_K = 16 # Block size for the reduction dimension D (used by all tiled kernels)
 
 def ceil_div(a, b):
     return (a + b - 1) // b
