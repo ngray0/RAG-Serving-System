@@ -1065,7 +1065,7 @@ if __name__ == "__main__":
         true_knn_ids_q0 = set(knn_indices[0].tolist())
     else:
         true_knn_ids_q0 = set() # Cannot calculate recall
-
+    '''
     # --- Loop through hyperparameters ---
     for m_val in m_options:
         for efc_val in efc_options:
@@ -1092,7 +1092,7 @@ if __name__ == "__main__":
                 })
                 print(f"    Result: Build={build_time:.2f}s, Search={search_time:.4f}s, Recall@10(Q0)={recall_q0:.2%}")
                 # Optional: Add a small delay if needed, e.g. time.sleep(1)
-
+    
     # --- Print Summary ---
     print("\n" + "="*40)
     print("ANN Hyperparameter Test Summary:")
@@ -1104,15 +1104,15 @@ if __name__ == "__main__":
          print(f"M={res['M']:<3d}, efC={res['efC']:<4d}, efS={res['efS']:<4d} -> "
                f"Build={res['build_time']:.2f}s, Search={res['search_time']:.4f}s, "
                f"Recall(Q0)={res['recall_q0']:.2%}")
-
+    '''
     # --- Test ANN (HNSW) ---
     print("\n" + "="*40)
     print(f"Testing our_ann (HNSW, K={K_val})...")
     print("="*40)
     ann_indices, ann_dists = our_ann(N_data, Dim, A_data, X_queries, K_val,
                              M=32,              # Keep M for now
-                             ef_construction=300, # Keep efC for now
-                             ef_search=800) 
+                             ef_construction=200, # Keep efC for now
+                             ef_search=100) 
     print("ANN results shape (Indices):", ann_indices.shape)
     print("ANN results shape (Distances - Squared L2):", ann_dists.shape) # HNSW returns Squared L2
     # print("Sample ANN Indices (Query 0):\n", ann_indices[0]) # Optional print
