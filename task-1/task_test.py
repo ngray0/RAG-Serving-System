@@ -106,6 +106,37 @@ def dot_kernel_pairwise_tiled(
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
 
+@triton.jit
+def dot_kernel_pairwise(
+    X_ptr, A_ptr, Out_ptr,
+    Q, N, D,
+    stride_xq, stride_xd,
+    stride_an, stride_ad,
+    stride_outq, stride_outn,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates pairwise dot product: dot(X[q], A[n])"""
+    pid_q = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    dot_prod = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < d_end
+
+        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
+
+        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
+
+        dot_prod += tl.sum(x_vals * a_vals, axis=0)
+
+    out_offset = pid_q * stride_outq + pid_n * stride_outn
+    tl.store(Out_ptr + out_offset, dot_prod)
+
+
 @triton.autotune(
         configs=[
         # --- Blocks including 8x? or ?x8 ---
@@ -343,6 +374,27 @@ def distance_dot_triton(X, A, **kwargs):
         Out.stride(0), Out.stride(1),
         **kwargs
     )
+    return Out
+def distance_dot2(X, A):
+    """Computes pairwise dot product using Triton kernel."""
+    X_prep, A_prep = _prepare_tensors(X, A)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+    grid = (Q, N)
+    dot_kernel_pairwise[grid](
+        X_prep, A_prep, Out,
+        Q, N, D,
+        X_prep.stride(0), X_prep.stride(1),
+        A_prep.stride(0), A_prep.stride(1),
+        Out.stride(0), Out.stride(1),
+        BLOCK_SIZE_D=DEFAULT_BLOCK_D
+    )
+    # Return negative dot product if used for minimization (finding 'nearest')
+    # return -Out
+    # Or return raw dot product if similarity maximization is intended
     return Out
 
 def distance_l2_triton(X, A, **kwargs):
@@ -1367,6 +1419,27 @@ if __name__ == "__main__":
     # Consider printing samples if failed
     # print("GPU DOT:", gpu_dot_products.cpu()[0,:5])
     # print("REF DOT:", ref_dot_products.cpu()[0,:5])
+    gpu_dot_products = distance_dot2(X_queries, A_data)
+
+# Calculate reference dot products using PyTorch matmul
+# Ensure dtypes match for matmul if necessary, though PyTorch handles mixed types
+    ref_dot_products = torch.matmul(X_queries, A_data.T) # X (Q,D) @ A.T (D,N) -> (Q,N)
+
+# Compare results
+    rtol = 1e-5
+    atol = 1e-6
+    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products).to(torch.float32), rtol=rtol, atol=atol)
+
+    if are_dots_close:
+        print("Dot product verification successful: distance_dot_triton matches torch.matmul.")
+    else:
+        print("Dot product verification FAILED: distance_dot_triton does NOT match torch.matmul.")
+        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products).to(torch.float32)))
+        print(f"Maximum absolute difference in dot products: {max_diff_dot.item()}")
+    # Consider printing samples if failed
+    # print("GPU DOT:", gpu_dot_products.cpu()[0,:5])
+    # print("REF DOT:", ref_dot_products.cpu()[0,:5])
+
 
     start_time = time.time()
     print("\n" + "="*40)
