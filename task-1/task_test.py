@@ -345,7 +345,7 @@ def distance_dot_triton(X, A, **kwargs):
     )
     return Out
 
-def distance_l2_triton2(X, A, **kwargs):
+def distance_l2_triton(X, A, **kwargs):
     """
     Computes pairwise L2 (Euclidean) distances using the tiled dot product kernel
     and PyTorch operations for norms.
@@ -362,9 +362,9 @@ def distance_l2_triton2(X, A, **kwargs):
     A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # (N, 1)
     dist_sq = X_norm_sq - 2 * dot_products + A_norm_sq.T # (Q, N)
     dist_sq.clamp_(min=0.0)
-    dist = torch.sqrt(dist_sq)
-    return dist
-def distance_l2_triton(X, A):
+    #dist = torch.sqrt(dist_sq)
+    return dist_sq
+def distance_l2_triton2(X, A):
     """Computes pairwise squared L2 distance using Triton kernel."""
     X_prep, A_prep = _prepare_tensors(X, A)
     Q, D = X_prep.shape
