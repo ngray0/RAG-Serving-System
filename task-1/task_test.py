@@ -246,7 +246,7 @@ def kmeans_assign_kernel(
     tl.store(assignments_out_ptrs, best_assignment, mask=mask_n)
 
 @triton.jit
-def l2_dist_kernel_1_vs_M(
+def l2_dist_kernel_1_vs_M2(
     query_ptr, candidates_ptr, output_ptr,
     M, D, stride_cand_m, stride_cand_d,
     BLOCK_SIZE_D: tl.constexpr,
@@ -560,7 +560,32 @@ def l2_dist_kernel_pairwise(
     # Store result
     out_offset = pid_q * stride_outq + pid_n * stride_outn
     tl.store(Out_ptr + out_offset, dist_sq)
-
+@triton.jit
+def l2_dist_kernel_1_vs_M( # Renamed from previous example
+    query_ptr,      # Pointer to query vector (D,)
+    candidates_ptr, # Pointer to candidate vectors (M, D)
+    output_ptr,     # Pointer to output distances (M,)
+    M, D,           # Dimensions
+    stride_cand_m, stride_cand_d,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates squared L2 distance: 1 query vs M candidates."""
+    pid_m = tl.program_id(axis=0) # Candidate index
+    dist_sq = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < D
+        # Load query block
+        query_d_ptr = query_ptr + offs_d
+        query_vals = tl.load(query_d_ptr, mask=mask_d, other=0.0)
+        # Load candidate block
+        cand_d_ptr = candidates_ptr + pid_m * stride_cand_m + offs_d * stride_cand_d
+        cand_vals = tl.load(cand_d_ptr, mask=mask_d, other=0.0)
+        # Accumulate difference squared
+        diff = query_vals - cand_vals
+        dist_sq += tl.sum(diff * diff, axis=0)
+    # Store result
+    tl.store(output_ptr + pid_m, dist_sq)
 
 # ============================================================================
 # Task 2.2: Approximate Nearest Neighbors (Simplified HNSW)
