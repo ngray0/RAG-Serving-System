@@ -1051,7 +1051,7 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
     print(f"ANN search time: {end_search - start_search:.4f} seconds")
 
     return all_indices, all_distances
-
+'''
 # ============================================================================
 # Example Usage (Modified)
 # ============================================================================
@@ -1220,7 +1220,7 @@ if __name__ == "__main__":
         true_knn_ids_q0 = set(knn_indices[0].tolist())
     else:
         true_knn_ids_q0 = set() # Cannot calculate recall
-    '''
+    
     # --- Loop through hyperparameters ---
     for m_val in m_options:
         for efc_val in efc_options:
@@ -1259,7 +1259,7 @@ if __name__ == "__main__":
          print(f"M={res['M']:<3d}, efC={res['efC']:<4d}, efS={res['efS']:<4d} -> "
                f"Build={res['build_time']:.2f}s, Search={res['search_time']:.4f}s, "
                f"Recall(Q0)={res['recall_q0']:.2%}")
-    '''
+    
     # --- Test ANN (HNSW) ---
     print("\n" + "="*40)
     print(f"Testing our_ann (HNSW, K={K_val})...")
@@ -1296,3 +1296,243 @@ if __name__ == "__main__":
 
     elif 'knn_indices' not in locals() or 'ann_indices' not in locals():
         print("\nCannot calculate recall: KNN or ANN results not available.")
+'''
+if __name__ == "__main__":
+    N_data = 5000
+    N_queries = 100
+    Dim = 128
+    K_val = 10
+
+    print("="*40)
+    print("Generating Data...")
+    print("="*40)
+    # Database vectors
+    A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
+    # Query vectors
+    X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot_dists = distance_dot_triton(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", dot_dists.shape)
+    print(dot_dists)
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_l2...")
+    print("="*40)
+    l2_dists = distance_l2_triton(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", l2_dists.shape)
+    print(l2_dists)
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_cosine...")
+    print("="*40)
+    cos_dists = distance_cosine_triton(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample Cosine distances shape:", cos_dists.shape)
+    print(cos_dists)
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_manhattan...")
+    print("="*40)
+    man_dists = distance_manhattan_triton(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample Manhattan distances shape:", man_dists.shape)
+    print(man_dists)
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot_dists2 = distance_dot_triton(X_queries, A_data)
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", dot_dists2.shape)
+    
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_l2...")
+    print("="*40)
+    l2_dists2 = distance_l2_triton(X_queries, A_data)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", l2_dists2.shape)
+    
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_cosine...")
+    print("="*40)
+    cos_dists2 = distance_cosine_triton(X_queries, A_data)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample Cosine distances shape:", cos_dists2.shape)
+   
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_manhattan...")
+    print("="*40)
+    man_dists2 = distance_manhattan_triton(X_queries, A_data)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample Manhattan distances shape:", man_dists2.shape)
+   
+
+
+
+    print("\n" + "="*40)
+    print(f"Testing our_knn (K={K_val})...")
+    print("="*40)
+    knn_indices, knn_dists = our_knn(N_data, Dim, A_data, X_queries, K_val)
+    print("KNN results shape (Indices):", knn_indices.shape)
+    print("KNN results shape (Distances):", knn_dists.shape)
+    print("Sample KNN Indices (Query 0):\n", knn_indices[0])
+    print("Sample KNN Dists (Query 0):\n", knn_dists[0])
+
+
+    print("\n" + "="*40)
+    print(f"Testing our_kmeans (K=5)...")
+    print("="*40)
+    K_clusters = 5
+    kmeans_centroids, kmeans_assignments = our_kmeans(N_data, Dim, A_data, K_clusters)
+    print("KMeans centroids shape:", kmeans_centroids.shape)
+    print("KMeans assignments shape:", kmeans_assignments.shape)
+    print("Sample KMeans Assignments:\n", kmeans_assignments[:20])
+    # Verify counts
+    ids, counts = torch.unique(kmeans_assignments, return_counts=True)
+    print("Cluster counts:")
+    for id_val, count_val in zip(ids.tolist(), counts.tolist()):
+        print(f"  Cluster {id_val}: {count_val}")
+
+
+    print("\n" + "="*40)
+    print(f"Testing our_ann (HNSW, K={K_val})...")
+    print("="*40)
+    # Reduce HNSW params for quicker example run
+    ann_indices, ann_dists = our_ann(N_data, Dim, A_data, X_queries, K_val,
+                                 M=32,              # Increased connections
+                                 ef_construction=200, # Increased construction beam
+                                 ef_search=100) 
+    print("ANN results shape (Indices):", ann_indices.shape)
+    print("ANN results shape (Distances):", ann_dists.shape)
+    print("Sample ANN Indices (Query 0):\n", ann_indices[0])
+    print("Sample ANN Dists (Query 0):\n", ann_dists[0])
+
+    # Optional: Compare ANN vs KNN recall for query 0
+    """
+    if N_queries > 0 and K_val > 0:
+        true_knn_ids = set(knn_indices[0].tolist())
+        approx_ann_ids = set(ann_indices[0].tolist())
+        # Remove potential -1 placeholders if K > actual neighbors found
+        approx_ann_ids.discard(-1)
+
+        recall = len(true_knn_ids.intersection(approx_ann_ids)) / K_val
+        print(f"\nANN Recall @ {K_val} for Query 0 (vs brute-force KNN): {recall:.2%}")
+    """
+    if N_queries > 0 and K_val > 0 and 'knn_indices' in locals() and 'ann_indices' in locals():
+        total_intersect = 0
+    # Loop through all queries
+        for i in range(N_queries):
+        # Get true KNN neighbors for query i
+            true_knn_ids = set(knn_indices[i].cpu().tolist())
+        # Get approximate ANN neighbors for query i
+            approx_ann_ids = set(ann_indices[i].cpu().tolist())
+        # Remove potential -1 placeholders from ANN results
+            approx_ann_ids.discard(-1)
+        # Add the number of overlapping neighbors to the total
+            total_intersect += len(true_knn_ids.intersection(approx_ann_ids))
+
+    # Calculate average recall across all queries
+        if N_queries * K_val > 0:
+            avg_recall = total_intersect / (N_queries * K_val)
+            print(f"\nAverage ANN Recall @ {K_val} (vs brute-force KNN): {avg_recall:.2%}")
+        else:
+            print("\nCannot calculate average recall (N_queries or K_val is zero).")
+
+    elif 'knn_indices' not in locals() or 'ann_indices' not in locals():
+        print("\nCannot calculate recall: KNN or ANN results not available.")
+'''
+def test_kmeans():
+    N, D, A, K = testdata_kmeans("test_file.json")
+    kmeans_result = our_kmeans(N, D, A, K)
+    print(kmeans_result)
+
+def test_knn():
+    N, D, A, X, K = testdata_knn("test_file.json")
+    knn_result = our_knn(N, D, A, X, K)
+    print(knn_result)
+    
+def test_ann():
+    N, D, A, X, K = testdata_ann("test_file.json")
+    ann_result = our_ann(N, D, A, X, K)
+    print(ann_result)
+    
+def recall_rate(list1, list2):
+    """
+    Calculate the recall rate of two lists
+    list1[K]: The top K nearest vectors ID
+    list2[K]: The top K nearest vectors ID
+    """
+    return len(set(list1) & set(list2)) / len(list1)
+
+def main():
+    np.random.seed(0)
+    #size = 1 << 20  # 1 million elements
+    n = 1000
+    d = 100
+    # Transfer to GPU.
+    A_cp = cp.random.rand(n, d).astype(cp.float32)
+    B_cp = cp.random.rand(n, d).astype(cp.float32)
+    
+    start_time = time.time()
+    l2 = distance_l2(A_cp, B_cp)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    dot = distance_dot(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Dot Product distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    manhattan = distance_manhattan(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+
+    start_time = time.time()
+    cosine = distance_cosine(A_cp, B_cp)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+
+    
+    print("L2 (Euclidean) distance:", l2)
+    print("Dot product:", dot)
+    print("Manhattan (L1) distance:", manhattan)
+    print("Cosine distance:", cosine)
+
+    knn_idx, knn_dists = our_knn(A_cp.shape[0], A_cp.shape[1], A_cp, B_cp, 5, distance_l2)
+    print(knn_idx, knn_dists)
+    knn_idx, knn_dists = our_knn(A_cp.shape[0], A_cp.shape[1], A_cp, B_cp, 5, distance_cosine)
+    print(knn_idx, knn_dists)
+    knn_idx, knn_dists = our_knn(A_cp.shape[0], A_cp.shape[1], A_cp, B_cp, 5, distance_manhattan)
+    print(knn_idx, knn_dists)
+    knn_idx, knn_dists = our_knn(A_cp.shape[0], A_cp.shape[1], A_cp, B_cp, 5, distance_dot)
+    print(knn_idx, knn_dists)
+
+
+if __name__ == "__main__":
+    main()
+'''
