@@ -1092,27 +1092,86 @@ if __name__ == "__main__":
     # Query vectors
     X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
 
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot_dists = distance_dot(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", dot_dists.shape)
+    print(dot_dists)
 
+    start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_l2...")
     print("="*40)
     l2_dists = distance_l2(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", l2_dists.shape)
     print(l2_dists)
 
+    start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_cosine...")
     print("="*40)
     cos_dists = distance_cosine(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample Cosine distances shape:", cos_dists.shape)
     print(cos_dists)
 
+    start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_manhattan...")
     print("="*40)
     man_dists = distance_manhattan(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample Manhattan distances shape:", man_dists.shape)
     print(man_dists)
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot_dists2 = distance_dot(X_queries, A_data)
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", dot_dists2.shape)
+    
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_l2...")
+    print("="*40)
+    l2_dists2 = distance_l2(X_queries, A_data)
+    end_time = time.time()
+    print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", l2_dists2.shape)
+    
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_cosine...")
+    print("="*40)
+    cos_dists2 = distance_cosine(X_queries, A_data)
+    end_time = time.time()
+    print(f"Cosine distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample Cosine distances shape:", cos_dists2.shape)
+   
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_manhattan...")
+    print("="*40)
+    man_dists2 = distance_manhattan(X_queries, A_data)
+    end_time = time.time()
+    print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample Manhattan distances shape:", man_dists2.shape)
+   
+
 
 
     dlpack_A = torch.to_dlpack(A_data)
