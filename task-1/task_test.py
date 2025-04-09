@@ -268,7 +268,7 @@ def l2_dist_kernel_1_vs_M(
 # ============================================================================
 # Helper Functions
 # ============================================================================
-def _prepare_tensors(*tensors, target_device):
+def _prepare_tensors(*tensors, target_device =device):
     """Ensure tensors are float32, contiguous, and on the correct device."""
     prepared = []
     for t in tensors:
