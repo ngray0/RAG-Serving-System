@@ -549,6 +549,25 @@ def our_knn_hierachy(N, D, A, X, K):
     k_indices = k_indices[cp.argsort(distances[k_indices])]
     return k_indices
 
+def our_knn_stream(N, D, A, X, K):
+    """
+    KNN using CUDA Streams in CuPy for concurrent query processing.
+    """
+    B = X.shape[0] if X.ndim > 1 else 1  # Determine batch size.
+    streams = [cp.cuda.Stream() for _ in range(B)]
+    results = [None] * B
+
+    for i in range(B):
+        with streams[i]:
+            query = X[i] if X.ndim > 1 else X
+            distances = compute_all_distances(A, query)[CURRENT_DISTANCE]
+            k_indices = cp.argpartition(distances, K)[:K]
+            results[i] = k_indices[cp.argsort(distances[k_indices])]
+    for s in streams:
+        s.synchronize()
+    
+    return results if B > 1 else results[0]
+
 
 if __name__ == "__main__":
     N_data = 5000
@@ -677,6 +696,10 @@ if __name__ == "__main__":
     knn_indices = our_knn_hierachy(N_data, Dim, A_data_cp, X_queries_cp[5], K_val)         
     end_time = time.time()
     print("Hierarchy", end_time-start_time)
+    start_time = time.time() 
+    knn_indices = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val)         
+    end_time = time.time()
+    print("Streams", end_time-start_time,(end_time-start_time)/N_queries)
 
     start_time = time.time()
     knn_indices_cp,_ = our_knn(N_data, Dim, A_data, X_queries, K_val)
