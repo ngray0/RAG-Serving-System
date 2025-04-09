@@ -13,8 +13,12 @@ from datasets import load_dataset
 import datetime
 
 from metrics.collector import MetricsCollector
+from rag_service.config import Settings
 
-QUERIES_FILE = "data/short_facts_queries.json"
+settings = Settings()
+QUERIES_FILE = settings.document_queries_file
+POLL_INTERVAL = settings.polling_interval
+
 
 def generate_trace(pattern: str, rps: int, duration: int, seed: int = None) -> List[int]:
     """
@@ -123,7 +127,6 @@ def send_request(endpoint, query, timeout, metrics, request_id, timestamp_data):
             
         # Step 2: Poll for the result
         start_poll_time = time.time()
-        poll_interval = 0.1  # seconds between polls
         
         while True:
             #check if exceeded timeout
@@ -155,7 +158,7 @@ def send_request(endpoint, query, timeout, metrics, request_id, timestamp_data):
                     return
                     
                 # If still processing, wait and try again
-                time.sleep(poll_interval)
+                time.sleep(POLL_INTERVAL)
                 
             except Exception as e:
                 print(f"Failed to parse poll response: {e}")

@@ -30,7 +30,8 @@ def main():
     # Create request queue
     request_queue = RequestQueue(
         max_batch_size=settings.max_batch_size,
-        max_wait_time=settings.max_wait_time
+        max_wait_time=settings.max_wait_time,
+        polling_interval=settings.polling_interval
     )
 
     # retriever object
@@ -45,7 +46,8 @@ def main():
         embedding_model=embedding_model,
         llm_model=llm_model,
         retriever = retriever,
-        device = settings.device
+        device = settings.device,
+        polling_interval = settings.polling_interval
     )
     
     processor.start()

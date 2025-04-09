@@ -18,13 +18,15 @@ class BatchProcessor(threading.Thread):
                  embedding_model: dict,
                  llm_model, 
                  retriever: SimpleRetriever, 
-                 device: str = 'cuda'): 
+                 device: str = 'cuda',
+                 polling_interval: float = 0.1): 
         super().__init__(daemon=True) 
         self.request_queue = request_queue
         self.embedding_model = embedding_model
         self.llm_model = llm_model
         self.retriever = retriever 
         self.device = torch.device(device) 
+        self.polling_interval = polling_interval
         self.running = True
 
         # Move models to the cuda deviced
@@ -52,7 +54,7 @@ class BatchProcessor(threading.Thread):
 
                 if not batch:
                     # No requests, sleep adn try again
-                    time.sleep(0.05) 
+                    time.sleep(self.polling_interval) 
                     continue
 
                 logging.info(f"Processing batch of size {len(batch)}...")
@@ -94,7 +96,7 @@ class BatchProcessor(threading.Thread):
             )
 
             # Format contexts for the LLM
-            all_contexts = ["\n---\n".join(docs) for docs in all_retrieved_docs] # Use a separator
+            all_contexts = ["\n---\n".join(docs) for docs in all_retrieved_docs] 
 
             # 3 Batch LLM generation
             prompts = [f"Context:\n{c}\n\nQuestion: {q}\n\nAnswer:" for q, c in zip(queries, all_contexts)]
