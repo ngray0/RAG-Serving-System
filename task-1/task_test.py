@@ -142,6 +142,44 @@ def dot_kernel_pairwise_tiled(
     key=['Q', 'N', 'D'],
 )
 @triton.jit
+def l2_dist_kernel_pairwise(
+    X_ptr,      # Pointer to Query vectors (Q, D)
+    A_ptr,      # Pointer to Database vectors (N, D)
+    Out_ptr,    # Pointer to output distances (Q, N)
+    # --- Dimensions ---
+    Q, N, D,
+    # --- Strides ---
+    stride_xq, stride_xd,
+    stride_an, stride_ad,
+    stride_outq, stride_outn,
+    # --- Block Size ---
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates pairwise squared L2 distance: dist(X[q], A[n])"""
+    pid_q = tl.program_id(axis=0) # Query index
+    pid_n = tl.program_id(axis=1) # Database index
+
+    dist_sq = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < d_end
+
+        # Load X[pid_q, d_start:d_end]
+        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
+
+        # Load A[pid_n, d_start:d_end]
+        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
+
+        diff = x_vals - a_vals
+        dist_sq += tl.sum(diff * diff, axis=0)
+
+    # Store result
+    out_offset = pid_q * stride_outq + pid_n * stride_outn
+    tl.store(Out_ptr + out_offset, dist_sq)
+@triton.jit
 def manhattan_kernel_pairwise_tiled(
     X_ptr, A_ptr, Out_ptr,           # Data pointers
     Q, N, D,                         # Matrix dimensions
@@ -306,7 +344,7 @@ def distance_dot_triton(X, A, **kwargs):
     )
     return Out
 
-def distance_l2_triton(X, A, **kwargs):
+def distance_l2_triton2(X, A, **kwargs):
     """
     Computes pairwise L2 (Euclidean) distances using the tiled dot product kernel
     and PyTorch operations for norms.
@@ -325,6 +363,25 @@ def distance_l2_triton(X, A, **kwargs):
     dist_sq.clamp_(min=0.0)
     dist = torch.sqrt(dist_sq)
     return dist
+def distance_l2_triton(X, A):
+    """Computes pairwise squared L2 distance using Triton kernel."""
+    X_prep, A_prep = _prepare_tensors(X, A)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+    grid = (Q, N)
+    l2_dist_kernel_pairwise[grid](
+        X_prep, A_prep, Out,
+        Q, N, D,
+        X_prep.stride(0), X_prep.stride(1),
+        A_prep.stride(0), A_prep.stride(1),
+        Out.stride(0), Out.stride(1),
+        BLOCK_SIZE_D=DEFAULT_BLOCK_D
+    )
+    return Out
+
 
 def distance_cosine_triton(X, A, epsilon=1e-8, **kwargs):
     """
@@ -522,44 +579,7 @@ def _prepare_tensors2(*tensors):
         prepared.append(t.contiguous())
     return prepared
 DEFAULT_BLOCK_D = 128
-@triton.jit
-def l2_dist_kernel_pairwise(
-    X_ptr,      # Pointer to Query vectors (Q, D)
-    A_ptr,      # Pointer to Database vectors (N, D)
-    Out_ptr,    # Pointer to output distances (Q, N)
-    # --- Dimensions ---
-    Q, N, D,
-    # --- Strides ---
-    stride_xq, stride_xd,
-    stride_an, stride_ad,
-    stride_outq, stride_outn,
-    # --- Block Size ---
-    BLOCK_SIZE_D: tl.constexpr,
-):
-    """Calculates pairwise squared L2 distance: dist(X[q], A[n])"""
-    pid_q = tl.program_id(axis=0) # Query index
-    pid_n = tl.program_id(axis=1) # Database index
 
-    dist_sq = tl.zeros((), dtype=tl.float32)
-    for d_start in range(0, D, BLOCK_SIZE_D):
-        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
-        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
-        mask_d = offs_d < d_end
-
-        # Load X[pid_q, d_start:d_end]
-        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
-        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
-
-        # Load A[pid_n, d_start:d_end]
-        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
-        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
-
-        diff = x_vals - a_vals
-        dist_sq += tl.sum(diff * diff, axis=0)
-
-    # Store result
-    out_offset = pid_q * stride_outq + pid_n * stride_outn
-    tl.store(Out_ptr + out_offset, dist_sq)
 @triton.jit
 def l2_dist_kernel_1_vs_M( # Renamed from previous example
     query_ptr,      # Pointer to query vector (D,)
