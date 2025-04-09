@@ -525,9 +525,9 @@ def l2_dist_kernel_pairwise(
 # Task 2.2: Approximate Nearest Neighbors (Simplified HNSW)
 # ============================================================================
 # (Using the HNSW class provided in the previous version)
-class SimpleHNSW_for_ANN:
-    # Uses l2_dist_kernel_1_vs_M and distance_l2_triton internally now
+class SimpleHNSW_for_ANN: # Using previous class structure
     def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
+        # --- Existing __init__ content ---
         self.dim = dim
         self.M = M
         self.ef_construction = ef_construction
@@ -539,7 +539,8 @@ class SimpleHNSW_for_ANN:
         self.node_count = 0
         self.entry_point = -1
         self.max_level = -1
-        self.BLOCK_SIZE_D_DIST = DEFAULT_BLOCK_K # Use global default block size
+        self.BLOCK_SIZE_D_DIST = 128
+        # --- End of existing __init__ content ---
 
     def _get_level_for_new_node(self):
         level = int(-math.log(random.uniform(0, 1)) * self.mL)
@@ -547,14 +548,23 @@ class SimpleHNSW_for_ANN:
 
     def _distance(self, query_vec, candidate_indices):
         """Internal distance calc using the 1-vs-M Triton kernel (Squared L2)."""
+        # --- Uses l2_dist_kernel_1_vs_M as defined before ---
+        # (Code identical to previous working version)
         if not isinstance(candidate_indices, list): candidate_indices = list(candidate_indices)
-        if not candidate_indices: return torch.empty(0, device=device), []
-        target_device = query_vec.device if isinstance(query_vec, torch.Tensor) else self.vectors.device
-        query_vec_prep, = _prepare_tensors(query_vec.flatten(), target_device=target_device)
+        if not candidate_indices: return torch.empty(0, device=device), [] # Return empty indices too
+
+        num_candidates = len(candidate_indices)
+        # Ensure query is prepared (or assume it is)
+        query_vec_prep, = _prepare_tensors(query_vec.flatten())
+        # Gather candidate vectors from the main storage
+        # Ensure indices are valid before indexing
         valid_indices = [idx for idx in candidate_indices if idx < self.node_count and idx >= 0]
-        if not valid_indices: return torch.empty(0, device=device), []
+        if not valid_indices:
+             return torch.empty(0, device=device), []
+
         num_valid_candidates = len(valid_indices)
-        candidate_vectors, = _prepare_tensors(self.vectors[valid_indices], target_device=target_device)
+        candidate_vectors = self.vectors[valid_indices] # Index with valid indices only
+
         distances_out = torch.empty(num_valid_candidates, dtype=torch.float32, device=device)
         grid = (num_valid_candidates,)
         l2_dist_kernel_1_vs_M[grid](
@@ -563,7 +573,8 @@ class SimpleHNSW_for_ANN:
             candidate_vectors.stride(0), candidate_vectors.stride(1),
             BLOCK_SIZE_D=self.BLOCK_SIZE_D_DIST
         )
-        return distances_out, valid_indices # Returns squared L2
+        # Return distances corresponding to the valid_indices used
+        return distances_out, valid_indices
 
     def _distance_batch(self, query_indices, candidate_indices):
         """
@@ -588,7 +599,7 @@ class SimpleHNSW_for_ANN:
         grid = (Q, N)
 
         # Ensure vectors are prepared if necessary (e.g., contiguous)
-        query_vectors, candidate_vectors = _prepare_tensors2(query_vectors, candidate_vectors)
+        query_vectors, candidate_vectors = _prepare_tensors(query_vectors, candidate_vectors)
 
         # Assuming l2_dist_kernel_pairwise is defined and imported/available
         l2_dist_kernel_pairwise[grid](
@@ -601,6 +612,8 @@ class SimpleHNSW_for_ANN:
         )
         return Out
 
+
+    # --- REVISED _select_neighbors_heuristic METHOD ---
     def _select_neighbors_heuristic(self, query_vec, candidates, M_target):
         """
         Selects M_target neighbors from candidates using a heuristic.
@@ -681,96 +694,158 @@ class SimpleHNSW_for_ANN:
 
         return selected_neighbors
 
-
+    # --- REVISED add_point METHOD ---
     def add_point(self, point_vec):
-        """Adds a single point to the graph."""
-        target_device = self.vectors.device if self.node_count > 0 else device
-        point_vec_prep, = _prepare_tensors(point_vec.flatten(), target_device=target_device)
+        """Adds a single point to the graph using heuristic neighbor selection."""
+        point_vec, = _prepare_tensors(point_vec.flatten()) # Prepare input
         new_node_id = self.node_count
-
-        if self.node_count == 0: self.vectors = point_vec_prep.unsqueeze(0)
-        else: self.vectors = torch.cat((self.vectors, point_vec_prep.unsqueeze(0)), dim=0)
+        # Note: In a real implementation, dynamically resizing GPU tensors like this
+        # can be inefficient. Pre-allocation or different memory strategies are often used.
+        self.vectors = torch.cat((self.vectors, point_vec.unsqueeze(0)), dim=0)
         self.node_count += 1
+
         node_level = self._get_level_for_new_node()
         self.level_assignments.append(node_level)
 
+        # Expand graph structure (CPU lists)
         while node_level >= len(self.graph): self.graph.append([])
         for lvl in range(len(self.graph)):
              while len(self.graph[lvl]) <= new_node_id: self.graph[lvl].append([])
 
         current_entry_point = self.entry_point
         current_max_level = self.max_level
-        if current_entry_point == -1:
-            self.entry_point = new_node_id; self.max_level = node_level; return new_node_id
 
+        if current_entry_point == -1: # First node
+            self.entry_point = new_node_id
+            self.max_level = node_level
+            return new_node_id
+
+        # Search from top layer down to insertion level + 1 to find EPs
         ep = [current_entry_point]
         for level in range(current_max_level, node_level, -1):
-             if level >= len(self.graph) or not ep or ep[0] >= len(self.graph[level]): continue
-             search_results = self._search_layer(point_vec_prep, ep, level, ef=1) # Uses squared L2
+             # Ensure graph structure is valid for this level and EP
+             if level >= len(self.graph) or ep[0] >= len(self.graph[level]):
+                  continue # Skip if level or node doesn't exist in graph structure yet
+             search_results = self._search_layer(point_vec, ep, level, ef=1)
              if not search_results: break
              ep = [search_results[0][1]]
 
+        # Connect node at each level from min(node_level, current_max_level) down to 0
         for level in range(min(node_level, current_max_level), -1, -1):
+             # Ensure graph structure is valid before search
              if level >= len(self.graph) or not ep or any(idx >= len(self.graph[level]) for idx in ep):
-                 if current_entry_point < len(self.graph[level]): ep = [current_entry_point]
-                 else: continue
+                 # Handle cases where entry points might be invalid for the level
+                 # This might happen if levels were added but nodes weren't fully connected yet.
+                 # A safer bet might be to use the global entry point if ep is invalid here.
+                 if current_entry_point < len(self.graph[level]):
+                     ep = [current_entry_point]
+                 else:
+                     continue # Cannot proceed at this level
 
-             neighbors_found_with_dist_sq = self._search_layer(point_vec_prep, ep, level, self.ef_construction) # Uses squared L2
-             if not neighbors_found_with_dist_sq: continue
-             selected_neighbor_ids = self._select_neighbors_heuristic(point_vec_prep, neighbors_found_with_dist_sq, self.M)
+             # Search layer to find candidate neighbors (size ef_construction)
+             neighbors_found_with_dist = self._search_layer(point_vec, ep, level, self.ef_construction)
+
+             if not neighbors_found_with_dist:
+                 # If search yields nothing, maybe use EPs from upper layer?
+                 # Or handle appropriately. For now, skip connecting if no neighbors found.
+                 continue
+
+             # --- Use Heuristic Selection ---
+             # Select M neighbors using the heuristic method
+             selected_neighbor_ids = self._select_neighbors_heuristic(point_vec, neighbors_found_with_dist, self.M)
+
+             # --- Add Connections ---
+             # Add forward connections (new_node -> selected_neighbors)
              self.graph[level][new_node_id] = selected_neighbor_ids
 
+             # Add backward connections (selected_neighbors -> new_node) with pruning
              for neighbor_id in selected_neighbor_ids:
-                 if neighbor_id >= len(self.graph[level]): continue
+                 # Ensure neighbor_id is valid for this level's graph structure
+                 if neighbor_id >= len(self.graph[level]):
+                      # This indicates a potential issue if search returned an invalid ID
+                      print(f"Warning: Neighbor ID {neighbor_id} out of bounds for level {level}. Skipping connection.")
+                      continue
+
                  neighbor_connections = self.graph[level][neighbor_id]
-                 if new_node_id not in neighbor_connections:
+                 if new_node_id not in neighbor_connections: # Avoid duplicate links
                      if len(neighbor_connections) < self.M:
                          neighbor_connections.append(new_node_id)
                      else:
-                         # Pruning logic (uses squared L2 from _distance)
-                         dist_new_sq, valid_new = self._distance(self.vectors[neighbor_id], [new_node_id])
-                         if not valid_new: continue
-                         dist_new_sq = dist_new_sq[0].item()
-                         current_neighbor_ids = list(neighbor_connections)
-                         dists_to_current_sq, valid_curr_ids = self._distance(self.vectors[neighbor_id], current_neighbor_ids)
-                         if dists_to_current_sq.numel() > 0:
-                              furthest_dist_sq = -1.0; furthest_idx_in_list = -1
-                              dist_map = {nid: d.item() for nid, d in zip(valid_curr_ids, dists_to_current_sq)}
+                         # --- Pruning Logic ---
+                         # Calculate distance from neighbor_id to new_node_id
+                         # Calculate distances from neighbor_id to its current neighbors
+                         # If new_node is closer than the furthest current neighbor, replace it.
+
+                         dist_new, _ = self._distance(self.vectors[neighbor_id], [new_node_id])
+                         if not dist_new: continue # Handle error if distance calc fails
+                         dist_new = dist_new[0].item()
+
+                         current_neighbor_ids = list(neighbor_connections) # Copy list
+                         dists_to_current, valid_curr_ids = self._distance(self.vectors[neighbor_id], current_neighbor_ids)
+
+                         if dists_to_current.numel() > 0:
+                              furthest_dist = -1.0
+                              furthest_idx_in_list = -1
+                              # Map distances back to original list indices if valid_curr_ids differs
+                              dist_map = {nid: d.item() for nid, d in zip(valid_curr_ids, dists_to_current)}
+
                               for list_idx, current_nid in enumerate(current_neighbor_ids):
-                                   d_sq = dist_map.get(current_nid, float('inf'))
-                                   if d_sq > furthest_dist_sq: furthest_dist_sq = d_sq; furthest_idx_in_list = list_idx
-                              if furthest_idx_in_list != -1 and dist_new_sq < furthest_dist_sq:
+                                   d = dist_map.get(current_nid, float('inf'))
+                                   if d > furthest_dist:
+                                        furthest_dist = d
+                                        furthest_idx_in_list = list_idx
+
+                              # If new node is better than the worst current one, replace
+                              if furthest_idx_in_list != -1 and dist_new < furthest_dist:
                                    neighbor_connections[furthest_idx_in_list] = new_node_id
+                         elif len(neighbor_connections) < self.M: # Should have been caught earlier, but safe fallback
+                              neighbor_connections.append(new_node_id)
 
-             ep = selected_neighbor_ids
-             if not ep: ep = [nid for _, nid in neighbors_found_with_dist_sq[:1]]
 
-        if node_level > self.max_level: self.max_level = node_level; self.entry_point = new_node_id
+             # Update entry points for the next level down (use selected neighbors)
+             # Using only selected neighbors might be better than all found
+             ep = selected_neighbor_ids # Or use neighbors_found_with_dist? HNSW paper detail. Let's try selected.
+             if not ep: # If selection yielded nothing, fall back?
+                  ep = [nid for _, nid in neighbors_found_with_dist[:1]] # Fallback to closest found
+
+        # Update global entry point if this node is the highest level
+        if node_level > self.max_level:
+            self.max_level = node_level
+            self.entry_point = new_node_id
         return new_node_id
 
+
+    # --- _search_layer METHOD ---
+    # (Assumed to be identical to previous working version - uses self._distance)
     def _search_layer(self, query_vec, entry_points, target_level, ef):
-        """Performs greedy search on a single layer (returns squared L2 dists)."""
+        """Performs greedy search on a single layer (identical to previous example)."""
         if self.entry_point == -1: return []
+        # Ensure entry points are valid indices
         valid_entry_points = [ep for ep in entry_points if ep < self.node_count and ep >=0]
         if not valid_entry_points:
-             if self.entry_point != -1: valid_entry_points = [self.entry_point]
+             if self.entry_point != -1: valid_entry_points = [self.entry_point] # Fallback
              else: return []
 
-        initial_distances_sq, valid_indices_init = self._distance(query_vec, valid_entry_points) # Squared L2
-        if initial_distances_sq.numel() == 0: return []
+        candidates = set(valid_entry_points)
+        visited = set(valid_entry_points)
+        initial_distances, valid_indices_init = self._distance(query_vec, valid_entry_points)
+        if initial_distances.numel() == 0: return [] # Cannot start search
 
-        dist_map_init = {nid: d.item() for nid, d in zip(valid_indices_init, initial_distances_sq)}
+        # Map distances back to original requested entry points if some were invalid
+        dist_map_init = {nid: d.item() for nid, d in zip(valid_indices_init, initial_distances)}
+
         candidate_heap = [(dist_map_init.get(ep, float('inf')), ep) for ep in valid_entry_points]
         heapq.heapify(candidate_heap)
-        results_heap = [(-dist_sq, node_id) for dist_sq, node_id in candidate_heap if dist_sq != float('inf')]
+        results_heap = [(-dist, node_id) for dist, node_id in candidate_heap if dist != float('inf')]
         heapq.heapify(results_heap)
-        visited = set(valid_entry_points)
 
         while candidate_heap:
-            dist_candidate_sq, current_node_id = heapq.heappop(candidate_heap)
-            if dist_candidate_sq == float('inf'): continue
-            furthest_dist_sq = -results_heap[0][0] if results_heap else float('inf')
-            if dist_candidate_sq > furthest_dist_sq and len(results_heap) >= ef: break
+            dist_candidate, current_node_id = heapq.heappop(candidate_heap)
+            if dist_candidate == float('inf'): continue # Skip if invalid distance somehow got in
+
+            if results_heap:
+                 dist_furthest_result = -results_heap[0][0]
+                 if dist_candidate > dist_furthest_result and len(results_heap) >= ef: break
 
             try: neighbors = self.graph[target_level][current_node_id]
             except IndexError: neighbors = []
@@ -778,37 +853,51 @@ class SimpleHNSW_for_ANN:
             unvisited_neighbors = [n for n in neighbors if n not in visited]
             if unvisited_neighbors:
                  visited.update(unvisited_neighbors)
-                 neighbor_distances_sq, valid_neighbor_indices = self._distance(query_vec, unvisited_neighbors) # Squared L2
-                 if neighbor_distances_sq.numel() == 0: continue
+                 neighbor_distances, valid_neighbor_indices = self._distance(query_vec, unvisited_neighbors)
+                 if neighbor_distances.numel() == 0: continue
 
-                 dist_map_neighbors = {nid: d.item() for nid, d in zip(valid_neighbor_indices, neighbor_distances_sq)}
-                 for neighbor_id in valid_neighbor_indices:
-                      neighbor_dist_sq_val = dist_map_neighbors[neighbor_id]
-                      furthest_dist_sq = -results_heap[0][0] if results_heap else float('inf')
-                      if len(results_heap) < ef or neighbor_dist_sq_val < furthest_dist_sq:
-                           heapq.heappush(results_heap, (-neighbor_dist_sq_val, neighbor_id))
-                           if len(results_heap) > ef: heapq.heappop(results_heap)
-                           heapq.heappush(candidate_heap, (neighbor_dist_sq_val, neighbor_id))
+                 # Map distances back
+                 dist_map_neighbors = {nid: d.item() for nid, d in zip(valid_neighbor_indices, neighbor_distances)}
 
-        final_results = sorted([(abs(neg_dist_sq), node_id) for neg_dist_sq, node_id in results_heap])
-        return final_results # Returns (squared_dist, node_id)
+                 for neighbor_id in valid_neighbor_indices: # Iterate only valid neighbors
+                      neighbor_dist_val = dist_map_neighbors[neighbor_id]
+                      if len(results_heap) < ef or neighbor_dist_val < -results_heap[0][0]:
+                           if len(results_heap) >= ef: heapq.heappop(results_heap)
+                           heapq.heappush(results_heap, (-neighbor_dist_val, neighbor_id))
 
+                      # Only add to candidate heap if potentially better than furthest result
+                      # (or if heap isn't full) - minor optimization
+                      if len(results_heap) < ef or neighbor_dist_val < -results_heap[0][0]:
+                           heapq.heappush(candidate_heap, (neighbor_dist_val, neighbor_id))
+
+        final_results = sorted([(abs(neg_dist), node_id) for neg_dist, node_id in results_heap])
+        return final_results
+
+
+    # --- search_knn METHOD ---
+    # (Assumed to be identical to previous working version - calls _search_layer)
     def search_knn(self, query_vec, k):
-        """Searches for k nearest neighbors (returns squared L2 dists)."""
+        """Searches for k nearest neighbors (identical to previous example)."""
         if self.entry_point == -1: return []
-        query_vec_prep, = _prepare_tensors(query_vec.flatten(), target_device=self.vectors.device)
+        query_vec, = _prepare_tensors(query_vec.flatten())
+
         ep = [self.entry_point]
         current_max_level = self.max_level
         for level in range(current_max_level, 0, -1):
-             if level >= len(self.graph) or not ep or ep[0] >= len(self.graph[level]): continue
-             search_results = self._search_layer(query_vec_prep, ep, level, ef=1) # Squared L2
+             if level >= len(self.graph) or ep[0] >= len(self.graph[level]): continue # Safety check
+             search_results = self._search_layer(query_vec, ep, level, ef=1)
              if not search_results: break
              ep = [search_results[0][1]]
-        if 0 >= len(self.graph) or not ep or ep[0] >= len(self.graph[0]):
-             if self.entry_point != -1 and 0 < len(self.graph) and self.entry_point < len(self.graph[0]): ep = [self.entry_point]
-             else: return []
-        neighbors_found = self._search_layer(query_vec_prep, ep, 0, self.ef_search) # Squared L2
-        return neighbors_found[:k] # Returns (squared_dist, node_id)
+        # Final search at level 0
+        if 0 >= len(self.graph) or not ep or ep[0] >= len(self.graph[0]): # Check level 0 validity
+             if self.entry_point != -1 and 0 < len(self.graph) and self.entry_point < len(self.graph[0]):
+                  ep = [self.entry_point] # Fallback to global EP for level 0 if needed
+             else:
+                  return [] # Cannot search level 0
+
+        neighbors_found = self._search_layer(query_vec, ep, 0, self.ef_search)
+        return neighbors_found[:k]
+
 
 # --- our_ann function remains the same, calling this class ---
 '''
