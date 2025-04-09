@@ -811,6 +811,7 @@ class SimpleHNSW_for_ANN:
         return neighbors_found[:k] # Returns (squared_dist, node_id)
 
 # --- our_ann function remains the same, calling this class ---
+'''
 def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
      target_device = X.device
      A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
@@ -840,6 +841,61 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
      search_time = end_search - start_search
      print(f"ANN search time: {end_search - start_search:.4f} seconds")
      return all_indices, all_distances, build_time, search_time # Returns indices and SQUARED L2 distances
+'''
+def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
+     # ... (identical to previous version, just instantiates the updated class) ...
+    A_prep, X_prep = _prepare_tensors(A, X)
+    Q = X_prep.shape[0]
+    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
+    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
+    assert X_prep.shape[1] == D, "D doesn't match X.shape[1]"
+    assert K > 0, "K must be positive"
+
+    print(f"Running ANN (HNSW w/ Heuristics): Q={Q}, N={N_A}, D={D}, K={K}")
+    print(f"HNSW Params: M={M}, efC={ef_construction}, efS={ef_search}")
+
+    # 1. Build the HNSW Index
+    start_build = time.time()
+    hnsw_index = SimpleHNSW_for_ANN(dim=D, M=M, ef_construction=ef_construction, ef_search=ef_search)
+
+    print("Building index...")
+    # Incremental build using the revised add_point
+    for i in range(N_A):
+        hnsw_index.add_point(A_prep[i])
+        if (i + 1) % (N_A // 10 + 1) == 0:
+             print(f"  Added {i+1}/{N_A} points...")
+
+    end_build = time.time()
+    print(f"Index build time: {end_build - start_build:.2f} seconds")
+    # Check if graph was actually built
+    if hnsw_index.node_count == 0 or hnsw_index.entry_point == -1 :
+        print("Error: Index build resulted in an empty graph.")
+        return torch.full((Q, K), -1, dtype=torch.int64), torch.full((Q, K), float('inf'), dtype=torch.float32)
+
+
+    # 2. Perform Search for each query
+    start_search = time.time()
+    all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device)
+    all_distances = torch.full((Q, K), float('inf'), dtype=torch.float32, device=device)
+
+    print("Searching queries...")
+    for q_idx in range(Q):
+        results = hnsw_index.search_knn(X_prep[q_idx], K)
+        num_results = len(results)
+        if num_results > 0:
+            q_dists = torch.tensor([res[0] for res in results], dtype=torch.float32, device=device)
+            q_indices = torch.tensor([res[1] for res in results], dtype=torch.int64, device=device)
+            # Ensure slicing doesn't go out of bounds if num_results < K
+            k_actual = min(num_results, K)
+            all_distances[q_idx, :k_actual] = q_dists[:k_actual]
+            all_indices[q_idx, :k_actual] = q_indices[:k_actual]
+        if (q_idx + 1) % (Q // 10 + 1) == 0:
+             print(f"  Searched {q_idx+1}/{Q} queries...")
+
+    end_search = time.time()
+    print(f"ANN search time: {end_search - start_search:.4f} seconds")
+
+    return all_indices, all_distances
 
 # ============================================================================
 # Example Usage (Modified)
