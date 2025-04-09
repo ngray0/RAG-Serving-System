@@ -362,7 +362,7 @@ def distance_l2_triton(X, A, **kwargs):
     A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # (N, 1)
     dist_sq = X_norm_sq - 2 * dot_products + A_norm_sq.T # (Q, N)
     dist_sq.clamp_(min=0.0)
-    dist = torch.sqrt(dist_sq)
+    #dist = torch.sqrt(dist_sq)
     return dist_sq
 def distance_l2_triton2(X, A):
     """Computes pairwise squared L2 distance using Triton kernel."""
