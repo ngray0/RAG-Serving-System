@@ -142,44 +142,7 @@ def dot_kernel_pairwise_tiled(
     ],
     key=['Q', 'N', 'D'],
 )
-@triton.jit
-def l2_dist_kernel_pairwise(
-    X_ptr,      # Pointer to Query vectors (Q, D)
-    A_ptr,      # Pointer to Database vectors (N, D)
-    Out_ptr,    # Pointer to output distances (Q, N)
-    # --- Dimensions ---
-    Q, N, D,
-    # --- Strides ---
-    stride_xq, stride_xd,
-    stride_an, stride_ad,
-    stride_outq, stride_outn,
-    # --- Block Size ---
-    BLOCK_SIZE_D: tl.constexpr,
-):
-    """Calculates pairwise squared L2 distance: dist(X[q], A[n])"""
-    pid_q = tl.program_id(axis=0) # Query index
-    pid_n = tl.program_id(axis=1) # Database index
 
-    dist_sq = tl.zeros((), dtype=tl.float32)
-    for d_start in range(0, D, BLOCK_SIZE_D):
-        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
-        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
-        mask_d = offs_d < d_end
-
-        # Load X[pid_q, d_start:d_end]
-        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
-        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
-
-        # Load A[pid_n, d_start:d_end]
-        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
-        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
-
-        diff = x_vals - a_vals
-        dist_sq += tl.sum(diff * diff, axis=0)
-
-    # Store result
-    out_offset = pid_q * stride_outq + pid_n * stride_outn
-    tl.store(Out_ptr + out_offset, dist_sq)
 @triton.jit
 def manhattan_kernel_pairwise_tiled(
     X_ptr, A_ptr, Out_ptr,           # Data pointers
@@ -243,7 +206,44 @@ def manhattan_kernel_pairwise_tiled(
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
 
+@triton.jit
+def l2_dist_kernel_pairwise(
+    X_ptr,      # Pointer to Query vectors (Q, D)
+    A_ptr,      # Pointer to Database vectors (N, D)
+    Out_ptr,    # Pointer to output distances (Q, N)
+    # --- Dimensions ---
+    Q, N, D,
+    # --- Strides ---
+    stride_xq, stride_xd,
+    stride_an, stride_ad,
+    stride_outq, stride_outn,
+    # --- Block Size ---
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """Calculates pairwise squared L2 distance: dist(X[q], A[n])"""
+    pid_q = tl.program_id(axis=0) # Query index
+    pid_n = tl.program_id(axis=1) # Database index
 
+    dist_sq = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < d_end
+
+        # Load X[pid_q, d_start:d_end]
+        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
+
+        # Load A[pid_n, d_start:d_end]
+        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
+
+        diff = x_vals - a_vals
+        dist_sq += tl.sum(diff * diff, axis=0)
+
+    # Store result
+    out_offset = pid_q * stride_outq + pid_n * stride_outn
+    tl.store(Out_ptr + out_offset, dist_sq)
 # --- Kernels needed for K-Means and HNSW ---
 # (These remain unchanged as they use different distance logic or simple kernels)
 @triton.jit
