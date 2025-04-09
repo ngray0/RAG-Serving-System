@@ -1356,13 +1356,13 @@ if __name__ == "__main__":
 # Compare results
     rtol = 1e-5
     atol = 1e-6
-    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products**2).to(torch.float32), rtol=rtol, atol=atol)
+    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products).to(torch.float32), rtol=rtol, atol=atol)
 
     if are_dots_close:
         print("Dot product verification successful: distance_dot_triton matches torch.matmul.")
     else:
         print("Dot product verification FAILED: distance_dot_triton does NOT match torch.matmul.")
-        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products**2).to(torch.float32)))
+        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products).to(torch.float32)))
         print(f"Maximum absolute difference in dot products: {max_diff_dot.item()}")
     # Consider printing samples if failed
     # print("GPU DOT:", gpu_dot_products.cpu()[0,:5])
@@ -1391,14 +1391,14 @@ if __name__ == "__main__":
 
 # Compare the float32 GPU result against the float64 CPU reference
 # torch.allclose handles the dtype difference here
-    are_close = torch.allclose(gpu_distances_cpu_f32, ref_distances_f64**2, rtol=rtol, atol=atol)
+    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float32), rtol=rtol, atol=atol)
 
     if are_close:
         print("Verification successful (PyTorch): GPU results are close to CPU torch.cdist results within tolerance.")
     else:
         print("Verification failed (PyTorch): Discrepancies found.")
     # Calculate and print the maximum difference
-        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - ref_distances_f64.to(torch.float32)))
+        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float32)))
         print(f"Maximum absolute difference: {max_diff.item()}")
         print(gpu_distances_cpu_f32)
         print("REFS", ref_distances_f64**2)
