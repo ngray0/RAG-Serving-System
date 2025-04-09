@@ -27,6 +27,7 @@ print(f"Using device: {device}")
 # ============================================================================
 DEFAULT_BLOCK_Q = 32
 DEFAULT_BLOCK_N = 64
+DEFAULT_BLOCK_D = 128
 DEFAULT_BLOCK_K = 64 # Block size for the reduction dimension D (used by all tiled kernels)
 
 def ceil_div(a, b):
@@ -578,7 +579,7 @@ def _prepare_tensors2(*tensors):
         # Kernels often benefit from contiguous memory
         prepared.append(t.contiguous())
     return prepared
-DEFAULT_BLOCK_D = 128
+
 
 @triton.jit
 def l2_dist_kernel_1_vs_M( # Renamed from previous example
