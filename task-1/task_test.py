@@ -1529,14 +1529,14 @@ if __name__ == "__main__":
 
 # Compare the float32 GPU result against the float64 CPU reference
 # torch.allclose handles the dtype difference here
-    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float32), rtol=rtol, atol=atol)
+    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float64), rtol=rtol, atol=atol)
 
     if are_close:
         print("Verification successful (PyTorch): GPU results are close to CPU torch.cdist results within tolerance.")
     else:
         print("Verification failed (PyTorch): Discrepancies found.")
     # Calculate and print the maximum difference
-        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float32)))
+        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float64)))
         print(f"Maximum absolute difference: {max_diff.item()}")
         print(gpu_distances_cpu_f32)
         print("REFS", ref_distances_f64**2)
