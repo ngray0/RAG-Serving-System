@@ -119,7 +119,7 @@ def dot_kernel_pairwise(
     pid_q = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    dot_prod = tl.zeros((), dtype=tl.float64)
+    dot_prod = tl.zeros((), dtype=tl.float32)
     for d_start in range(0, D, BLOCK_SIZE_D):
         d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
@@ -197,7 +197,7 @@ def manhattan_kernel_pairwise_tiled(
     offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
 
     # 2. Initialize Accumulator Tile for L1 distances
-    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float64)
+    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float32)
 
     # 3. Loop over the Dimension D (K dimension) in blocks of BLOCK_K
     for k_start in range(0, D, BLOCK_K):
@@ -255,7 +255,7 @@ def l2_dist_kernel_pairwise(
     pid_q = tl.program_id(axis=0) # Query index
     pid_n = tl.program_id(axis=1) # Database index
 
-    dist_sq = tl.zeros((), dtype=tl.float64)
+    dist_sq = tl.zeros((), dtype=tl.float32)
     for d_start in range(0, D, BLOCK_SIZE_D):
         d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
@@ -289,7 +289,7 @@ def kmeans_assign_kernel(
     offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     mask_n = offs_n < N
 
-    min_dist_sq = tl.full((BLOCK_SIZE_N,), float('inf'), dtype=tl.float64)
+    min_dist_sq = tl.full((BLOCK_SIZE_N,), float('inf'), dtype=tl.float32)
     best_assignment = tl.zeros((BLOCK_SIZE_N,), dtype=tl.int32)
 
     for k_start in range(0, K, BLOCK_SIZE_K_CHUNK):
@@ -297,7 +297,7 @@ def kmeans_assign_kernel(
         for k_idx in range(BLOCK_SIZE_K_CHUNK):
             actual_k = k_start + k_idx
             if actual_k < k_end:
-                current_dist_sq = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float64)
+                current_dist_sq = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
                 for d_start in range(0, D, BLOCK_SIZE_D):
                     offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
                     mask_d = offs_d < D
@@ -323,7 +323,7 @@ def l2_dist_kernel_1_vs_M2(
 ):
     """Calculates squared L2 distance: 1 query vs M candidates."""
     pid_m = tl.program_id(axis=0)
-    dist_sq = tl.zeros((), dtype=tl.float64)
+    dist_sq = tl.zeros((), dtype=tl.float32)
     for d_start in range(0, D, BLOCK_SIZE_D):
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
         mask_d = offs_d < D
@@ -339,15 +339,15 @@ def l2_dist_kernel_1_vs_M2(
 # Helper Functions
 # ============================================================================
 def _prepare_tensors(*tensors, target_device =device):
-    """Ensure tensors are float64, contiguous, and on the correct device."""
+    """Ensure tensors are float32, contiguous, and on the correct device."""
     prepared = []
     for t in tensors:
         if not isinstance(t, torch.Tensor):
-            t = torch.tensor(t, dtype=torch.float64, device=target_device)
+            t = torch.tensor(t, dtype=torch.float32, device=target_device)
         if t.device != target_device:
             t = t.to(target_device)
-        if t.dtype != torch.float64:
-            t = t.to(dtype=torch.float64)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
         prepared.append(t.contiguous())
     return prepared
 
@@ -382,7 +382,7 @@ def distance_dot2(X, A):
     N, D_A = A_prep.shape
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
 
-    Out = torch.empty((Q, N), dtype=torch.float64, device=device)
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
     grid = (Q, N)
     dot_kernel_pairwise[grid](
         X_prep, A_prep, Out,
@@ -423,7 +423,7 @@ def distance_l2_triton2(X, A):
     N, D_A = A_prep.shape
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
 
-    Out = torch.empty((Q, N), dtype=torch.float64, device=device)
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
     grid = (Q, N)
     l2_dist_kernel_pairwise[grid](
         X_prep, A_prep, Out,
@@ -466,7 +466,7 @@ def distance_manhattan_triton(X, A, **kwargs):
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
     # print(f"Calculating pairwise Manhattan (Tiled Triton Kernel) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
 
-    Out = torch.empty((Q, N), dtype=torch.float64, device=target_device)
+    Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
     BLOCK_Q = kwargs.get('BLOCK_Q', DEFAULT_BLOCK_Q)
     BLOCK_N = kwargs.get('BLOCK_N', DEFAULT_BLOCK_N)
     grid = (ceil_div(Q, BLOCK_Q), ceil_div(N, BLOCK_N))
@@ -583,10 +583,10 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
         assignments = assignments_int32.to(torch.int64)
         #update_start_time = time.time() # Optional timing
         new_sums = torch.zeros_like(centroids)
-        cluster_counts = torch.zeros(K, dtype=torch.float64, device=device)
+        cluster_counts = torch.zeros(K, dtype=torch.float32, device=device)
         idx_expand = assignments.unsqueeze(1).expand(N_A, D)
         new_sums.scatter_add_(dim=0, index=idx_expand, src=A_prep)
-        cluster_counts.scatter_add_(dim=0, index=assignments, src=torch.ones_like(assignments, dtype=torch.float64))
+        cluster_counts.scatter_add_(dim=0, index=assignments, src=torch.ones_like(assignments, dtype=torch.float32))
         final_counts_safe = cluster_counts.clamp(min=1.0)
         new_centroids = new_sums / final_counts_safe.unsqueeze(1)
         empty_cluster_mask = (cluster_counts == 0)
@@ -620,17 +620,17 @@ def distance_l2_squared_triton(X, A, **kwargs):
     # NO SQRT HERE
     return dist_sq
 def _prepare_tensors2(*tensors):
-    """Ensure tensors are float64, contiguous, and on the correct device."""
+    """Ensure tensors are float32, contiguous, and on the correct device."""
     prepared = []
     # Assume 'device' is globally available or passed appropriately
     global device
     for t in tensors:
         if not isinstance(t, torch.Tensor):
-            t = torch.tensor(t, dtype=torch.float64, device=device)
+            t = torch.tensor(t, dtype=torch.float32, device=device)
         if t.device != device:
             t = t.to(device)
-        if t.dtype != torch.float64:
-            t = t.to(dtype=torch.float64)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
         # Kernels often benefit from contiguous memory
         prepared.append(t.contiguous())
     return prepared
@@ -647,7 +647,7 @@ def l2_dist_kernel_1_vs_M( # Renamed from previous example
 ):
     """Calculates squared L2 distance: 1 query vs M candidates."""
     pid_m = tl.program_id(axis=0) # Candidate index
-    dist_sq = tl.zeros((), dtype=tl.float64)
+    dist_sq = tl.zeros((), dtype=tl.float32)
     for d_start in range(0, D, BLOCK_SIZE_D):
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
         mask_d = offs_d < D
@@ -675,7 +675,7 @@ class SimpleHNSW_for_ANN: # Using previous class structure
         self.ef_construction = ef_construction
         self.ef_search = ef_search
         self.mL = mL
-        self.vectors = torch.empty((0, dim), dtype=torch.float64, device=device)
+        self.vectors = torch.empty((0, dim), dtype=torch.float32, device=device)
         self.graph = []
         self.level_assignments = []
         self.node_count = 0
@@ -707,7 +707,7 @@ class SimpleHNSW_for_ANN: # Using previous class structure
         num_valid_candidates = len(valid_indices)
         candidate_vectors = self.vectors[valid_indices] # Index with valid indices only
 
-        distances_out = torch.empty(num_valid_candidates, dtype=torch.float64, device=device)
+        distances_out = torch.empty(num_valid_candidates, dtype=torch.float32, device=device)
         grid = (num_valid_candidates,)
         l2_dist_kernel_1_vs_M[grid](
             query_vec_prep, candidate_vectors, distances_out,
@@ -737,7 +737,7 @@ class SimpleHNSW_for_ANN: # Using previous class structure
         N = len(candidate_indices)
         D = self.dim
 
-        Out = torch.empty((Q, N), dtype=torch.float64, device=device)
+        Out = torch.empty((Q, N), dtype=torch.float32, device=device)
         grid = (Q, N)
 
         # Ensure vectors are prepared if necessary (e.g., contiguous)
@@ -1058,7 +1058,7 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
      if hnsw_index.node_count == 0 or hnsw_index.entry_point == -1 : print("Error: Index build failed."); return torch.full((Q, K), -1), torch.full((Q, K), float('inf'))
      start_search = time.time()
      all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device)
-     all_distances = torch.full((Q, K), float('inf'), dtype=torch.float64, device=device)
+     all_distances = torch.full((Q, K), float('inf'), dtype=torch.float32, device=device)
      print("Searching queries..."); i=0
      for i in range(Q):
           results = hnsw_index.search_knn(X_prep[i], K) # Returns (squared_dist, node_id)
@@ -1101,20 +1101,20 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
     # Check if graph was actually built
     if hnsw_index.node_count == 0 or hnsw_index.entry_point == -1 :
         print("Error: Index build resulted in an empty graph.")
-        return torch.full((Q, K), -1, dtype=torch.int64), torch.full((Q, K), float('inf'), dtype=torch.float64)
+        return torch.full((Q, K), -1, dtype=torch.int64), torch.full((Q, K), float('inf'), dtype=torch.float32)
 
 
     # 2. Perform Search for each query
     start_search = time.time()
     all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device)
-    all_distances = torch.full((Q, K), float('inf'), dtype=torch.float64, device=device)
+    all_distances = torch.full((Q, K), float('inf'), dtype=torch.float32, device=device)
 
     print("Searching queries...")
     for q_idx in range(Q):
         results = hnsw_index.search_knn(X_prep[q_idx], K)
         num_results = len(results)
         if num_results > 0:
-            q_dists = torch.tensor([res[0] for res in results], dtype=torch.float64, device=device)
+            q_dists = torch.tensor([res[0] for res in results], dtype=torch.float32, device=device)
             q_indices = torch.tensor([res[1] for res in results], dtype=torch.int64, device=device)
             # Ensure slicing doesn't go out of bounds if num_results < K
             k_actual = min(num_results, K)
@@ -1140,8 +1140,8 @@ if __name__ == "__main__":
     print("="*40)
     print("Generating Data...")
     print("="*40)
-    A_data = torch.randn(N_data, Dim, dtype=torch.float64, device=device)
-    X_queries = torch.randn(N_queries, Dim, dtype=torch.float64, device=device)
+    A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
+    X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
 
     # --- Test Triton Dot Product ---
     start_time = time.time()
@@ -1428,13 +1428,13 @@ if __name__ == "__main__":
 # Compare results
     rtol = 1e-5
     atol = 1e-6
-    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products).to(torch.float64), rtol=rtol, atol=atol)
+    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products).to(torch.float32), rtol=rtol, atol=atol)
 
     if are_dots_close:
         print("Dot product verification successful: distance_dot_triton matches torch.matmul.")
     else:
         print("Dot product verification FAILED: distance_dot_triton does NOT match torch.matmul.")
-        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products).to(torch.float64)))
+        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products).to(torch.float32)))
         print(f"Maximum absolute difference in dot products: {max_diff_dot.item()}")
     # Consider printing samples if failed
     # print("GPU DOT:", gpu_dot_products.cpu()[0,:5])
@@ -1462,16 +1462,16 @@ if __name__ == "__main__":
 # Move GPU result to CPU for comparison
     gpu_distances_cpu_f32 = l2_dists.cpu()
 
-# Compare the float64 GPU result against the float64 CPU reference
+# Compare the float32 GPU result against the float64 CPU reference
 # torch.allclose handles the dtype difference here
-    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float64), rtol=rtol, atol=atol)
+    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float32), rtol=rtol, atol=atol)
 
     if are_close:
         print("Verification successful (PyTorch): GPU results are close to CPU torch.cdist results within tolerance.")
     else:
         print("Verification failed (PyTorch): Discrepancies found.")
     # Calculate and print the maximum difference
-        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float64)))
+        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float32)))
         print(f"Maximum absolute difference: {max_diff.item()}")
         print(gpu_distances_cpu_f32)
         print("REFS", ref_distances_f64**2)
@@ -1527,16 +1527,16 @@ if __name__ == "__main__":
 # Move GPU result to CPU for comparison
     gpu_distances_cpu_f32 = l2_dists2.cpu()
 
-# Compare the float64 GPU result against the float64 CPU reference
+# Compare the float32 GPU result against the float64 CPU reference
 # torch.allclose handles the dtype difference here
-    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float64), rtol=rtol, atol=atol)
+    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float32), rtol=rtol, atol=atol)
 
     if are_close:
         print("Verification successful (PyTorch): GPU results are close to CPU torch.cdist results within tolerance.")
     else:
         print("Verification failed (PyTorch): Discrepancies found.")
     # Calculate and print the maximum difference
-        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float64)))
+        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float32)))
         print(f"Maximum absolute difference: {max_diff.item()}")
         print(gpu_distances_cpu_f32)
         print("REFS", ref_distances_f64**2)
@@ -1665,8 +1665,8 @@ def main():
     n = 1000
     d = 100
     # Transfer to GPU.
-    A_cp = cp.random.rand(n, d).astype(cp.float64)
-    B_cp = cp.random.rand(n, d).astype(cp.float64)
+    A_cp = cp.random.rand(n, d).astype(cp.float32)
+    B_cp = cp.random.rand(n, d).astype(cp.float32)
     
     start_time = time.time()
     l2 = distance_l2(A_cp, B_cp)
