@@ -523,7 +523,7 @@ def our_knn(N_A, D, A, X, K):
 
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
-    all_distances = distance_l2(X_prep, A_prep) # Shape (Q, N_A)
+    all_distances = distance_dot(X_prep, A_prep) # Shape (Q, N_A)
 
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
@@ -534,7 +534,7 @@ def our_knn(N_A, D, A, X, K):
 
     return topk_indices, topk_distances
 
-CURRENT_DISTANCE = "L2"
+CURRENT_DISTANCE = "Dot"
 def our_knn_hierachy(N, D, A, X, K):
     """
     KNN using hierarchical memory: Pinned memory enables fast CPU–GPU transfers.
