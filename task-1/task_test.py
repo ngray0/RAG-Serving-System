@@ -1339,21 +1339,69 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_dot...")
     print("="*40)
-    dot_dists = distance_dot_triton(X_queries[:2], A_data[:5])
+    dot_dists = distance_dot_triton(X_queries, A_data)
     end_time = time.time()
     print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", dot_dists.shape)
     print(dot_dists)
+    print("Verifying distance_dot_triton...")
+
+# Calculate dot products using your Triton-based function
+    gpu_dot_products = distance_dot_triton(X_queries, A_data)
+
+# Calculate reference dot products using PyTorch matmul
+# Ensure dtypes match for matmul if necessary, though PyTorch handles mixed types
+    ref_dot_products = torch.matmul(X_queries, A_data.T) # X (Q,D) @ A.T (D,N) -> (Q,N)
+
+# Compare results
+    rtol = 1e-5
+    atol = 1e-6
+    are_dots_close = torch.allclose(gpu_dot_products, (ref_dot_products**2).to(torch.float32), rtol=rtol, atol=atol)
+
+    if are_dots_close:
+        print("Dot product verification successful: distance_dot_triton matches torch.matmul.")
+    else:
+        print("Dot product verification FAILED: distance_dot_triton does NOT match torch.matmul.")
+        max_diff_dot = torch.max(torch.abs(gpu_dot_products - (ref_dot_products**2).to(torch.float32)))
+        print(f"Maximum absolute difference in dot products: {max_diff_dot.item()}")
+    # Consider printing samples if failed
+    # print("GPU DOT:", gpu_dot_products.cpu()[0,:5])
+    # print("REF DOT:", ref_dot_products.cpu()[0,:5])
 
     start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_l2...")
     print("="*40)
-    l2_dists = distance_l2_triton(X_queries[:2], A_data[:5])
+    l2_dists = distance_l2_triton2(X_queries, A_data)
     end_time = time.time()
     print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", l2_dists.shape)
     print(l2_dists)
+    X_cpu_f64 = X_queries.to(dtype=torch.float64, device='cpu')
+    A_cpu_f64 = A_data.to(dtype=torch.float64, device='cpu')
+
+# Calculate reference distances using torch.cdist with p=2 for L2
+# This is a built-in, optimized PyTorch function
+    ref_distances_f64 = torch.cdist(X_cpu_f64, A_cpu_f64, p=2)
+    rtol = 1e-5  # Relative tolerance
+    atol = 1e-6  # Absolute tolerance
+
+# Move GPU result to CPU for comparison
+    gpu_distances_cpu_f32 = l2_dists.cpu()
+
+# Compare the float32 GPU result against the float64 CPU reference
+# torch.allclose handles the dtype difference here
+    are_close = torch.allclose(gpu_distances_cpu_f32, ref_distances_f64**2, rtol=rtol, atol=atol)
+
+    if are_close:
+        print("Verification successful (PyTorch): GPU results are close to CPU torch.cdist results within tolerance.")
+    else:
+        print("Verification failed (PyTorch): Discrepancies found.")
+    # Calculate and print the maximum difference
+        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - ref_distances_f64.to(torch.float32)))
+        print(f"Maximum absolute difference: {max_diff.item()}")
+        print(gpu_distances_cpu_f32)
+        print("REFS", ref_distances_f64**2)
 
     start_time = time.time()
     print("\n" + "="*40)
