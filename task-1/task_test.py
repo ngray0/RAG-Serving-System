@@ -361,7 +361,7 @@ def distance_l2_triton(X, A, **kwargs):
     X_norm_sq = torch.sum(X_prep**2, axis=1, keepdims=True)  # (Q, 1)
     A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # (N, 1)
     dist_sq = X_norm_sq - 2 * dot_products + A_norm_sq.T # (Q, N)
-    dist_sq.clamp_(min=0.0)
+    #dist_sq.clamp_(min=0.0)
     #dist = torch.sqrt(dist_sq)
     return dist_sq
 def distance_l2_triton2(X, A):
@@ -487,6 +487,9 @@ def our_knn(N_A, D, A, X, K):
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
     all_distances = distance_l2_triton(X_prep, A_prep) # Shape (Q, N_A)
+    all_distances2 = distance_l2_triton2(X_prep, A_prep)
+    print("Better ones:", all_distances2)
+    print("USED:", all_distances)
 
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
