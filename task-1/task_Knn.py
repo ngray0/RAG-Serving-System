@@ -674,12 +674,12 @@ if __name__ == "__main__":
     print("Hierarchy", (end_time-start_time)/N_queries)
 
     start_time = time.time() 
-    knn_indices,_ = our_knn_hierachy(N_data, Dim, A_data, X_queries_cp[5], K_val)         
+    knn_indices = our_knn_hierachy(N_data, Dim, A_data_cp, X_queries_cp[5], K_val)         
     end_time = time.time()
     print("Hierarchy", end_time-start_time)
 
     start_time = time.time()
-    knn_indices_cp = our_knn(N_data, Dim, A_data_cp, X_queries, K_val)
+    knn_indices_cp,_ = our_knn(N_data, Dim, A_data, X_queries, K_val)
     end_time = time.time()
     print("Triton", (end_time-start_time)/N_queries)
 
