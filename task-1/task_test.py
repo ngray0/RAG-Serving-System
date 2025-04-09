@@ -82,7 +82,7 @@ def dot_kernel_pairwise_tiled(
     pid_n_block = tl.program_id(axis=1)
     offs_q = pid_q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
     offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float64)
 
     for k_start in range(0, D, BLOCK_K):
         offs_k = k_start + tl.arange(0, BLOCK_K)
@@ -362,7 +362,7 @@ def distance_dot_triton(X, A, **kwargs):
     Q, D = X_prep.shape
     N, D_A = A_prep.shape
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
-    Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
+    Out = torch.empty((Q, N), dtype=torch.float64, device=target_device)
     BLOCK_Q = kwargs.get('BLOCK_Q', DEFAULT_BLOCK_Q)
     BLOCK_N = kwargs.get('BLOCK_N', DEFAULT_BLOCK_N)
     grid = (ceil_div(Q, BLOCK_Q), ceil_div(N, BLOCK_N))
@@ -1529,14 +1529,14 @@ if __name__ == "__main__":
 
 # Compare the float32 GPU result against the float64 CPU reference
 # torch.allclose handles the dtype difference here
-    are_close = torch.allclose(gpu_distances_cpu_f32, ref_distances_f64**2, rtol=rtol, atol=atol)
+    are_close = torch.allclose(gpu_distances_cpu_f32, (ref_distances_f64**2).to(torch.float32), rtol=rtol, atol=atol)
 
     if are_close:
         print("Verification successful (PyTorch): GPU results are close to CPU torch.cdist results within tolerance.")
     else:
         print("Verification failed (PyTorch): Discrepancies found.")
     # Calculate and print the maximum difference
-        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - ref_distances_f64.to(torch.float32)))
+        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - (ref_distances_f64**2).to(torch.float32)))
         print(f"Maximum absolute difference: {max_diff.item()}")
         print(gpu_distances_cpu_f32)
         print("REFS", ref_distances_f64**2)
