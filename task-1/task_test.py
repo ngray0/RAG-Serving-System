@@ -1393,6 +1393,32 @@ if __name__ == "__main__":
     end_time = time.time()
     print(f"L2 distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", l2_dists2.shape)
+
+    X_cpu_f64 = X_queries.to(dtype=torch.float64, device='cpu')
+    A_cpu_f64 = A_data.to(dtype=torch.float64, device='cpu')
+
+# Calculate reference distances using torch.cdist with p=2 for L2
+# This is a built-in, optimized PyTorch function
+    ref_distances_f64 = torch.cdist(X_cpu_f64, A_cpu_f64, p=2)
+    rtol = 1e-5  # Relative tolerance
+    atol = 1e-6  # Absolute tolerance
+
+# Move GPU result to CPU for comparison
+    gpu_distances_cpu_f32 = l2_dists2.cpu()
+
+# Compare the float32 GPU result against the float64 CPU reference
+# torch.allclose handles the dtype difference here
+    are_close = torch.allclose(gpu_distances_cpu_f32, ref_distances_f64**2, rtol=rtol, atol=atol)
+
+    if are_close:
+        print("Verification successful (PyTorch): GPU results are close to CPU torch.cdist results within tolerance.")
+    else:
+        print("Verification failed (PyTorch): Discrepancies found.")
+    # Calculate and print the maximum difference
+        max_diff = torch.max(torch.abs(gpu_distances_cpu_f32 - ref_distances_f64.to(torch.float32)))
+        print(f"Maximum absolute difference: {max_diff.item()}")
+        print(gpu_distances_cpu_f32)
+        print("REFS", ref_distances_f64**2)
     
 
     start_time = time.time()
