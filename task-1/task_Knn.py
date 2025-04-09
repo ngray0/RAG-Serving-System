@@ -612,7 +612,23 @@ if __name__ == "__main__":
     A_data_cp = cp.from_dlpack(dlpack_A)
     X_queries_cp = cp.from_dlpack(dlpack_X)
     print("CuPy testing....")
-    our_knn_hierachy(N_data,Dim, A_data_cp, X_queries_cp, K_val)
+    N_queries = X_queries_cp.shape[0]
+    all_knn_indices = [] # To store results for each query
+
+    print("Processing queries individually...")
+    for i in range(N_queries):
+        query_vector_cp = X_queries_cp[i] # Get the i-th query vector (shape will be (D,))
+        try:
+        # Call the function with a single query vector
+            knn_indices_cp = our_knn_hierachy(N_data, Dim, A_data_cp, query_vector_cp, K_val)
+            all_knn_indices.append(cp.asnumpy(knn_indices_cp)) # Store result (optional: convert to numpy)
+        # Optional: Add print statement for progress
+        # if (i+1) % 10 == 0: print(f"Processed query {i+1}/{N_queries}")
+        except Exception as e:
+            print(f"Error processing query {i}: {e}")
+            all_knn_indices.append(None) # Or handle error differently
+
+    print("Finished processing all queries.")
     start_time = time.time()
 
     print("\n" + "="*40)
