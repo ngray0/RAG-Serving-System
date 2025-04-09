@@ -492,6 +492,47 @@ def compute_all_distances(A, X):
         "Manhattan": distance_manhattan2(A, X)
     }
 
+def our_knn(N_A, D, A, X, K):
+    """
+    Finds the K nearest neighbors in A for each query vector in X using
+    brute-force pairwise L2 distance calculation.
+
+    Args:
+        N_A (int): Number of database points (should match A.shape[0]).
+        D (int): Dimensionality (should match A.shape[1] and X.shape[1]).
+        A (torch.Tensor): Database vectors (N_A, D) on GPU.
+        X (torch.Tensor): Query vectors (Q, D) on GPU.
+        K (int): Number of neighbors to find.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]:
+            - topk_indices (torch.Tensor): Indices of the K nearest neighbors (Q, K).
+            - topk_distances (torch.Tensor): Squared L2 distances of the K nearest neighbors (Q, K).
+    """
+    A_prep, X_prep = _prepare_tensors(A, X)
+    Q = X_prep.shape[0]
+    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
+    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
+    assert X_prep.shape[1] == D, "D doesn't match X.shape[1]"
+    assert K > 0, "K must be positive"
+    assert K <= N_A, "K cannot be larger than the number of database points"
+
+
+    print(f"Running k-NN: Q={Q}, N={N_A}, D={D}, K={K}")
+    start_time = time.time()
+
+    # 1. Calculate all pairwise squared L2 distances
+    #    distance_l2 returns squared L2 distances
+    all_distances = distance_l2(X_prep, A_prep) # Shape (Q, N_A)
+
+    # 2. Find the top K smallest distances for each query
+    #    largest=False gives smallest distances (nearest neighbors)
+    topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
+
+    end_time = time.time()
+    print(f"k-NN computation time: {end_time - start_time:.4f} seconds")
+
+    return topk_indices, topk_distances
 
 CURRENT_DISTANCE = "L2"
 def our_knn_hierachy(N, D, A, X, K):
@@ -616,6 +657,7 @@ if __name__ == "__main__":
     all_knn_indices = [] # To store results for each query
 
     print("Processing queries individually...")
+    start_time = time.time()
     for i in range(N_queries):
         query_vector_cp = X_queries_cp[i] # Get the i-th query vector (shape will be (D,))
         try:
@@ -627,6 +669,23 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error processing query {i}: {e}")
             all_knn_indices.append(None) # Or handle error differently
+    end_time = time.time()
+    print("Hierarchy", (end_time-start_time)/N_queries)
+    start_time = time.time()
+    for i in range(N_queries):
+        query_vector = X_queries[i] # Get the i-th query vector (shape will be (D,))
+        try:
+        # Call the function with a single query vector
+            knn_indices,_ = our_knn(N_data, Dim, A_data, query_vector, K_val)
+            all_knn_indices.append(cp.asnumpy(knn_indices)) # Store result (optional: convert to numpy)
+        # Optional: Add print statement for progress
+        # if (i+1) % 10 == 0: print(f"Processed query {i+1}/{N_queries}")
+        except Exception as e:
+            print(f"Error processing query {i}: {e}")
+            all_knn_indices.append(None) # Or handle error differently
+    end_time = time.time()
+    print("Triton", (end_time-start_time)/N_queries)
+    
 
     print("Finished processing all queries.")
     start_time = time.time()
