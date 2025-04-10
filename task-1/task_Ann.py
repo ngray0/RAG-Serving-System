@@ -913,7 +913,7 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
 # Example Usage (Illustrative) - MODIFIED
 # ============================================================================
 if __name__ == "__main__":
-    N_data = 20000    # Larger dataset to see benefits
+    N_data = 2000000    # Larger dataset to see benefits
     N_queries = 500
     Dim = 128
     K_val = 10
