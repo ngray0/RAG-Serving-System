@@ -899,7 +899,7 @@ if __name__ == "__main__":
 
         # Compute all pairwise dot products
         # shape: (Q, N)
-        all_dot_products = distance_dot_triton(X_norm, A_norm)
+        all_dot_products = distance_dot_tiled(X_norm, A_norm)
 
         # Find top K largest dot products for each query
         k_actual = min(K, N)
