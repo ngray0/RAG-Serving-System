@@ -101,7 +101,87 @@ def kmeans_assign_kernel(
     assignments_out_ptrs = assignments_ptr + offs_n
     tl.store(assignments_out_ptrs, best_assignment, mask=mask_n)
 
+@triton.jit
+def kmeans_assign_kernel_cosine( # Renamed for clarity
+    A_norm_ptr,           # Pointer to L2-NORMALIZED data points (N, D)
+    centroids_norm_ptr,   # Pointer to L2-NORMALIZED centroids (K, D)
+    assignments_ptr,      # Pointer to output assignments (N,)
+    N, D, K,
+    stride_an, stride_ad,   # Strides for NORMALIZED A
+    stride_ck, stride_cd,   # Strides for NORMALIZED centroids
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K_CHUNK: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+):
+    """
+    Assigns each point in A to the centroid with the highest Cosine Similarity.
+    ASSUMES A_norm_ptr and centroids_norm_ptr point to L2-NORMALIZED vectors.
+    Cosine Similarity = Dot Product for normalized vectors.
+    """
+    # --- Program ID and Offsets (Same as before) ---
+    pid_n_block = tl.program_id(axis=0) # ID for the N dimension block
+    offs_n = pid_n_block * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) # Range for points in block
+    mask_n = offs_n < N # Mask for points in this block
 
+    # --- Initialization for Maximum Similarity Search ---
+    # Initialize max similarity found so far for each point in the block.
+    # Cosine similarity ranges from -1 to 1. Initialize to a value lower than -1.
+    max_similarity = tl.full((BLOCK_SIZE_N,), -2.0, dtype=tl.float32)
+    # Initialize best assignment for each point in the block.
+    best_assignment = tl.zeros((BLOCK_SIZE_N,), dtype=tl.int32)
+
+    # --- Loop through Chunks of Centroids (Same as before) ---
+    for k_start in range(0, K, BLOCK_SIZE_K_CHUNK):
+        k_end = tl.minimum(k_start + BLOCK_SIZE_K_CHUNK, K)
+
+        # --- Loop through Centroids within the Chunk (Same as before) ---
+        for k_idx in range(BLOCK_SIZE_K_CHUNK):
+            actual_k = k_start + k_idx
+            # Only process if the centroid index is valid for this chunk
+            if actual_k < k_end:
+
+                # --- Calculate Dot Product (Cosine Similarity) for current centroid ---
+                # Initialize dot product accumulator for the current points block vs actual_k centroid
+                current_dot_product = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+
+                # --- Loop through Dimensions to compute Dot Product ---
+                for d_start in range(0, D, BLOCK_SIZE_D):
+                    offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+                    mask_d = offs_d < D # Mask for valid dimensions in this block
+
+                    # Load NORMALIZED centroid block for the current dimension chunk
+                    # Shape: (BLOCK_SIZE_D,)
+                    centroid_d_ptr = centroids_norm_ptr + actual_k * stride_ck + offs_d * stride_cd
+                    # Need boundary check for D dimension
+                    centroid_vals = tl.load(centroid_d_ptr, mask=mask_d, other=0.0)
+
+                    # Load NORMALIZED points block for the current dimension chunk
+                    # Shape: (BLOCK_SIZE_N, BLOCK_SIZE_D)
+                    points_d_ptr = A_norm_ptr + offs_n[:, None] * stride_an + offs_d[None, :] * stride_ad
+                    # Need boundary checks for both N and D dimensions
+                    points_vals = tl.load(points_d_ptr, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+
+                    # Accumulate dot product component for this dimension block
+                    # points_vals * centroid_vals[None, :] performs element-wise multiplication broadcasted
+                    # tl.sum(..., axis=1) sums across the D dimension block for each point in N
+                    current_dot_product += tl.sum(points_vals * centroid_vals[None, :], axis=1)
+                # End of dimension loop: current_dot_product now holds the full dot product (Cosine Similarity)
+
+                # --- Compare and Update Assignment ---
+                # Check if the similarity with the current centroid (actual_k) is higher than the max found so far
+                is_more_similar = current_dot_product > max_similarity
+
+                # Update max_similarity where current centroid is better
+                max_similarity = tl.where(is_more_similar, current_dot_product, max_similarity)
+                # Update best_assignment where current centroid is better
+                best_assignment = tl.where(is_more_similar, actual_k, best_assignment)
+            # End if actual_k < k_end
+        # End loop k_idx
+    # End loop k_start
+
+    # --- Store Results (Same as before) ---
+    assignments_out_ptrs = assignments_ptr + offs_n
+    tl.store(assignments_out_ptrs, best_assignment, mask=mask_n)
 def _prepare_tensors(*tensors, target_device =device):
     """Ensure tensors are float32, contiguous, and on the correct device."""
     prepared = []
@@ -228,6 +308,8 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     centroids = A_prep[initial_indices].clone()
     # assignments must be int64 for scatter_add_ index later
     assignments = torch.empty(N_A, dtype=torch.int64, device=device)
+    A_norm = normalize_vectors(A) # Using your normalize_vectors function
+    centroids_norm = normalize_vectors(centroids)
 
     # --- Triton Kernel Launch Configuration (Only for Assignment) ---
     BLOCK_SIZE_N_ASSIGN = 128
@@ -242,15 +324,15 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
         # --- 1. Assignment Step (Uses Triton Kernel) ---
         # Kernel expects int32 output, so create temp tensor
         assignments_int32 = torch.empty(N_A, dtype=torch.int32, device=device)
-        kmeans_assign_kernel[grid_assign](
-            A_prep, centroids, assignments_int32, # Use int32 tensor here
-            N_A, D, K,
-            A_prep.stride(0), A_prep.stride(1),
-            centroids.stride(0), centroids.stride(1),
-            BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
-            BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN,
-            BLOCK_SIZE_D=BLOCK_SIZE_D_ASSIGN
-        )
+        kmeans_assign_kernel_cosine[grid_assign](
+        A_norm, centroids_norm, assignments_int32, # Pass normalized tensors
+        N_A, D, K,
+        A_norm.stride(0), A_norm.stride(1),
+        centroids_norm.stride(0), centroids_norm.stride(1),
+        BLOCK_SIZE_N=BLOCK_SIZE_N_ASSIGN,
+        BLOCK_SIZE_K_CHUNK=BLOCK_SIZE_K_CHUNK_ASSIGN,
+        BLOCK_SIZE_D=BLOCK_SIZE_D_ASSIGN
+)
         # Cast assignments to int64 for scatter_add_ index
         assignments = assignments_int32.to(torch.int64)
         # torch.cuda.synchronize() # Optional synchronization
@@ -655,259 +737,543 @@ def our_ann_kmeans_optimized(N_A, D, A, X, K, k_clusters=100, nprobe=5, max_kmea
     return all_indices, all_similarities
 
 
-class SimpleHNSW_for_ANN:
-    # Uses l2_dist_kernel_1_vs_M and distance_l2_triton internally now
+class SimpleHNSW_DotProduct_Optimized:
+    """
+    Optimized HNSW implementation using Dot Product similarity (1 - dot_product distance)
+    on normalized vectors, leveraging Triton kernels.
+    """
     def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
         self.dim = dim
-        self.M = M
-        self.ef_construction = ef_construction
-        self.ef_search = ef_search
-        self.mL = mL
-        self.vectors = torch.empty((0, dim), dtype=torch.float32, device=device)
+        self.M = M # Max connections per node per layer
+        self.ef_construction = ef_construction # Size of dynamic candidate list during construction
+        self.ef_search = ef_search # Size of dynamic candidate list during search
+        self.mL = mL # Normalization factor for level generation
+        # Store only normalized vectors
+        self.vectors_norm = torch.empty((0, dim), dtype=torch.float32, device=device)
+        # Graph structure: List of layers, each layer is a list of nodes,
+        # each node is a list of neighbor indices for that layer.
         self.graph = []
-        self.level_assignments = []
         self.node_count = 0
-        self.entry_point = -1
-        self.max_level = -1
-        self.BLOCK_SIZE_D_DIST = DEFAULT_BLOCK_K # Use global default block size
+        self.entry_point = -1 # Index of the entry point node
+        self.max_level = -1 # Highest level currently in the graph
+        # Note: level_assignments might not be strictly needed anymore if not used elsewhere
+        # self.level_assignments = [] # Store the max level for each node
+
+        print(f"Initialized HNSW (Dot Product): M={M}, efC={ef_construction}, efS={ef_search}")
 
     def _get_level_for_new_node(self):
-        level = int(-math.log(random.uniform(0, 1)) * self.mL)
-        return level
+        # Generates a random level based on the mL factor (higher mL -> lower levels)
+        return int(-math.log(random.uniform(0, 1)) * self.mL)
 
-    def _distance(self, query_vec, candidate_indices):
-        """Internal distance calc using the 1-vs-M Triton kernel (Squared L2)."""
-        if not isinstance(candidate_indices, list): candidate_indices = list(candidate_indices)
-        if not candidate_indices: return torch.empty(0, device=device), []
-        target_device = query_vec.device if isinstance(query_vec, torch.Tensor) else self.vectors.device
-        query_vec_prep, = _prepare_tensors(query_vec.flatten(), target_device=target_device)
-        valid_indices = [idx for idx in candidate_indices if idx < self.node_count and idx >= 0]
-        if not valid_indices: return torch.empty(0, device=device), []
-        num_valid_candidates = len(valid_indices)
-        candidate_vectors, = _prepare_tensors(self.vectors[valid_indices], target_device=target_device)
-        distances_out = torch.empty(num_valid_candidates, dtype=torch.float32, device=device)
-        grid = (num_valid_candidates,)
-        dot_kernel_pairwise[grid](
-            query_vec_prep, candidate_vectors, distances_out,
-            num_valid_candidates, self.dim,
-            candidate_vectors.stride(0), candidate_vectors.stride(1),
-            BLOCK_SIZE_D=self.BLOCK_SIZE_D_DIST
-        )
-        return distances_out, valid_indices # Returns squared L2
-
-    def _distance_batch(self, query_indices, candidate_indices):
+    # --- Distance Calculation using Dot Product ---
+    def _get_distances(self, query_norm_vector, candidate_indices):
         """
-        Calculates pairwise L2 distances between batches using distance_l2_triton.
-        Returns actual L2 distances.
+        Calculates distances (1 - dot_product) between a single normalized query
+        and multiple candidate nodes using optimized Triton dot product.
+
+        Args:
+            query_norm_vector (torch.Tensor): The L2-normalized query vector (1, D).
+            candidate_indices (list or torch.Tensor): Indices of candidate nodes.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]:
+                - distances (torch.Tensor): Tensor of distances (1 - dot). Shape (num_valid_candidates,).
+                - valid_indices (torch.Tensor): Tensor of valid candidate indices used.
         """
-        if not query_indices or not candidate_indices:
-            return torch.empty((len(query_indices), len(candidate_indices)), device=device)
-        target_device = self.vectors.device
+        if isinstance(candidate_indices, list):
+            candidate_indices = torch.tensor(candidate_indices, device=query_norm_vector.device, dtype=torch.long)
 
-        valid_query_indices = [idx for idx in query_indices if idx < self.node_count and idx >= 0]
-        valid_candidate_indices = [idx for idx in candidate_indices if idx < self.node_count and idx >= 0]
-        if not valid_query_indices or not valid_candidate_indices:
-             return torch.empty((len(valid_query_indices), len(valid_candidate_indices)), device=target_device)
+        # Filter out invalid indices (e.g., padding -1 or out of bounds)
+        valid_mask = (candidate_indices >= 0) & (candidate_indices < self.node_count)
+        valid_indices = candidate_indices[valid_mask]
 
-        query_vectors = self.vectors[valid_query_indices]
-        candidate_vectors = self.vectors[valid_candidate_indices]
-        pairwise_l2_distances = distance_cosine(query_vectors, candidate_vectors)
-        return pairwise_l2_distances # Shape (len(valid_query), len(valid_candidate))
+        if valid_indices.numel() == 0:
+            return torch.empty(0, device=query_norm_vector.device), valid_indices # Return empty tensor of indices
 
-    def _select_neighbors_heuristic(self, query_vec, candidates, M_target):
-        """Selects M_target neighbors (implementation using squared L2 internally)."""
+        # Retrieve normalized candidate vectors
+        candidate_vectors_norm = self.vectors_norm[valid_indices] # Shape (num_valid, D)
+
+        # Calculate dot products using the optimized Triton kernel
+        # Input shapes: (1, D) and (num_valid, D)
+        # Output shape: (1, num_valid)
+        dot_products = distance_cosine(query_norm_vector, candidate_vectors_norm)
+
+        # Calculate distance = 1 - dot_product (similarity)
+        # Squeeze to get shape (num_valid,)
+        distances = 1.0 - dot_products.squeeze(0)
+
+        return distances, valid_indices
+
+    def _get_distances_batch(self, query_indices, candidate_indices):
+        """
+        Calculates pairwise distances (1 - dot_product) between batches of nodes.
+
+        Args:
+            query_indices (list or torch.Tensor): Indices of query nodes.
+            candidate_indices (list or torch.Tensor): Indices of candidate nodes.
+
+        Returns:
+            torch.Tensor: Pairwise distances (1 - dot). Shape (num_valid_query, num_valid_candidate).
+                          Returns empty tensor if no valid pairs.
+        """
+        if isinstance(query_indices, list):
+            query_indices = torch.tensor(query_indices, device=self.vectors_norm.device, dtype=torch.long)
+        if isinstance(candidate_indices, list):
+            candidate_indices = torch.tensor(candidate_indices, device=self.vectors_norm.device, dtype=torch.long)
+
+        valid_query_mask = (query_indices >= 0) & (query_indices < self.node_count)
+        valid_query_indices = query_indices[valid_query_mask]
+
+        valid_candidate_mask = (candidate_indices >= 0) & (candidate_indices < self.node_count)
+        valid_candidate_indices = candidate_indices[valid_candidate_mask]
+
+        if valid_query_indices.numel() == 0 or valid_candidate_indices.numel() == 0:
+            return torch.empty((valid_query_indices.numel(), valid_candidate_indices.numel()),
+                               device=self.vectors_norm.device)
+
+        query_vectors_norm = self.vectors_norm[valid_query_indices]
+        candidate_vectors_norm = self.vectors_norm[valid_candidate_indices]
+
+        # Calculate dot products: shape (num_valid_query, num_valid_candidate)
+        dot_products = distance_cosine(query_vectors_norm, candidate_vectors_norm)
+
+        # Calculate distance = 1 - dot_product
+        distances = 1.0 - dot_products
+
+        return distances
+
+    # --- Neighbor Selection Heuristic (adapted for 1-dot distance) ---
+    def _select_neighbors_heuristic(self, query_norm_vec, candidates_with_dist, M_target):
+        """
+        Selects M_target neighbors from candidates using a heuristic based on
+        the '1 - dot_product' distance metric. Keep closest overall, prune others.
+
+        Args:
+            query_norm_vec (torch.Tensor): The L2-normalized query vector (1, D).
+            candidates_with_dist (list): List of tuples (distance, node_id).
+                                         distance is 1 - dot_product.
+            M_target (int): The maximum number of neighbors to select.
+
+        Returns:
+            list: List of selected neighbor node indices.
+        """
         selected_neighbors = []
-        working_candidates_heap = [(dist, nid) for dist, nid in candidates]
-        heapq.heapify(working_candidates_heap)
-        discarded_candidates = set()
+        # Use a min-heap directly on distances (smaller 1-dot distance is better)
+        working_candidates_heap = list(candidates_with_dist) # Make a copy
+        heapq.heapify(working_candidates_heap) # Min-heap based on distance
+        discarded_candidates = set() # Track nodes to discard
 
         while working_candidates_heap and len(selected_neighbors) < M_target:
-            dist_best_sq, best_nid = heapq.heappop(working_candidates_heap)
-            if best_nid in discarded_candidates: continue
+            # Get the node closest to the query among remaining candidates
+            dist_best, best_nid = heapq.heappop(working_candidates_heap)
+
+            # Skip if already discarded by a previously selected neighbor
+            if best_nid in discarded_candidates:
+                continue
+
             selected_neighbors.append(best_nid)
 
-            remaining_candidates_info = {}
-            temp_heap = []
+            # --- Heuristic Pruning ---
+            # Prune remaining candidates 'r' if dist(r, best_nid) < dist(r, query)
+            # This means 'r' is closer to the newly selected 'best_nid' than to the query,
+            # suggesting 'best_nid' is a better connection point for 'r'.
+
+            # Create a temporary list of remaining valid candidates to check against best_nid
+            remaining_candidates_info = {} # {nid: dist_to_query}
+            temp_heap_storage = [] # To rebuild the heap later
             while working_candidates_heap:
-                 dist_r_sq, nid_r = heapq.heappop(working_candidates_heap)
+                 dist_r, nid_r = heapq.heappop(working_candidates_heap)
                  if nid_r not in discarded_candidates:
-                      remaining_candidates_info[nid_r] = dist_r_sq
-                      temp_heap.append((dist_r_sq, nid_r))
-            working_candidates_heap = temp_heap
-            heapq.heapify(working_candidates_heap)
+                      remaining_candidates_info[nid_r] = dist_r
+                      # Add back to storage to rebuild heap later if not pruned
+                      temp_heap_storage.append((dist_r, nid_r))
+
+            # If no remaining candidates, we are done pruning for this step
+            if not remaining_candidates_info:
+                working_candidates_heap = temp_heap_storage # Should be empty
+                break # Exit outer loop if no candidates left
+
             remaining_nids = list(remaining_candidates_info.keys())
 
-            if remaining_nids:
-                dists_best_to_remaining = self._distance_batch([best_nid], remaining_nids) # Actual L2
-                if dists_best_to_remaining.numel() > 0:
-                    dists_best_to_remaining_sq = (dists_best_to_remaining**2).squeeze(0) # Squared L2
+            # Calculate distances between the selected 'best_nid' and all remaining candidates 'r'
+            # Shape: (1, num_remaining)
+            dists_best_to_remaining = self._get_distances_batch([best_nid], remaining_nids)
 
-                    for i, r_nid in enumerate(remaining_nids):
-                        dist_r_query_sq = remaining_candidates_info[r_nid] # Already squared L2
-                        if i < len(dists_best_to_remaining_sq):
-                           dist_r_best_sq = dists_best_to_remaining_sq[i].item()
-                           if dist_r_best_sq < dist_r_query_sq:
-                               discarded_candidates.add(r_nid)
+            # Add candidates to discard set based on the heuristic
+            if dists_best_to_remaining.numel() > 0:
+                dists_best_to_remaining = dists_best_to_remaining.squeeze(0) # Shape (num_remaining,)
+                for i, r_nid in enumerate(remaining_nids):
+                    dist_r_query = remaining_candidates_info[r_nid] # Dist(r, query)
+                    dist_r_best = dists_best_to_remaining[i].item() # Dist(r, best_nid)
+
+                    # Apply heuristic check: if r is closer to best_nid than to query
+                    if dist_r_best < dist_r_query:
+                        discarded_candidates.add(r_nid) # Mark 'r' for discarding
+
+            # Rebuild the heap only with candidates that *weren't* discarded
+            working_candidates_heap = [(dist_r, nid_r) for dist_r, nid_r in temp_heap_storage if nid_r not in discarded_candidates]
+            heapq.heapify(working_candidates_heap) # Convert back to heap
+
         return selected_neighbors
 
+    # --- Core HNSW Methods (adapted for normalization and 1-dot distance) ---
     def add_point(self, point_vec):
-        """Adds a single point to the graph."""
-        target_device = self.vectors.device if self.node_count > 0 else device
-        point_vec_prep, = _prepare_tensors(point_vec.flatten(), target_device=target_device)
+        """Adds a single point to the HNSW graph."""
+        if point_vec.ndim == 1: point_vec = point_vec.unsqueeze(0) # Ensure (1, D)
+        point_vec_prep, = _prepare_tensors(point_vec, target_device=device)
+
+        # --- Normalize the incoming vector ---
+        point_norm = normalize_vectors(point_vec_prep) # Shape (1, D)
+
         new_node_id = self.node_count
 
-        if self.node_count == 0: self.vectors = point_vec_prep.unsqueeze(0)
-        else: self.vectors = torch.cat((self.vectors, point_vec_prep.unsqueeze(0)), dim=0)
+        # Append normalized vector to storage
+        if self.node_count == 0:
+             self.vectors_norm = point_norm
+        else:
+             self.vectors_norm = torch.cat((self.vectors_norm, point_norm), dim=0)
         self.node_count += 1
+
+        # Determine level for the new node
         node_level = self._get_level_for_new_node()
-        self.level_assignments.append(node_level)
+        # self.level_assignments.append(node_level) # Store level if needed
 
-        while node_level >= len(self.graph): self.graph.append([])
-        for lvl in range(len(self.graph)):
-             while len(self.graph[lvl]) <= new_node_id: self.graph[lvl].append([])
+        # --- Expand graph structure (CPU lists) ---
+        # This part remains a potential bottleneck for huge datasets / high insert rates
+        # Needs to accommodate the new node index at all levels up to node_level
+        while node_level >= len(self.graph): self.graph.append([]) # Add new empty levels if needed
+        for lvl_idx in range(len(self.graph)):
+             # Ensure each existing level list is long enough
+             while len(self.graph[lvl_idx]) <= new_node_id:
+                 self.graph[lvl_idx].append([]) # Add empty neighbor lists for new/intermediate nodes
 
-        current_entry_point = self.entry_point
+        # --- Find entry point and search down levels ---
+        current_entry_point_id = self.entry_point
         current_max_level = self.max_level
-        if current_entry_point == -1:
-            self.entry_point = new_node_id; self.max_level = node_level; return new_node_id
 
-        ep = [current_entry_point]
+        # If graph is empty, set new node as entry point
+        if current_entry_point_id == -1:
+            self.entry_point = new_node_id
+            self.max_level = node_level
+            # No connections to make yet
+            return new_node_id
+
+        # Search from top level down to node_level + 1 to find the best entry point for insertion levels
+        ep_id = current_entry_point_id
         for level in range(current_max_level, node_level, -1):
-             if level >= len(self.graph) or not ep or ep[0] >= len(self.graph[level]): continue
-             search_results = self._search_layer(point_vec_prep, ep, level, ef=1) # Uses squared L2
-             if not search_results: break
-             ep = [search_results[0][1]]
+             # Ensure level and entry point are valid within graph structure
+             if level >= len(self.graph) or ep_id >= len(self.graph[level]): continue
 
+             # Search returns [(distance, node_id)] sorted by distance (1-dot)
+             search_results = self._search_layer(point_norm, [ep_id], level, ef=1)
+             if not search_results: break # Should not happen if ep_id is valid? Error check maybe needed.
+             # Update entry point for the next lower level to the closest node found
+             ep_id = search_results[0][1] # Closest node ID
+
+        # --- Insert node at levels from min(node_level, current_max_level) down to 0 ---
+        ep_ids = [ep_id] # Start insertion with the entry point found above
         for level in range(min(node_level, current_max_level), -1, -1):
-             if level >= len(self.graph) or not ep or any(idx >= len(self.graph[level]) for idx in ep):
-                 if current_entry_point < len(self.graph[level]): ep = [current_entry_point]
-                 else: continue
+             if level >= len(self.graph): continue # Should not happen based on graph expansion logic
 
-             neighbors_found_with_dist_sq = self._search_layer(point_vec_prep, ep, level, self.ef_construction) # Uses squared L2
-             if not neighbors_found_with_dist_sq: continue
-             selected_neighbor_ids = self._select_neighbors_heuristic(point_vec_prep, neighbors_found_with_dist_sq, self.M)
+             # Find nearest neighbors at this level using the current entry points
+             # Search returns [(distance, node_id)] sorted by distance (1-dot)
+             neighbors_found_with_dist = self._search_layer(point_norm, ep_ids, level, self.ef_construction)
+             if not neighbors_found_with_dist:
+                 # Fallback if search fails unexpectedly
+                 if current_entry_point_id < len(self.graph[level]):
+                     neighbors_found_with_dist = self._search_layer(point_norm, [current_entry_point_id], level, self.ef_construction)
+                 if not neighbors_found_with_dist: continue # Skip level if still no neighbors
+
+
+             # Select neighbors using heuristic (returns list of node IDs)
+             selected_neighbor_ids = self._select_neighbors_heuristic(point_norm, neighbors_found_with_dist, self.M)
+
+             # --- Add connections for the new node ---
+             # Connect new_node_id -> selected_neighbor_ids
              self.graph[level][new_node_id] = selected_neighbor_ids
 
+             # --- Add connections from selected neighbors back to the new node ---
              for neighbor_id in selected_neighbor_ids:
+                 # Ensure neighbor_id is valid before accessing its connections
                  if neighbor_id >= len(self.graph[level]): continue
+
                  neighbor_connections = self.graph[level][neighbor_id]
+
+                 # Only add connection if it doesn't already exist (shouldn't happen here)
+                 # and if the neighbor has less than M connections
                  if new_node_id not in neighbor_connections:
                      if len(neighbor_connections) < self.M:
                          neighbor_connections.append(new_node_id)
                      else:
-                         # Pruning logic (uses squared L2 from _distance)
-                         dist_new_sq, valid_new = self._distance(self.vectors[neighbor_id], [new_node_id])
-                         if not valid_new: continue
-                         dist_new_sq = dist_new_sq[0].item()
-                         current_neighbor_ids = list(neighbor_connections)
-                         dists_to_current_sq, valid_curr_ids = self._distance(self.vectors[neighbor_id], current_neighbor_ids)
-                         if dists_to_current_sq.numel() > 0:
-                              furthest_dist_sq = -1.0; furthest_idx_in_list = -1
-                              dist_map = {nid: d.item() for nid, d in zip(valid_curr_ids, dists_to_current_sq)}
+                         # --- Pruning: If neighbor is full, check if new node is closer than its furthest neighbor ---
+                         # Calculate distance from neighbor_id to new_node_id
+                         dist_new, _ = self._get_distances(self.vectors_norm[neighbor_id].unsqueeze(0), [new_node_id])
+                         if dist_new.numel() == 0: continue # Should not happen if new_node_id is valid
+                         dist_new_val = dist_new.item()
+
+                         # Calculate distances from neighbor_id to its current neighbors
+                         current_neighbor_ids = list(neighbor_connections) # Get current neighbors
+                         dists_to_current, valid_curr_ids = self._get_distances(self.vectors_norm[neighbor_id].unsqueeze(0), current_neighbor_ids)
+
+                         if dists_to_current.numel() > 0:
+                              # Find the furthest neighbor among the valid ones
+                              furthest_dist = -1.0
+                              furthest_idx_in_list = -1
+                              dist_map = {nid.item(): d.item() for nid, d in zip(valid_curr_ids, dists_to_current)}
+
                               for list_idx, current_nid in enumerate(current_neighbor_ids):
-                                   d_sq = dist_map.get(current_nid, float('inf'))
-                                   if d_sq > furthest_dist_sq: furthest_dist_sq = d_sq; furthest_idx_in_list = list_idx
-                              if furthest_idx_in_list != -1 and dist_new_sq < furthest_dist_sq:
+                                   # Use .get with a large default distance if ID wasn't valid for distance calc
+                                   d = dist_map.get(current_nid, float('inf'))
+                                   if d > furthest_dist:
+                                        furthest_dist = d
+                                        furthest_idx_in_list = list_idx # Index within neighbor_connections list
+
+                              # If new node is closer than the furthest current neighbor
+                              if furthest_idx_in_list != -1 and dist_new_val < furthest_dist:
+                                   # Replace the furthest neighbor with the new node
                                    neighbor_connections[furthest_idx_in_list] = new_node_id
+                         # Else: If dists_to_current is empty, something is wrong, but we can't prune.
 
-             ep = selected_neighbor_ids
-             if not ep: ep = [nid for _, nid in neighbors_found_with_dist_sq[:1]]
+             # Update entry points for the next level down (use selected neighbors)
+             ep_ids = selected_neighbor_ids
+             # Fallback if no neighbors selected (use closest found)
+             if not ep_ids and neighbors_found_with_dist:
+                 ep_ids = [nid for _, nid in neighbors_found_with_dist[:1]]
 
-        if node_level > self.max_level: self.max_level = node_level; self.entry_point = new_node_id
+
+        # Update graph entry point if new node's level is highest
+        if node_level > self.max_level:
+            self.max_level = node_level
+            self.entry_point = new_node_id
+
         return new_node_id
 
-    def _search_layer(self, query_vec, entry_points, target_level, ef):
-        """Performs greedy search on a single layer (returns squared L2 dists)."""
-        if self.entry_point == -1: return []
-        valid_entry_points = [ep for ep in entry_points if ep < self.node_count and ep >=0]
+    def _search_layer(self, query_norm_vec, entry_point_ids, target_level, ef):
+        """
+        Performs greedy search on a single layer using the '1 - dot_product' distance.
+
+        Args:
+            query_norm_vec (torch.Tensor): The L2-normalized query vector (1, D).
+            entry_point_ids (list): List of node indices to start the search from.
+            target_level (int): The graph level to search within.
+            ef (int): The size of the dynamic candidate list (beam width).
+
+        Returns:
+            list: Sorted list of tuples `(distance, node_id)` for the nearest neighbors found.
+                  Distance is `1 - dot_product`. Smaller is better.
+        """
+        if self.entry_point == -1: return [] # Empty graph
+
+        # Ensure entry points are valid
+        valid_entry_points = [ep for ep in entry_point_ids if ep < self.node_count and ep >=0]
         if not valid_entry_points:
-             if self.entry_point != -1: valid_entry_points = [self.entry_point]
-             else: return []
+             # Fallback to global entry point if provided EPs are invalid
+             if self.entry_point != -1 and self.entry_point < self.node_count:
+                 valid_entry_points = [self.entry_point]
+             else:
+                 return [] # Cannot start search
 
-        initial_distances_sq, valid_indices_init = self._distance(query_vec, valid_entry_points) # Squared L2
-        if initial_distances_sq.numel() == 0: return []
+        # Calculate initial distances from query to entry points
+        initial_distances, valid_indices_init = self._get_distances(query_norm_vec, valid_entry_points)
+        if valid_indices_init.numel() == 0: return [] # Failed to get distances even to entry points
 
-        dist_map_init = {nid: d.item() for nid, d in zip(valid_indices_init, initial_distances_sq)}
-        candidate_heap = [(dist_map_init.get(ep, float('inf')), ep) for ep in valid_entry_points]
-        heapq.heapify(candidate_heap)
-        results_heap = [(-dist_sq, node_id) for dist_sq, node_id in candidate_heap if dist_sq != float('inf')]
-        heapq.heapify(results_heap)
-        visited = set(valid_entry_points)
 
+        # --- Initialize Heaps ---
+        # Candidate heap (min-heap): stores (distance, node_id), ordered by distance. Nodes to visit.
+        # Results heap (max-heap): stores (-distance, node_id), ordered by -distance. Best nodes found so far.
+        candidate_heap = []
+        results_heap = []
+        visited = set() # Keep track of visited node IDs
+
+        # Populate initial heaps
+        dist_map_init = {nid.item(): d.item() for nid, d in zip(valid_indices_init, initial_distances)}
+        for ep_id in valid_entry_points: # Iterate original list to handle potential invalid IDs
+             dist = dist_map_init.get(ep_id, float('inf')) # Use inf if distance calculation failed
+             if dist != float('inf'):
+                  # Add to both heaps initially
+                  heapq.heappush(candidate_heap, (dist, ep_id))
+                  heapq.heappush(results_heap, (-dist, ep_id)) # Max heap stores negative distance
+                  visited.add(ep_id)
+
+        # --- Greedy Search Loop ---
         while candidate_heap:
-            dist_candidate_sq, current_node_id = heapq.heappop(candidate_heap)
-            if dist_candidate_sq == float('inf'): continue
-            furthest_dist_sq = -results_heap[0][0] if results_heap else float('inf')
-            if dist_candidate_sq > furthest_dist_sq and len(results_heap) >= ef: break
+            # Get the closest candidate node (lowest 1-dot distance)
+            dist_candidate, current_node_id = heapq.heappop(candidate_heap)
 
-            try: neighbors = self.graph[target_level][current_node_id]
-            except IndexError: neighbors = []
+            # Get the furthest node currently in the results (highest 1-dot distance)
+            # Note: results_heap[0][0] is the *negative* of the largest distance
+            furthest_dist_in_results = -results_heap[0][0] if results_heap else float('inf')
 
-            unvisited_neighbors = [n for n in neighbors if n not in visited]
-            if unvisited_neighbors:
-                 visited.update(unvisited_neighbors)
-                 neighbor_distances_sq, valid_neighbor_indices = self._distance(query_vec, unvisited_neighbors) # Squared L2
-                 if neighbor_distances_sq.numel() == 0: continue
+            # Stop condition: If the closest candidate is further than the furthest result found,
+            # and we already have enough results (or more), we can stop early.
+            # (Original HNSW condition, adapted for 1-dot distance)
+            if dist_candidate > furthest_dist_in_results and len(results_heap) >= ef :
+                 break
 
-                 dist_map_neighbors = {nid: d.item() for nid, d in zip(valid_neighbor_indices, neighbor_distances_sq)}
-                 for neighbor_id in valid_neighbor_indices:
-                      neighbor_dist_sq_val = dist_map_neighbors[neighbor_id]
-                      furthest_dist_sq = -results_heap[0][0] if results_heap else float('inf')
-                      if len(results_heap) < ef or neighbor_dist_sq_val < furthest_dist_sq:
-                           heapq.heappush(results_heap, (-neighbor_dist_sq_val, neighbor_id))
-                           if len(results_heap) > ef: heapq.heappop(results_heap)
-                           heapq.heappush(candidate_heap, (neighbor_dist_sq_val, neighbor_id))
+            # Get neighbors of the current node at the target level
+            try:
+                # Access graph structure (CPU list)
+                neighbors = self.graph[target_level][current_node_id]
+            except IndexError:
+                neighbors = [] # Node might not exist at this level or has no connections
 
-        final_results = sorted([(abs(neg_dist_sq), node_id) for neg_dist_sq, node_id in results_heap])
-        return final_results # Returns (squared_dist, node_id)
+            # Process unvisited neighbors
+            unvisited_neighbor_ids = [n for n in neighbors if n not in visited]
+            if unvisited_neighbor_ids:
+                 visited.update(unvisited_neighbor_ids) # Mark as visited
+
+                 # Calculate distances from query to these unvisited neighbors
+                 neighbor_distances, valid_neighbor_indices = self._get_distances(query_norm_vec, unvisited_neighbor_ids)
+
+                 # Process valid neighbors
+                 if valid_neighbor_indices.numel() > 0:
+                      dist_map_neighbors = {nid.item(): d.item() for nid, d in zip(valid_neighbor_indices, neighbor_distances)}
+
+                      for neighbor_id_tensor in valid_neighbor_indices: # Iterate through tensor
+                           neighbor_id = neighbor_id_tensor.item()
+                           neighbor_dist = dist_map_neighbors[neighbor_id]
+
+                           # Get the current furthest distance in results again (might have changed)
+                           furthest_dist_in_results = -results_heap[0][0] if results_heap else float('inf')
+
+                           # Check if this neighbor is potentially better than the furthest result
+                           # or if we don't have enough results yet
+                           if len(results_heap) < ef or neighbor_dist < furthest_dist_in_results:
+                                # Add to results heap (using negative distance for max-heap behavior)
+                                heapq.heappush(results_heap, (-neighbor_dist, neighbor_id))
+                                # If results heap exceeds ef, remove the furthest one (highest distance)
+                                if len(results_heap) > ef:
+                                     heapq.heappop(results_heap)
+
+                                # Add to candidate heap for exploration
+                                heapq.heappush(candidate_heap, (neighbor_dist, neighbor_id))
+
+        # Convert results heap (negative distances) to sorted list of (positive distance, node_id)
+        # Sorted by distance ascending (most similar first)
+        final_results = sorted([(abs(neg_dist), node_id) for neg_dist, node_id in results_heap])
+        return final_results # Returns [(distance, node_id)], distance = 1 - dot
 
     def search_knn(self, query_vec, k):
-        """Searches for k nearest neighbors (returns squared L2 dists)."""
-        if self.entry_point == -1: return []
-        query_vec_prep, = _prepare_tensors(query_vec.flatten(), target_device=self.vectors.device)
-        ep = [self.entry_point]
-        current_max_level = self.max_level
-        for level in range(current_max_level, 0, -1):
-             if level >= len(self.graph) or not ep or ep[0] >= len(self.graph[level]): continue
-             search_results = self._search_layer(query_vec_prep, ep, level, ef=1) # Squared L2
-             if not search_results: break
-             ep = [search_results[0][1]]
-        if 0 >= len(self.graph) or not ep or ep[0] >= len(self.graph[0]):
-             if self.entry_point != -1 and 0 < len(self.graph) and self.entry_point < len(self.graph[0]): ep = [self.entry_point]
-             else: return []
-        neighbors_found = self._search_layer(query_vec_prep, ep, 0, self.ef_search) # Squared L2
-        return neighbors_found[:k] # Returns (squared_dist, node_id)
+        """
+        Searches for the k nearest neighbors (highest dot product similarity) for a single query vector.
 
-# --- our_ann function remains the same, calling this class ---
-def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
+        Args:
+            query_vec (torch.Tensor): The query vector (D,) or (1, D).
+            k (int): The number of neighbors to find.
+
+        Returns:
+            list: List of tuples `(distance, node_id)` for the top k neighbors.
+                  Distance is `1 - dot_product`. Smaller is better.
+                  Returns empty list if graph is empty or search fails.
+        """
+        if self.entry_point == -1: return [] # Graph is empty
+        target_device = self.vectors_norm.device
+
+        # Prepare and normalize query vector
+        query_vec_prep, = _prepare_tensors(query_vec.flatten(), target_device=target_device)
+        query_norm = normalize_vectors(query_vec_prep.unsqueeze(0)) # Shape (1, D)
+
+
+        # --- Search Hierarchy ---
+        ep_id = self.entry_point
+        current_max_level = self.max_level
+        # Search from top level down to level 1
+        for level in range(current_max_level, 0, -1):
+            # Ensure level and entry point are valid
+            if level >= len(self.graph) or ep_id < 0 or ep_id >= len(self.graph[level]):
+                # Attempt to recover if ep_id became invalid, use global entry point
+                if self.entry_point >= 0 and self.entry_point < len(self.graph[level]):
+                    ep_id = self.entry_point
+                else:
+                    break # Cannot proceed if entry point is invalid for this level
+
+            # Find the single closest node at this level to be the entry point for the next
+            search_results = self._search_layer(query_norm, [ep_id], level, ef=1)
+            if not search_results: break # Stop if search fails at this level
+            ep_id = search_results[0][1] # Update entry point
+
+        # --- Final search at level 0 ---
+        # Ensure level 0 exists and entry point is valid
+        if 0 >= len(self.graph) or ep_id < 0 or ep_id >= len(self.graph[0]):
+            # Attempt fallback to global entry point if ep_id became invalid
+             if self.entry_point != -1 and 0 < len(self.graph) and self.entry_point < len(self.graph[0]):
+                  ep_id = self.entry_point
+             else:
+                  return [] # Cannot perform search at level 0
+
+
+        # Perform the detailed search at the base layer (level 0)
+        neighbors_found = self._search_layer(query_norm, [ep_id], 0, self.ef_search)
+
+        # Return the top k results (already sorted by distance)
+        return neighbors_found[:k] # Returns [(distance, node_id)], distance = 1 - dot
+
+# --- Updated our_ann Wrapper ---
+def our_ann_optimized_hnsw(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
+     """Wrapper for the optimized HNSW using Dot Product."""
      target_device = X.device
+     # Prepare data (initial tensors)
      A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
      Q = X_prep.shape[0]
-     assert A_prep.shape[0]==N_A and A_prep.shape[1]==D and X_prep.shape[1]==D and K>0
-     print(f"Running ANN (HNSW): Q={Q}, N={N_A}, D={D}, K={K}, M={M}, efC={ef_construction}, efS={ef_search}")
+
+     # Basic input validation
+     if not (A_prep.shape[0]==N_A and A_prep.shape[1]==D and X_prep.shape[1]==D and K>0):
+         raise ValueError("Input shape mismatch or invalid K.")
+
+     print(f"Running Optimized ANN (HNSW / Dot Product): Q={Q}, N={N_A}, D={D}, K={K}, M={M}, efC={ef_construction}, efS={ef_search}")
+
+     # --- Build Index ---
      start_build = time.time()
-     hnsw_index = SimpleHNSW_for_ANN(dim=D, M=M, ef_construction=ef_construction, ef_search=ef_search)
-     print("Building index..."); i=0
-     for i in range(N_A): hnsw_index.add_point(A_prep[i]) #; if (i+1)%(N_A//10+1)==0: print(f"  Added {i+1}/{N_A}...")
+     hnsw_index = SimpleHNSW_DotProduct_Optimized(dim=D, M=M, ef_construction=ef_construction, ef_search=ef_search)
+     print("Building index...");
+     # Add points one by one (normalization happens inside add_point)
+     # Consider adding progress reporting back if N_A is large
+     for i in range(N_A):
+         hnsw_index.add_point(A_prep[i])
+         # if (i + 1) % max(1, N_A // 10) == 0: print(f"  Added {i+1}/{N_A}...")
      end_build = time.time()
-     print(f"Index build time: {end_build - start_build:.2f} seconds")
-     if hnsw_index.node_count == 0 or hnsw_index.entry_point == -1 : print("Error: Index build failed."); return torch.full((Q, K), -1), torch.full((Q, K), float('inf'))
+     build_time = end_build - start_build
+     print(f"Index build time: {build_time:.2f} seconds")
+
+     # Check if index build was successful
+     if hnsw_index.node_count == 0 or hnsw_index.entry_point == -1 :
+         print("Error: Index build resulted in an empty or invalid graph.")
+         # Return empty/sentinel tensors
+         return torch.full((Q, K), -1, dtype=torch.int64, device=device), \
+                torch.full((Q, K), float('inf'), dtype=torch.float32, device=device), \
+                build_time, 0.0
+
+     # --- Perform Search ---
      start_search = time.time()
      all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device)
+     # Store distances (1 - dot_product). Initialize with worst possible distance (>= 2.0 or inf)
      all_distances = torch.full((Q, K), float('inf'), dtype=torch.float32, device=device)
-     print("Searching queries..."); i=0
-     for i in range(Q):
-          results = hnsw_index.search_knn(X_prep[i], K) # Returns (squared_dist, node_id)
-          num_results = len(results); k_actual = min(num_results, K)
-          if num_results > 0:
-               all_distances[i, :k_actual] = torch.tensor([res[0] for res in results[:k_actual]], device=device) # Store squared L2
-               all_indices[i, :k_actual] = torch.tensor([res[1] for res in results[:k_actual]], device=device)
-          # if (i+1)%(Q//10+1)==0: print(f"  Searched {i+1}/{Q}...")
+
+     print("Searching queries...");
+     for q_idx in range(Q):
+          # search_knn returns list of (distance, node_id), distance = 1 - dot
+          results = hnsw_index.search_knn(X_prep[q_idx], K)
+          num_results = len(results)
+          k_actual = min(num_results, K) # How many results we actually got (<= K)
+
+          if k_actual > 0:
+               # Extract distances and indices from results
+               q_dists = torch.tensor([res[0] for res in results[:k_actual]], dtype=torch.float32, device=device)
+               q_indices = torch.tensor([res[1] for res in results[:k_actual]], dtype=torch.int64, device=device)
+
+               # Assign to output tensors
+               all_distances[q_idx, :k_actual] = q_dists
+               all_indices[q_idx, :k_actual] = q_indices
+
+          # Consider adding progress reporting back if Q is large
+          # if (q_idx + 1) % max(1, Q // 10) == 0: print(f"  Searched {q_idx+1}/{Q}...")
+
      end_search = time.time()
-     build_time = end_build - start_build
      search_time = end_search - start_search
-     print(f"ANN search time: {end_search - start_search:.4f} seconds")
-     return all_indices, all_distances, build_time, search_time # Returns indices and SQUARED L2 distances
+     print(f"Optimized HNSW ANN search time: {search_time:.4f} seconds")
+
+     # Return original indices and distances (1 - dot_product)
+     return all_indices, all_distances, build_time, search_time
 
 # ============================================================================
 # Example Usage (Illustrative) - MODIFIED
