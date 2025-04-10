@@ -292,6 +292,94 @@ class TritonKnnRetriever:
         )
         return -Out
 
+    def distance_dot_tiled(self, X, A, N_TILE=50000, prep = True): # Tile size, adjust if needed
+        """
+    Computes pairwise dot product using Triton kernel, tiled over A
+    to avoid exceeding GPU grid dimension limits.
+
+    Args:
+        X (torch.Tensor): Query vectors (Q, D) on GPU.
+        A (torch.Tensor): Database vectors (N, D) on GPU.
+        N_TILE (int): The maximum number of rows of A to process in one kernel launch.
+
+    Returns:
+        torch.Tensor: Output tensor of dot products (Q, N) on GPU.
+        """
+        if prep == True:
+            X_prep, A_prep = self._prepare_tensors(X, A) # Ensure tensors are ready
+        else:
+            X_prep, A_prep = X, A
+        Q, D = X_prep.shape
+        N, D_A = A_prep.shape
+        assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    # Output tensor remains the full size
+        Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+
+        print(f"Tiling dot product calculation with N_TILE={N_TILE}")
+
+        for n_start in range(0, N, N_TILE):
+            n_end = min(n_start + N_TILE, N)
+            N_chunk = n_end - n_start # Size of the current chunk of A
+            A_chunk = A_prep[n_start:n_end, :] # Shape (N_chunk, D)
+        # Slice the relevant part of Out for this tile
+            Out_chunk = Out[:, n_start:n_end]   # Shape (Q, N_chunk)
+
+            grid = (Q, N_chunk)
+            if grid[0] == 0 or grid[1] == 0: continue 
+
+        dot_kernel_pairwise[grid](
+            X_prep, A_chunk, Out_chunk,       # Data pointers for the chunks
+            Q, N_chunk, D,                    # Dimensions for the chunk
+            X_prep.stride(0), X_prep.stride(1),
+            A_chunk.stride(0), A_chunk.stride(1), # Strides of A_chunk
+            Out_chunk.stride(0), Out_chunk.stride(1),# Strides of Out_chunk
+            BLOCK_SIZE_D=self.DEFAULT_BLOCK_D          # Kernel block size constant
+        )
+        # Potentially add torch.cuda.synchronize() here if debugging tile-by-tile issues
+
+        return Out
+    def distance_cosine(self, X, A, epsilon=1e-8, **kwargs):
+        """
+    Computes pairwise Cosine distances using the tiled dot product kernel
+    and PyTorch operations for norms.
+        """
+        target_device = X.device
+        X_prep, A_prep = self._prepare_tensors(X, A, target_device=target_device)
+        Q, D = X_prep.shape
+        N, D_A = A_prep.shape
+        assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+       # print(f"Calculating pairwise Cosine (Triton Dot + PyTorch Norm) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
+
+        dot_products = self.distance_dot(X_prep, A_prep, **kwargs) # (Q, N)
+        X_norm = torch.linalg.norm(X_prep, axis=1, keepdims=True) # (Q, 1)
+        A_norm = torch.linalg.norm(A_prep, axis=1, keepdims=True) # (N, 1)
+        norm_product = X_norm * A_norm.T # (Q, N)
+        cosine_similarity = dot_products / (norm_product + epsilon)
+        cosine_similarity.clamp_(min=-1.0, max=1.0)
+        return cosine_similarity
+
+    def distance_cosine_tiled(self, X, A, epsilon=1e-8, **kwargs):
+        """
+    Computes pairwise Cosine distances using the tiled dot product kernel
+    and PyTorch operations for norms.
+        """
+        target_device = X.device
+        X_prep, A_prep = self._prepare_tensors(X, A, target_device=target_device)
+        Q, D = X_prep.shape
+        N, D_A = A_prep.shape
+        assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+       # print(f"Calculating pairwise Cosine (Triton Dot + PyTorch Norm) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
+
+        dot_products = self.distance_dot_tiled(X_prep, A_prep, **kwargs) # (Q, N)
+        X_norm = torch.linalg.norm(X_prep, axis=1, keepdims=True) # (Q, 1)
+        A_norm = torch.linalg.norm(A_prep, axis=1, keepdims=True) # (N, 1)
+        norm_product = X_norm * A_norm.T # (Q, N)
+        cosine_similarity = dot_products / (norm_product + epsilon)
+        cosine_similarity.clamp_(min=-1.0, max=1.0)
+        return cosine_similarity
+
+
     def retrieve(self, X: Union[np.ndarray, torch.Tensor], K: int) -> Union[np.ndarray, List]:
         """
          Finds the K nearest neighbors for query vector(s) X.
