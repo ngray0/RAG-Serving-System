@@ -784,12 +784,12 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_dot...")
     print("="*40)
-    dot_dists2 = distance_dot(X_queries, A_data)
+    dot_dists2 = distance_dot_tiled(X_queries, A_data)
     end_time = time.time()
     print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", dot_dists2.shape)
     
-
+    '''
     start_time = time.time()
     print("\n" + "="*40)
     print("Testing distance_l2...")
@@ -818,6 +818,7 @@ if __name__ == "__main__":
     end_time = time.time()
     print(f"Manhattan distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample Manhattan distances shape:", man_dists2.shape)
+    '''
    
 
     torch.cuda.synchronize()
