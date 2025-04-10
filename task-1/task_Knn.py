@@ -511,6 +511,50 @@ def compute_all_distances(A, X):
         "Dot": distance_dot2(A, X),
         "Manhattan": distance_manhattan2(A, X)
     }
+def distance_dot_tiled(X, A, N_TILE=50000): # Tile size, adjust if needed
+    """
+    Computes pairwise dot product using Triton kernel, tiled over A
+    to avoid exceeding GPU grid dimension limits.
+
+    Args:
+        X (torch.Tensor): Query vectors (Q, D) on GPU.
+        A (torch.Tensor): Database vectors (N, D) on GPU.
+        N_TILE (int): The maximum number of rows of A to process in one kernel launch.
+
+    Returns:
+        torch.Tensor: Output tensor of dot products (Q, N) on GPU.
+    """
+    X_prep, A_prep = _prepare_tensors(X, A) # Ensure tensors are ready
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+
+    # Output tensor remains the full size
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+
+    print(f"Tiling dot product calculation with N_TILE={N_TILE}")
+
+    for n_start in range(0, N, N_TILE):
+        n_end = min(n_start + N_TILE, N)
+        N_chunk = n_end - n_start # Size of the current chunk of A
+        A_chunk = A_prep[n_start:n_end, :] # Shape (N_chunk, D)
+        # Slice the relevant part of Out for this tile
+        Out_chunk = Out[:, n_start:n_end]   # Shape (Q, N_chunk)
+
+        grid = (Q, N_chunk)
+        if grid[0] == 0 or grid[1] == 0: continue 
+
+        dot_kernel_pairwise[grid](
+            X_prep, A_chunk, Out_chunk,       # Data pointers for the chunks
+            Q, N_chunk, D,                    # Dimensions for the chunk
+            X_prep.stride(0), X_prep.stride(1),
+            A_chunk.stride(0), A_chunk.stride(1), # Strides of A_chunk
+            Out_chunk.stride(0), Out_chunk.stride(1),# Strides of Out_chunk
+            BLOCK_SIZE_D=DEFAULT_BLOCK_D          # Kernel block size constant
+        )
+        # Potentially add torch.cuda.synchronize() here if debugging tile-by-tile issues
+
+    return Out
 
 def our_knn(N_A, D, A, X, K):
     """
@@ -587,6 +631,7 @@ def our_knn_stream2(N, D, A, X, K):
         s.synchronize()
 
     return results if B > 1 else results[0]
+
 
 def our_knn_stream(N, D, A, X, K):
     """
@@ -672,7 +717,7 @@ def our_knn_stream(N, D, A, X, K):
 
 
 if __name__ == "__main__":
-    N_data = 5000
+    N_data = 5000000
     N_queries = 100
     Dim = 128
     K_val = 10
@@ -689,7 +734,17 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_dot...")
     print("="*40)
-    dot_dists = distance_dot(X_queries, A_data)
+    dot_dists = distance_dot_tiled(X_queries[:2], A_data[:5])
+    end_time = time.time()
+    print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
+    print("Sample L2 distances (squared) shape:", dot_dists.shape)
+    print(dot_dists)
+
+    start_time = time.time()
+    print("\n" + "="*40)
+    print("Testing distance_dot...")
+    print("="*40)
+    dot_dists = distance_dot_tiled(X_queries, A_data)
     end_time = time.time()
     print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", dot_dists.shape)

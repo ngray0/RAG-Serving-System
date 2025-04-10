@@ -542,6 +542,7 @@ def distance_dot2(X, Y):
 # Task 1.2: k-Nearest Neighbors (Brute Force)
 # ============================================================================
 
+
 def our_knn(N_A, D, A, X, K):
     """
     Finds the K nearest neighbors in A for each query vector in X using
