@@ -990,7 +990,7 @@ if __name__ == "__main__":
     print("="*40)
     # Parameters (tune these)
     num_clusters_ann = int(math.sqrt(N_data)) # Heuristic starting point
-    num_probes_ann = 10 # Increase probes for potentially better recall
+    num_probes_ann = 100 # Increase probes for potentially better recall
     start_ann_kmeans_opt = time.time()
     # Ensure KMeansANN_Optimized class and our_ann_kmeans_optimized function are defined
     ann_indices_kmeans_opt, ann_sims_kmeans_opt = our_ann_kmeans_optimized(
