@@ -663,7 +663,7 @@ if __name__ == "__main__":
     print("Sample Manhattan distances shape:", man_dists2.shape)
    
 
-
+    torch.cuda.synchronize()
 
     dlpack_A = torch.to_dlpack(A_data)
     dlpack_X = torch.to_dlpack(X_queries)
@@ -673,10 +673,29 @@ if __name__ == "__main__":
     X_queries_cp = cp.from_dlpack(dlpack_X)
     print("CuPy testing....")
     N_queries = X_queries_cp.shape[0]
+    NUM_RUNS = 10
     all_knn_indices = [] # To store results for each query
+    print("Performing warm-up runs...")
+    try:
+        _ = our_knn(N_data, Dim, A_data, X_queries, K_val)
+        torch.cuda.synchronize()
+        _ = our_knn_hierachy(N_data, Dim, A_data_cp, X_queries_cp[0], K_val) # Warm-up one query
+        cp.cuda.Stream.null.synchronize()
+        _ = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val)
+        # our_knn_stream already synchronizes internally
+        print("Warm-up complete.")
+    except Exception as e:
+        print(f"Error during warm-up: {e}")
+        print("Skipping benchmarks.")
+        exit()
+    print("-" * 40)
+
+
 
     print("Processing queries individually...")
-    start_time = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     for i in range(N_queries):
         query_vector_cp = X_queries_cp[i] # Get the i-th query vector (shape will be (D,))
         try:
@@ -689,18 +708,71 @@ if __name__ == "__main__":
             print(f"Error processing query {i}: {e}")
             all_knn_indices.append(None) # Or handle error differently
 
-    end_time = time.time()
-    print("Hierarchy", end_time-start_time, (end_time-start_time)/N_queries)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    print("Hierarchy", elapsed_time_ms, (elapsed_time_ms)/N_queries)
 
-    start_time = time.time() 
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     knn_indices = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val)         
-    end_time = time.time()
-    print("Streams", end_time-start_time,(end_time-start_time)/N_queries)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    print("Triton",elapsed_time_ms, (elapsed_time_ms)/N_queries)
 
-    start_time = time.time()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
     knn_indices_cp,_ = our_knn(N_data, Dim, A_data, X_queries, K_val)
-    end_time = time.time()
-    print("Triton",end_time-start_time, (end_time-start_time)/N_queries)
+    end_event.record()
+    torch.cuda.synchronize()
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    print("Triton",elapsed_time_ms, (elapsed_time_ms)/N_queries)
+    print(f"Timing CuPy Hierarchy (our_knn_hierachy - Looped) over {NUM_RUNS} runs...")
+    cupy_hier_times = []
+    for r in range(NUM_RUNS):
+        all_knn_indices_hier = []
+        start_time = time.time()
+        for i in range(N_queries):
+            query_vector_cp = X_queries_cp[i]
+            try:
+                knn_indices_cp_hier = our_knn_hierachy(N_data, Dim, A_data_cp, query_vector_cp, K_val)
+                # We don't synchronize inside the loop, only after all queries
+                all_knn_indices_hier.append(knn_indices_cp_hier) # Keep result if needed
+            except Exception as e:
+                print(f"Error processing query {i} in hierarchy run {r+1}: {e}")
+                all_knn_indices_hier.append(None)
+        # --- IMPORTANT: Synchronize after the loop before stopping timer ---
+        cp.cuda.Stream.null.synchronize()
+        end_time = time.time()
+        cupy_hier_times.append(end_time - start_time)
+        # print(f" Run {r+1}/{NUM_RUNS} time: {cupy_hier_times[-1]:.4f}s") # Optional: print time per run
+    cupy_hier_avg_time = sum(cupy_hier_times) / NUM_RUNS
+    print(f"CuPy Hierarchy Avg Time: {cupy_hier_avg_time:.4f} seconds")
+    print(f"CuPy Hierarchy Avg Time per Query: {cupy_hier_avg_time / N_queries:.6f} seconds")
+    print("-" * 40)
+
+
+    # ------------------------------------
+    # Timed Benchmark: CuPy Streams (our_knn_stream)
+    # ------------------------------------
+    # Note: This method uses CuPy streams for potentially concurrent execution.
+    print(f"Timing CuPy Streams (our_knn_stream) over {NUM_RUNS} runs...")
+    cupy_stream_times = []
+    for r in range(NUM_RUNS):
+        start_time = time.time()
+        # our_knn_stream handles internal synchronization
+        knn_indices_stream = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val)
+        # No explicit sync needed here as the function guarantees completion
+        end_time = time.time()
+        cupy_stream_times.append(end_time - start_time)
+        # print(f" Run {r+1}/{NUM_RUNS} time: {cupy_stream_times[-1]:.4f}s") # Optional: print time per run
+    cupy_stream_avg_time = sum(cupy_stream_times) / NUM_RUNS
+    print(f"CuPy Streams Avg Time: {cupy_stream_avg_time:.4f} seconds")
+    print(f"CuPy Streams Avg Time per Query: {cupy_stream_avg_time / N_queries:.6f} seconds")
+    print("-" * 40)
 
 
     start_time = time.time()
@@ -716,6 +788,21 @@ if __name__ == "__main__":
             all_knn_indices.append(None) # Or handle error differently
     end_time = time.time()
     print("Triton", (end_time-start_time)/N_queries)
+
+    print(f"Timing Triton Batched (our_knn) over {NUM_RUNS} runs...")
+    triton_times = []
+    for r in range(NUM_RUNS):
+        start_time = time.time()
+        knn_indices_torch, _ = our_knn(N_data, Dim, A_data, X_queries, K_val)
+        # --- IMPORTANT: Synchronize before stopping timer ---
+        torch.cuda.synchronize()
+        end_time = time.time()
+        triton_times.append(end_time - start_time)
+        # print(f" Run {r+1}/{NUM_RUNS} time: {triton_times[-1]:.4f}s") # Optional: print time per run
+    triton_avg_time = sum(triton_times) / NUM_RUNS
+    print(f"Triton Batched Avg Time: {triton_avg_time:.4f} seconds")
+    print(f"Triton Batched Avg Time per Query: {triton_avg_time / N_queries:.6f} seconds")
+    print("-" * 40)
 
     
 
