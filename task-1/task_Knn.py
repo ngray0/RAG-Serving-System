@@ -693,7 +693,6 @@ if __name__ == "__main__":
     end_time = time.time()
     print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", dot_dists.shape)
-    print("CONFIG", dot_kernel_pairwise.best_config)
     print(dot_dists)
 
     start_time = time.time()
