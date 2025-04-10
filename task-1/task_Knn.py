@@ -571,7 +571,7 @@ def our_knn_stream(N, D, A, X, K):
 
 if __name__ == "__main__":
     N_data = 5000
-    N_queries = 100
+    N_queries = 1000
     Dim = 128
     K_val = 10
 
@@ -673,7 +673,7 @@ if __name__ == "__main__":
     X_queries_cp = cp.from_dlpack(dlpack_X)
     print("CuPy testing....")
     N_queries = X_queries_cp.shape[0]
-    NUM_RUNS = 10
+    NUM_RUNS = 500
     all_knn_indices = [] # To store results for each query
     print("Performing warm-up runs...")
     try:
@@ -720,7 +720,7 @@ if __name__ == "__main__":
     end_event.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    print("Triton",elapsed_time_ms/1000.0, (elapsed_time_ms/ 1000.0)/N_queries)
+    print("Stream",elapsed_time_ms/1000.0, (elapsed_time_ms/ 1000.0)/N_queries)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
