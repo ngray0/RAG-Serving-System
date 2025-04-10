@@ -331,7 +331,7 @@ class TritonKnnRetriever:
     and PyTorch operations for norms.
         """
         target_device = X.device
-        X_prep, A_prep = self._prepare_tensors(X, A, target_device=target_device)
+        X_prep, A_prep = self._prepare_tensors(X, A)
         Q, D = X_prep.shape
         N, D_A = A_prep.shape
         assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
