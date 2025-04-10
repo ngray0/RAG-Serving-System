@@ -372,7 +372,7 @@ def distance_dot(X, A):
     # Return negative dot product if used for minimization (finding 'nearest')
     # return -Out
     # Or return raw dot product if similarity maximization is intended
-    return Out
+    return -Out
 
 def distance_l2(X, A, **kwargs):
     """
@@ -550,7 +550,7 @@ def our_knn_hierachy(N, D, A, X, K):
     k_indices = k_indices[cp.argsort(distances[k_indices])]
     return k_indices
 
-def our_knn_stream(N, D, A, X, K):
+def our_knn_stream2(N, D, A, X, K):
     """
     KNN using CUDA Streams in CuPy for concurrent query processing.
     """
@@ -561,12 +561,94 @@ def our_knn_stream(N, D, A, X, K):
     for i in range(B):
         with streams[i]:
             query = X[i] if X.ndim > 1 else X
-            distances = compute_all_distances(A, query)[CURRENT_DISTANCE]
+            distances = distance_dot2(A, query)[CURRENT_DISTANCE]
             k_indices = cp.argpartition(distances, K)[:K]
             results[i] = k_indices[cp.argsort(distances[k_indices])]
     for s in streams:
         s.synchronize()
-    
+
+    return results if B > 1 else results[0]
+
+def our_knn_stream(N, D, A, X, K):
+    """
+    KNN using CUDA Streams in CuPy for concurrent query processing.
+    MODIFIED: Uses distance_dot for similarity (finds K most similar neighbors).
+    """
+    # Ensure A and X are CuPy arrays
+    if not isinstance(A, cp.ndarray):
+        A = cp.asarray(A)
+    if not isinstance(X, cp.ndarray):
+        X = cp.asarray(X)
+
+    # --- Input Validation (Optional but Recommended) ---
+    if A.shape[0] != N or A.shape[1] != D:
+         print(f"Warning: Dataset A shape {A.shape} does not match N={N}, D={D}")
+         # Or raise ValueError("Dataset A shape mismatch")
+    if X.ndim > 0 and X.shape[-1] != D:
+         raise ValueError(f"Query X feature dimension {X.shape[-1]} does not match D={D}")
+    # --- End Validation ---
+
+    B = X.shape[0] if X.ndim > 1 else 1  # Determine batch size.
+    if B == 0: return [] # Handle empty query batch
+
+    streams = [cp.cuda.Stream() for _ in range(B)]
+    results = [None] * B # To store indices for each query
+
+    # Determine the actual number of neighbors to find (cannot exceed dataset size)
+    actual_k = min(K, N)
+    if actual_k <= 0: # Handles K<=0 or N=0
+        empty_result = cp.array([], dtype=cp.int64)
+        return [empty_result] * B if B > 1 else empty_result
+
+    for i in range(B):
+        # Assign work to the stream
+        with streams[i]:
+            # Extract the query, ensure it's 2D (1, D) for distance_dot
+            query = X[i] if X.ndim > 1 else X
+            # Reshape even if X was 1D, so query_2d is always (1, D)
+            query_2d = query.reshape(1, D)
+
+            # --- MODIFIED DISTANCE CALCULATION ---
+            # Calculate raw dot products (similarities) using the specified function
+            # Input shapes: query_2d (1, D), A (N, D)
+            # Output shape: raw_dot_products (1, N)
+            raw_dot_products = distance_dot(query_2d, A)
+
+            # We have scores for one query vs all dataset points, shape (1, N).
+            # Get the 1D array of scores (shape N,)
+            scores_1d = raw_dot_products[0]
+
+            # --- MODIFIED K-NN LOGIC FOR SIMILARITY (Find K LARGEST scores) ---
+            # Find the indices of the K largest scores (most similar neighbors)
+
+            # Method 1: Partitioning (often faster for large N)
+            # Partition to find the indices of the K largest (unsorted among themselves)
+            # We need to partition around the (N - actual_k)-th element index
+            k_indices_unsorted = cp.argpartition(scores_1d, N - actual_k)[-actual_k:]
+
+            # Get the actual scores for these K indices if needed (e.g., for sorting)
+            k_scores_unsorted = scores_1d[k_indices_unsorted]
+
+            # Sort these K scores in descending order to get the final ranking
+            # argsort on negative scores gives descending order indices relative to the K subset
+            sorted_order_in_k = cp.argsort(-k_scores_unsorted)
+
+            # Apply the sort order to the indices
+            top_k_indices = k_indices_unsorted[sorted_order_in_k]
+
+            # # Method 2: Sorting (simpler, maybe faster for small N)
+            # sorted_indices_descending = cp.argsort(-scores_1d) # Sort all N scores descending
+            # top_k_indices = sorted_indices_descending[:actual_k]
+
+            # Store the final indices for this query
+            results[i] = top_k_indices
+            # --------------------------------------------------------------------
+
+    # Wait for all streams to finish their work
+    for s in streams:
+        s.synchronize()
+
+    # Return the list of results (or single result if B=1)
     return results if B > 1 else results[0]
 
 
