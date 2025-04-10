@@ -22,7 +22,7 @@ print(f"Using device: {device}")
 
 DEFAULT_BLOCK_Q = 32
 DEFAULT_BLOCK_N = 64
-DEFAULT_BLOCK_D = 128
+DEFAULT_BLOCK_D = 512
 DEFAULT_BLOCK_K = 16 # Block size for the reduction dimension D (used by all tiled kernels)
 
 def ceil_div(a, b):
@@ -101,34 +101,6 @@ def dot_kernel_pairwise_tiled(
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
 
-@triton.autotune(
-    configs=[
-        # Vary BLOCK_SIZE_D and num_warps
-        triton.Config({'BLOCK_SIZE_D': 32,  'num_warps': 2}),
-        triton.Config({'BLOCK_SIZE_D': 64,  'num_warps': 2}),
-        triton.Config({'BLOCK_SIZE_D': 64,  'num_warps': 4}),
-
-        triton.Config({'BLOCK_SIZE_D': 128, 'num_warps': 2}),
-        triton.Config({'BLOCK_SIZE_D': 128, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_D': 128, 'num_warps': 8}), # More warps for larger blocks
-
-        triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 8}),
-
-        triton.Config({'BLOCK_SIZE_D': 512, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_D': 512, 'num_warps': 8}),
-
-        triton.Config({'BLOCK_SIZE_D': 1024, 'num_warps': 4}),
-        triton.Config({'BLOCK_SIZE_D': 1024, 'num_warps': 8}),
-
-        # Example with num_stages (often combined with num_warps)
-        # More stages can hide memory latency but use more shared memory
-        # triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 4, 'num_stages': 2}),
-        # triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 4, 'num_stages': 3}),
-
-    ],
-    key=['D'], # Keep the key simple for now, focusing on D's influence
-)
 
 @triton.jit
 def dot_kernel_pairwise(
@@ -394,8 +366,8 @@ def distance_dot(X, A):
         Q, N, D,
         X_prep.stride(0), X_prep.stride(1),
         A_prep.stride(0), A_prep.stride(1),
-        Out.stride(0), Out.stride(1)#,
-        #BLOCK_SIZE_D=DEFAULT_BLOCK_D
+        Out.stride(0), Out.stride(1),
+        BLOCK_SIZE_D=DEFAULT_BLOCK_D
     )
     # Return negative dot product if used for minimization (finding 'nearest')
     # return -Out
