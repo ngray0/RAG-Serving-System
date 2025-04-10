@@ -184,7 +184,7 @@ def distance_dot_tiled(X, A, N_TILE=50000, prep = True): # Tile size, adjust if 
         )
         # Potentially add torch.cuda.synchronize() here if debugging tile-by-tile issues
 
-    return Out
+    return -Out
 
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
