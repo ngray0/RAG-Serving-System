@@ -101,6 +101,35 @@ def dot_kernel_pairwise_tiled(
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
 
+@triton.autotune(
+    configs=[
+        # Vary BLOCK_SIZE_D and num_warps
+        triton.Config({'BLOCK_SIZE_D': 32,  'num_warps': 2}),
+        triton.Config({'BLOCK_SIZE_D': 64,  'num_warps': 2}),
+        triton.Config({'BLOCK_SIZE_D': 64,  'num_warps': 4}),
+
+        triton.Config({'BLOCK_SIZE_D': 128, 'num_warps': 2}),
+        triton.Config({'BLOCK_SIZE_D': 128, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_D': 128, 'num_warps': 8}), # More warps for larger blocks
+
+        triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 8}),
+
+        triton.Config({'BLOCK_SIZE_D': 512, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_D': 512, 'num_warps': 8}),
+
+        triton.Config({'BLOCK_SIZE_D': 1024, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE_D': 1024, 'num_warps': 8}),
+
+        # Example with num_stages (often combined with num_warps)
+        # More stages can hide memory latency but use more shared memory
+        # triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 4, 'num_stages': 2}),
+        # triton.Config({'BLOCK_SIZE_D': 256, 'num_warps': 4, 'num_stages': 3}),
+
+    ],
+    key=['D'], # Keep the key simple for now, focusing on D's influence
+)
+
 @triton.jit
 def dot_kernel_pairwise(
     X_ptr, A_ptr, Out_ptr,
@@ -530,7 +559,7 @@ def our_knn(N_A, D, A, X, K):
     topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
 
     end_time = time.time()
-    print(f"k-NN computation time: {end_time - start_time:.4f} seconds")
+    print(f"k-NN computation time: {end_time - start_time:.6f} seconds")
 
     return topk_indices, topk_distances
 
@@ -571,7 +600,7 @@ def our_knn_stream(N, D, A, X, K):
 
 if __name__ == "__main__":
     N_data = 5000
-    N_queries = 1000
+    N_queries = 100
     Dim = 128
     K_val = 10
 
@@ -587,10 +616,11 @@ if __name__ == "__main__":
     print("\n" + "="*40)
     print("Testing distance_dot...")
     print("="*40)
-    dot_dists = distance_dot(X_queries[:2], A_data[:5])
+    dot_dists = distance_dot(X_queries, A_data)
     end_time = time.time()
     print(f"Dot distance computation time: {end_time - start_time:.4f} seconds")
     print("Sample L2 distances (squared) shape:", dot_dists.shape)
+    print("CONFIG", dot_kernel_pairwise.best_config)
     print(dot_dists)
 
     start_time = time.time()
@@ -673,7 +703,7 @@ if __name__ == "__main__":
     X_queries_cp = cp.from_dlpack(dlpack_X)
     print("CuPy testing....")
     N_queries = X_queries_cp.shape[0]
-    NUM_RUNS = 500
+    NUM_RUNS = 100
     all_knn_indices = [] # To store results for each query
     print("Performing warm-up runs...")
     try:
@@ -777,10 +807,11 @@ if __name__ == "__main__":
 
     start_time = time.time()
     for i in range(N_queries):
-        query_vector = X_queries[i] # Get the i-th query vector (shape will be (D,))
+        query_vector = X_queries[i:i+1] # Get the i-th query vector (shape will be (D,))
         try:
         # Call the function with a single query vector
             knn_indices,_ = our_knn(N_data, Dim, A_data, query_vector, K_val)
+            print(knn_indices)
         # Optional: Add print statement for progress
         # if (i+1) % 10 == 0: print(f"Processed query {i+1}/{N_queries}")
         except Exception as e:
