@@ -8,10 +8,10 @@ import numpy as np
 import time
 import cupy as cp
 import json
-from test import testdata_kmeans, testdata_knn, testdata_ann
-import csv
-import os
-import math
+#from test import testdata_kmeans, testdata_knn, testdata_ann
+#import csv
+#import os
+#import math
 from typing import List, Union
 
 if not torch.cuda.is_available():
@@ -152,6 +152,33 @@ class SimpleRetriever:
     # Return the list of results (or single result if B=1)
         return results if B > 1 else results[0]
 
+    def batch_retrieve(self, query_embeddings: np.ndarray, ks: List[int]) -> List[List[str]]:
+         """
+         Retrieve top-k documents for a batch of query embeddings by calling
+         the single 'retrieve' method iteratively.
+ 
+         Args:
+             query_embeddings: A NumPy array of query embeddings
+                               (shape: batch_size, embedding_dim).
+             ks: A list of integers, where each element is the 'k' value
+                 for the corresponding query in the batch.
+ 
+         Returns:
+             A list of lists, where each inner list contains the text of the
+             top-k documents for the corresponding query.
+         """
+         if query_embeddings.shape[0] != len(ks):
+             logging.error(f"Batch retrieve size mismatch: {query_embeddings.shape[0]} embeddings vs {len(ks)} k values.")
+             return [[] for _ in range(len(ks))]
+ 
+         batch_results = []
+         for i, query_emb in enumerate(query_embeddings):
+             k = ks[i]
+             top_docs = self.retrieve(query_emb, k)
+             batch_results.append(top_docs)
+ 
+         return batch_results
+
 
 
 class TritonKnnRetriever:
@@ -234,7 +261,7 @@ class TritonKnnRetriever:
              logging.info("Skipping Triton kernel warm-up on CPU.")
 
 
-    def _prepare_tensors(self, *tensors): # Removed target_device, uses self.device
+    def _prepare_tensors(self, *tensors): 
         """Ensure tensors are float32, contiguous, and on self.device."""
         prepared = []
         for t in tensors:
@@ -345,7 +372,7 @@ class TritonKnnRetriever:
     and PyTorch operations for norms.
         """
         target_device = X.device
-        X_prep, A_prep = self._prepare_tensors(X, A, target_device=target_device)
+        X_prep, A_prep = self._prepare_tensors(X, A)
         Q, D = X_prep.shape
         N, D_A = A_prep.shape
         assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
@@ -365,7 +392,7 @@ class TritonKnnRetriever:
     and PyTorch operations for norms.
         """
         target_device = X.device
-        X_prep, A_prep = self._prepare_tensors(X, A, target_device=target_device)
+        X_prep, A_prep = self._prepare_tensors(X, A)
         Q, D = X_prep.shape
         N, D_A = A_prep.shape
         assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
@@ -382,7 +409,7 @@ class TritonKnnRetriever:
 
     def retrieve(self, X: Union[np.ndarray, torch.Tensor], K: int) -> Union[np.ndarray, List]:
         """
-         Finds the K nearest neighbors for query vector(s) X.
+         Finds the K nearest neighbors for query vector X.
          Accepts X as 1D (D,) or 2D (Q, D) NumPy array or Torch Tensor.
 
          Args:
@@ -396,12 +423,6 @@ class TritonKnnRetriever:
             X_tensor = torch.from_numpy(X) 
         elif isinstance(X, torch.Tensor):
             X_tensor = X
-        else:
-            try:
-                 # Attempt conversion for list-like inputs etc.
-                 X_tensor = torch.tensor(X, dtype=torch.float32)
-            except Exception as e:
-                 raise TypeError(f"Input X must be NumPy array or Torch Tensor, got {type(X)}. Conversion failed: {e}")
 
         input_was_1d = False
         if X_tensor.ndim == 1:
@@ -435,9 +456,6 @@ class TritonKnnRetriever:
         # Pass the prepared tensors directly
         all_distances = self.distance_dot(X_prep, A_prep) # Shape (Q, N_A)
 
-        # Find the top K smallest distances (or largest similarities)
-        # Assuming lower distance value (higher dot product if using raw dot) is better
-        # If using raw dot product, change largest=True
         topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
 
         # 3. Transfer indices to CPU for document lookup
@@ -467,7 +485,7 @@ class TritonKnnRetriever:
              print(f"Error during document retrieval: {e}")
              raise
 
-        cpu_end_time = time.time()
+        #cpu_end_time = time.time()
         #print(f"k-NN GPU+Transfer Time: {gpu_end_time - start_time:.6f}s | CPU Lookup Time: {cpu_end_time - gpu_end_time:.6f}s")
 
         if input_was_1d:
@@ -479,6 +497,33 @@ class TritonKnnRetriever:
                 return retrieved_docs_batched
         else:
             return retrieved_docs_batched
+    
+    def batch_retrieve(self, query_embeddings: np.ndarray, ks: List[int]) -> List[List[str]]:
+         """
+         Retrieve top-k documents for a batch of query embeddings by calling
+         the single 'retrieve' method iteratively.
+ 
+         Args:
+             query_embeddings: A NumPy array of query embeddings
+                               (shape: batch_size, embedding_dim).
+             ks: A list of integers, where each element is the 'k' value
+                 for the corresponding query in the batch.
+ 
+         Returns:
+             A list of lists, where each inner list contains the text of the
+             top-k documents for the corresponding query.
+         """
+         if query_embeddings.shape[0] != len(ks):
+             logging.error(f"Batch retrieve size mismatch: {query_embeddings.shape[0]} embeddings vs {len(ks)} k values.")
+             return [[] for _ in range(len(ks))]
+ 
+         batch_results = []
+         for i, query_emb in enumerate(query_embeddings):
+             k = ks[i]
+             top_docs = self.retrieve(query_emb, k)
+             batch_results.append(top_docs)
+ 
+         return batch_results
 
 '''
 if __name__ == '__main__':

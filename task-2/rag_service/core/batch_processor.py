@@ -8,7 +8,7 @@ from typing import List, Union
 from datasets import Dataset
 
 from .request_queue import RequestQueue, RedisRequestQueue
-from .retriever import SimpleRetriever 
+from .retriever import SimpleRetriever, TritonKnnRetriever
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -102,7 +102,7 @@ class BatchProcessor(threading.Thread):
             # 3 Batch LLM generation
             prompts = [f"Context:\n{c}\n\nQuestion: {q}\n\nAnswer:" for q, c in zip(queries, all_contexts)]
             dataset = Dataset.from_dict({"text": prompts}) 
-            outputs = self.llm_model(dataset["text"], max_new_tokens=10, do_sample=True, batch_size=len(prompts))
+            outputs = self.llm_model(dataset["text"], max_new_tokens=25, do_sample=True, batch_size=len(prompts))
 
             # 4 stores results
             for i, request_id in enumerate(request_ids):

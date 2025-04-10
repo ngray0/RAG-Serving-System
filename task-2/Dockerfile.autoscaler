@@ -1,0 +1,20 @@
+FROM python:3.10
+
+WORKDIR /teamspace/studios/this_studio/MLS-G31/task-2
+
+# Install dependencies
+RUN pip install --no-cache-dir kubernetes==32.0.1 redis==5.2.1
+
+COPY deployment/auto_scaler.py /teamspace/studios/this_studio/MLS-G31/task-2/autoscaler.py
+
+# Set environment variables with defaults
+ENV NAMESPACE="default"
+ENV DEPLOYMENT_NAME="rag-service"
+ENV MIN_REPLICAS="1"
+ENV MAX_REPLICAS="4"
+ENV CHECK_INTERVAL="15"
+ENV QUEUE_SIZE_PER_REPLICA="30"
+ENV REDIS_URL="redis://redis-service:6379/0"
+
+# Run the autoscaler
+CMD ["python", "auto_scaler.py"]
