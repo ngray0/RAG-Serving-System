@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException
-from typing import Dict, Any
+from typing import Dict, Any, Union
 
 from rag_service.api.models import QueryRequest, QueryResponse
-from rag_service.core.request_queue import RequestQueue
+from rag_service.core.request_queue import RequestQueue, RedisRequestQueue
 
-def create_api(request_queue: RequestQueue):
+def create_api(request_queue: Union[RequestQueue, RedisRequestQueue]):
     """Create the FastAPI application with endpoints"""
     app = FastAPI()
     

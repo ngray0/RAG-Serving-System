@@ -1,12 +1,13 @@
+from ctypes import Union
 import threading
 import time
 import torch
 import numpy as np
 import logging 
-from typing import List
+from typing import List, Union
 from datasets import Dataset
 
-from .request_queue import RequestQueue
+from .request_queue import RequestQueue, RedisRequestQueue
 from .retriever import SimpleRetriever 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class BatchProcessor(threading.Thread):
     """Background thread that processes batches of RAG requests"""
     def __init__(self,
-                 request_queue: RequestQueue,
+                 request_queue: Union[RequestQueue, RedisRequestQueue],
                  embedding_model: dict,
                  llm_model, 
                  retriever: SimpleRetriever, 
