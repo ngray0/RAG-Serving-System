@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 import numpy as np
 import time
+import cupy as cp
 import json
 from test import testdata_kmeans, testdata_knn, testdata_ann
 import csv
@@ -68,61 +69,90 @@ class SimpleRetriever:
 
         self.doc_embeddings = doc_embeddings
         self.documents = documents
+        self.N_A = self.doc_embeddings.shape[0]
+        self.D = self.doc_embeddings.shape[1]
         logging.info(f"Initialized SimpleRetriever with {len(self.documents)} documents.")
+    def distance_dot(self, X, Y):
+       """
+    Calculates pairwise dot products between rows of X and rows of Y.
 
-    def retrieve(self, query_emb: np.ndarray, k: int = 2) -> List[str]:
+    Args:
+        X: cupy array of shape (Q, D) - Query points.
+        Y: cupy array of shape (N, D) - Reference data points.
+
+    Returns:
+        cupy array of shape (Q, N) where element (i, j) is dot(X[i], Y[j]).
         """
-        Retrieve top-k documents for a single query embedding using the
-        specified dot-product logic.
+       X_cp = cp.asarray(X)
+       Y_cp = cp.asarray(Y)
+       print(f"Calculating pairwise dot products via matmul for shapes: {X_cp.shape} and {Y_cp.T.shape}")
+       return X_cp @ Y_cp.T
 
-        Args:
-            query_emb: A NumPy array representing the query embedding
-                             (shape: embedding_dim or potentially 1, embedding_dim).
-            k: The number of top documents to retrieve.
-
-        Returns:
-            A list containing the text of the top-k documents. Returns empty list on error.
+  
+    def retrieve(self,  X, K):
         """
-        try:
-            query_emb_flat = query_emb.flatten()
-            sims = self.doc_embeddings @ query_emb_flat
-            sims = sims.ravel()
-            top_k_indices = np.argsort(sims)[::-1][:k]
-
-            retrieved_docs = [self.documents[i] for i in top_k_indices]
-            return retrieved_docs
-
-        except Exception as e:
-            logging.error(f"Unexpected error during retrieve method: {e}", exc_info=True)
-            return []
-
-
-    def batch_retrieve(self, query_embeddings: np.ndarray, ks: List[int]) -> List[List[str]]:
+    KNN using CUDA Streams in CuPy for concurrent query processing.
+    MODIFIED: Uses distance_dot for similarity (finds K most similar neighbors).
         """
-        Retrieve top-k documents for a batch of query embeddings by calling
-        the single 'retrieve' method iteratively.
+        if not isinstance(X, cp.ndarray):
+            X = cp.asarray(X)
 
-        Args:
-            query_embeddings: A NumPy array of query embeddings
-                              (shape: batch_size, embedding_dim).
-            ks: A list of integers, where each element is the 'k' value
-                for the corresponding query in the batch.
 
-        Returns:
-            A list of lists, where each inner list contains the text of the
-            top-k documents for the corresponding query.
-        """
-        if query_embeddings.shape[0] != len(ks):
-            logging.error(f"Batch retrieve size mismatch: {query_embeddings.shape[0]} embeddings vs {len(ks)} k values.")
-            return [[] for _ in range(len(ks))]
+        if X.ndim > 0 and X.shape[-1] != self.D:
+            raise ValueError(f"Query X feature dimension {X.shape[-1]} does not match D={self.D}")
+  
 
-        batch_results = []
-        for i, query_emb in enumerate(query_embeddings):
-            k = ks[i]
-            top_docs = self.retrieve(query_emb, k)
-            batch_results.append(top_docs)
+        B = X.shape[0] if X.ndim > 1 else 1
+        if B == 0: return []
 
-        return batch_results
+        streams = [cp.cuda.Stream() for _ in range(B)]
+        results = [None] * B # To store indices for each query
+
+    # Determine the actual number of neighbors to find (cannot exceed dataset size)
+        actual_k = min(K, self.N_A)
+        if actual_k <= 0: # Handles K<=0 or N=0
+            empty_result = cp.array([], dtype=cp.int64)
+            return [empty_result] * B if B > 1 else empty_result
+
+        for i in range(B):
+        # Assign work to the stream
+            with streams[i]:
+                query = X[i] if X.ndim > 1 else X
+                query_2d = query.reshape(1, self.D)
+
+                raw_dot_products = self.distance_dot(query_2d, self.doc_embeddings)
+
+                scores_1d = raw_dot_products[0]
+
+                k_indices_unsorted = cp.argpartition(scores_1d, self.N_A - actual_k)[-actual_k:]
+
+            # Get the actual scores for these K indices if needed (e.g., for sorting)
+                k_scores_unsorted = scores_1d[k_indices_unsorted]
+
+            # Sort these K scores in descending order to get the final ranking
+            # argsort on negative scores gives descending order indices relative to the K subset
+                sorted_order_in_k = cp.argsort(-k_scores_unsorted)
+
+            # Apply the sort order to the indices
+                top_k_indices = k_indices_unsorted[sorted_order_in_k]
+                top_k_docs = self.documents[top_k_indices]
+
+            # # Method 2: Sorting (simpler, maybe faster for small N)
+            # sorted_indices_descending = cp.argsort(-scores_1d) # Sort all N scores descending
+            # top_k_indices = sorted_indices_descending[:actual_k]
+
+            # Store the final indices for this query
+                results[i] = top_k_docs
+            # --------------------------------------------------------------------
+
+    # Wait for all streams to finish their work
+        for s in streams:
+            s.synchronize()
+
+    # Return the list of results (or single result if B=1)
+        return results if B > 1 else results[0]
+
+
 
 class TritonKnnRetriever:
     """
@@ -141,6 +171,7 @@ class TritonKnnRetriever:
         """
         self.device = device # Store the determined device
         self.documents = documents # Store documents (assumed CPU list)
+        
 
         if self.device.type == 'cpu':
              logging.warning("Running on CPU, Triton kernel will not be used effectively.")
@@ -259,7 +290,7 @@ class TritonKnnRetriever:
             Out.stride(0), Out.stride(1),
             BLOCK_SIZE_D=self.DEFAULT_BLOCK_D
         )
-        return Out
+        return -Out
 
     def retrieve(self, X: Union[np.ndarray, torch.Tensor], K: int) -> Union[np.ndarray, List]:
         """
