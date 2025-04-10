@@ -8,6 +8,7 @@ from datasets import Dataset
 
 from .request_queue import RequestQueue
 from .retriever import SimpleRetriever 
+from .retriever import TritonKnnRetriever 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -17,7 +18,7 @@ class BatchProcessor(threading.Thread):
                  request_queue: RequestQueue,
                  embedding_model: dict,
                  llm_model, 
-                 retriever: SimpleRetriever, 
+                 retriever: TritonKnnRetriever, 
                  device: str = 'cuda',
                  polling_interval: float = 0.1): 
         super().__init__(daemon=True) 
