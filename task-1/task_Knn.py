@@ -511,7 +511,7 @@ def compute_all_distances(A, X):
         "Dot": distance_dot2(A, X),
         "Manhattan": distance_manhattan2(A, X)
     }
-def distance_dot_tiled(X, A, N_TILE=50000): # Tile size, adjust if needed
+def distance_dot_tiled(X, A, N_TILE=50000, prep = True): # Tile size, adjust if needed
     """
     Computes pairwise dot product using Triton kernel, tiled over A
     to avoid exceeding GPU grid dimension limits.
@@ -524,7 +524,10 @@ def distance_dot_tiled(X, A, N_TILE=50000): # Tile size, adjust if needed
     Returns:
         torch.Tensor: Output tensor of dot products (Q, N) on GPU.
     """
-    X_prep, A_prep = _prepare_tensors(X, A) # Ensure tensors are ready
+    if prep == True:
+        X_prep, A_prep = _prepare_tensors(X, A) # Ensure tensors are ready
+    else:
+        X_prep, A_prep = X, A
     Q, D = X_prep.shape
     N, D_A = A_prep.shape
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
@@ -587,7 +590,7 @@ def our_knn(N_A, D, A, X, K):
 
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
-    all_distances = distance_dot_tiled(X_prep, A_prep) # Shape (Q, N_A)
+    all_distances = distance_dot_tiled(X_prep, A_prep, prep = False) # Shape (Q, N_A)
 
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
