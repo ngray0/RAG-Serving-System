@@ -711,7 +711,7 @@ if __name__ == "__main__":
     end_event.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    print("Hierarchy", elapsed_time_ms, (elapsed_time_ms)/N_queries)
+    print("Hierarchy", elapsed_time_ms/ 1000.0, (elapsed_time_ms/ 1000.0)/N_queries)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -720,7 +720,7 @@ if __name__ == "__main__":
     end_event.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    print("Triton",elapsed_time_ms, (elapsed_time_ms)/N_queries)
+    print("Triton",elapsed_time_ms/1000.0, (elapsed_time_ms/ 1000.0)/N_queries)
 
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -729,7 +729,7 @@ if __name__ == "__main__":
     end_event.record()
     torch.cuda.synchronize()
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    print("Triton",elapsed_time_ms, (elapsed_time_ms)/N_queries)
+    print("Triton",elapsed_time_ms/ 1000.0, (elapsed_time_ms/ 1000.0)/N_queries)
     print(f"Timing CuPy Hierarchy (our_knn_hierachy - Looped) over {NUM_RUNS} runs...")
     cupy_hier_times = []
     for r in range(NUM_RUNS):
