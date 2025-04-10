@@ -311,33 +311,46 @@ def our_knn(N_A, D, A, X, K):
 
     return topk_indices, topk_distances
 
-class KMeansANN:
-    """
-    Approximate Nearest Neighbor search using K-Means clustering (Inverted File Index).
+# --- Normalization Helper ---
+def normalize_vectors(vectors, epsilon=1e-12):
+    """L2 normalize vectors row-wise."""
+    norms = torch.linalg.norm(vectors, dim=1, keepdim=True)
+    return vectors / (norms + epsilon)
 
-    Builds an index by clustering the data points using K-Means.
-    Search involves finding the nearest cluster(s) to the query and then
-    performing exact search only within those clusters.
+# ============================================================================
+# Task 2.2: Approximate Nearest Neighbors (Optimized K-Means IVF - Dot Product)
+# ============================================================================
+class KMeansANN_Optimized:
+    """
+    Optimized Approximate Nearest Neighbor search using K-Means clustering (IVF)
+    with Dot Product similarity on normalized vectors and a GPU-friendly index structure.
+
+    Builds an index by clustering data points (using L2 K-Means).
+    Search involves finding the most similar cluster centroid(s) via dot product,
+    then performing exact dot product search within candidates from those clusters.
     """
     def __init__(self, dim, k_clusters, nprobe=1):
         """
         Args:
             dim (int): Dimensionality of the vectors.
             k_clusters (int): Number of clusters for K-Means.
-            nprobe (int): Number of nearest clusters to search during query time.
+            nprobe (int): Number of nearest clusters (by dot product) to search.
         """
         self.dim = dim
         self.k_clusters = k_clusters
-        self.nprobe = nprobe
-        self.centroids = None # Shape: (k_clusters, dim)
-        self.inverted_index = None # Dict: {cluster_id: [point_idx1, point_idx2, ...]}
-        self.data = None # Store original data: (N, dim)
+        self.nprobe = max(1, nprobe) # Ensure nprobe >= 1
+        self.centroids_norm = None       # Shape: (k_clusters, dim), L2 normalized
+        self.sorted_data_norm = None     # Shape: (N, dim), sorted by cluster, L2 normalized
+        self.cluster_offsets = None      # Shape: (k_clusters,), start index of each cluster in sorted_data
+        self.cluster_counts = None       # Shape: (k_clusters,), count of points in each cluster
+        self.sorted_to_original_idx = None # Shape: (N,), mapping from sorted index back to original A index
         self.is_built = False
-        print(f"Initialized KMeansANN: k_clusters={k_clusters}, nprobe={nprobe}")
+        self.original_n = 0
+        print(f"Initialized KMeansANN_Optimized (Dot Product): k_clusters={k_clusters}, nprobe={nprobe}")
 
     def build_index(self, A, max_kmeans_iters=50, kmeans_tol=1e-4):
         """
-        Builds the K-Means based index.
+        Builds the optimized K-Means based index using Dot Product similarity.
 
         Args:
             A (torch.Tensor): The database vectors (N, dim) on GPU.
@@ -345,40 +358,82 @@ class KMeansANN:
             kmeans_tol (float): Tolerance for K-Means convergence.
         """
         N_A, D = A.shape
+        self.original_n = N_A
         assert D == self.dim, f"Data dimension ({D}) doesn't match index dimension ({self.dim})"
         assert self.k_clusters <= N_A, f"k_clusters ({self.k_clusters}) cannot be larger than N_A ({N_A})"
-        assert self.nprobe <= self.k_clusters, f"nprobe ({self.nprobe}) cannot be larger than k_clusters ({self.k_clusters})"
+        # nprobe check already done in __init__
 
-        print("Building KMeansANN index...")
+        print("Building Optimized KMeansANN index (Dot Product)...")
         start_build = time.time()
+        target_device = A.device
 
-        # 1. Run K-Means to get centroids and assignments
+        # 1. Run K-Means (still using L2 distance internally for clustering)
+        print(f"  Running K-Means (L2 based) with K={self.k_clusters}...")
         # our_kmeans uses the triton kernel internally
-        print(f"  Running K-Means with K={self.k_clusters}...")
-        self.centroids, assignments = our_kmeans(N_A, self.dim, A, self.k_clusters,
+        centroids, assignments = our_kmeans(N_A, self.dim, A, self.k_clusters,
                                                   max_iters=max_kmeans_iters, tol=kmeans_tol)
         # centroids shape: (k_clusters, dim)
         # assignments shape: (N_A,) dtype=int64
 
-        # 2. Store original data (needed for final distance calculation)
-        self.data = A.clone() # Clone to ensure it doesn't change externally
+        # 2. Normalize Centroids
+        print("  Normalizing centroids...")
+        self.centroids_norm = normalize_vectors(centroids).contiguous()
 
-        # 3. Create the inverted index (mapping cluster_id -> list of point indices)
-        print("  Creating inverted index...")
-        self.inverted_index = {k: [] for k in range(self.k_clusters)}
-        for point_idx, cluster_id in enumerate(assignments.tolist()):
-            # Handle potential edge case if a cluster ends up empty (shouldn't happen with our_kmeans handling)
-             if cluster_id in self.inverted_index:
-                self.inverted_index[cluster_id].append(point_idx)
-            # else: print(f"Warning: Point {point_idx} assigned to non-existent cluster {cluster_id}") # Debugging
+        # 3. Sort data based on cluster assignments for GPU-friendly access
+        print("  Sorting data by cluster assignment...")
+        start_sort = time.time()
+        # Argsort gives the indices that would sort the assignments array
+        sorted_indices = torch.argsort(assignments)
+        # Keep track of mapping from sorted position back to original index
+        self.sorted_to_original_idx = sorted_indices.clone() # Store this mapping
+
+        # Sort the original data and the assignments array
+        sorted_A = A[sorted_indices]
+        sorted_assignments = assignments[sorted_indices]
+        end_sort = time.time()
+        print(f"  Data sorting time: {end_sort - start_sort:.4f}s")
+
+        # 4. Normalize the sorted data
+        print("  Normalizing sorted data...")
+        self.sorted_data_norm = normalize_vectors(sorted_A).contiguous()
+
+        # 5. Create GPU-based cluster offsets and counts
+        print("  Calculating cluster offsets and counts...")
+        start_offset = time.time()
+        # Find unique cluster IDs present and their first occurrence index and counts
+        unique_clusters, first_occurrence_indices, counts = torch.unique_consecutive(
+            sorted_assignments, return_inverse=False, return_counts=True
+        )
+
+        # Create full offset and count arrays (handling potentially empty clusters)
+        self.cluster_offsets = torch.full((self.k_clusters,), -1, dtype=torch.long, device=target_device) # Use -1 or N_A as sentinel
+        self.cluster_counts = torch.zeros(self.k_clusters, dtype=torch.long, device=target_device)
+
+        # Fill in the values for clusters that actually have points
+        # Ensure unique_clusters are within the expected range [0, k_clusters-1]
+        valid_cluster_mask = (unique_clusters >= 0) & (unique_clusters < self.k_clusters)
+        valid_unique_clusters = unique_clusters[valid_cluster_mask]
+        valid_first_indices = first_occurrence_indices[valid_cluster_mask]
+        valid_counts = counts[valid_cluster_mask]
+
+        self.cluster_offsets[valid_unique_clusters] = valid_first_indices
+        self.cluster_counts[valid_unique_clusters] = valid_counts
+        end_offset = time.time()
+        print(f"  Offset calculation time: {end_offset - start_offset:.4f}s")
+
+        # Cleanup intermediate tensors if needed
+        del sorted_A, sorted_assignments, assignments, centroids
+        torch.cuda.empty_cache() # Optional
 
         self.is_built = True
         end_build = time.time()
         print(f"Index build time: {end_build - start_build:.2f} seconds")
 
+
     def search_knn(self, query_vec, k):
         """
-        Searches for the k nearest neighbors for a single query vector.
+        Searches for the k most similar neighbors (highest dot product)
+        for a single query vector using the optimized IVF index.
 
         Args:
             query_vec (torch.Tensor): The query vector (1, dim) or (dim,) on GPU.
@@ -386,76 +441,106 @@ class KMeansANN:
 
         Returns:
             tuple[torch.Tensor, torch.Tensor]:
-                - topk_indices (torch.Tensor): Indices of the K nearest neighbors (k,).
-                - topk_distances (torch.Tensor): L2 distances of the K nearest neighbors (k,).
-                                                  Returns actual L2 distances.
+                - topk_indices (torch.Tensor): Original indices of the K most similar neighbors (k,).
+                - topk_similarities (torch.Tensor): Dot product similarity scores (k,).
+                                                     Returns dot product values (higher is better).
         """
         if not self.is_built:
             raise RuntimeError("Index has not been built yet. Call build_index() first.")
 
+        k = min(k, self.original_n) # Cannot return more neighbors than exist
+        if k == 0:
+            return torch.full((0,), -1, dtype=torch.int64), torch.full((0,), -float('inf'), dtype=torch.float32)
+
+
+        target_device = self.centroids_norm.device
         query_vec = query_vec.view(1, -1) # Ensure shape (1, dim)
-        query_vec_prep, = _prepare_tensors(query_vec, target_device=self.data.device)
+        query_vec_prep, = _prepare_tensors(query_vec, target_device=target_device)
 
-        # 1. Find the `nprobe` nearest centroids to the query vector
-        # Use distance_l2_triton for efficient query-vs-centroids calculation
-        # Returns actual L2 distances, shape (1, k_clusters)
-        dist_q_to_centroids = distance_dot(query_vec_prep, self.centroids)
+        # 1. Normalize the query vector
+        query_norm = normalize_vectors(query_vec_prep).contiguous() # Shape (1, dim)
 
-        # Get the indices and distances of the top `nprobe` closest centroids
-        # topk returns (values, indices)
-        top_centroid_dists, top_centroid_indices = torch.topk(
-            dist_q_to_centroids, k=self.nprobe, dim=1, largest=False, sorted=True # sorted=True is not strictly necessary
+        # 2. Find the `nprobe` most similar centroids (highest dot product)
+        # Use distance_dot_triton: query_norm @ self.centroids_norm.T
+        # Result shape: (1, k_clusters)
+        dot_q_to_centroids = distance_dot_tiled(query_norm, self.centroids_norm)
+
+        # Get the indices and dot products of the top `nprobe` most similar centroids
+        # We want the LARGEST dot products
+        # If less than nprobe centroids exist/are valid, topk handles it.
+        actual_nprobe = min(self.nprobe, self.k_clusters)
+        top_centroid_dots, top_centroid_indices = torch.topk(
+            dot_q_to_centroids, k=actual_nprobe, dim=1, largest=True, sorted=False # Don't need them sorted
         )
-        top_centroid_indices = top_centroid_indices.squeeze(0).tolist() # Get indices as list
+        top_centroid_indices = top_centroid_indices.squeeze(0) # Shape (nprobe,)
 
-        # 2. Collect candidate point indices from the selected clusters
-        candidate_indices = []
-        for cluster_id in top_centroid_indices:
-            candidate_indices.extend(self.inverted_index.get(cluster_id, []))
+        # 3. Identify candidate indices from the selected clusters using offsets/counts
+        candidate_sorted_indices = []
+        valid_counts = self.cluster_counts[top_centroid_indices]
+        valid_offsets = self.cluster_offsets[top_centroid_indices]
 
-        # Remove duplicates if nprobe > 1 and points are shared (unlikely but possible)
-        # Using list(set(...)) maintains order approximately but set conversion is faster
-        candidate_indices = list(dict.fromkeys(candidate_indices)) # Faster unique preserving order
+        total_candidates = 0
+        indices_to_fetch = []
+        for i in range(actual_nprobe):
+            count = valid_counts[i].item()
+            offset = valid_offsets[i].item()
+            if count > 0 and offset != -1: # Check if cluster is valid and non-empty
+                indices_to_fetch.append(torch.arange(offset, offset + count, device=target_device))
+                total_candidates += count
 
-        if not candidate_indices:
-            # No points found in the probed clusters (should be rare if k_clusters/nprobe are reasonable)
-            return torch.full((k,), -1, dtype=torch.int64), torch.full((k,), float('inf'), dtype=torch.float32)
+        if not indices_to_fetch:
+            # No candidates found in probed clusters
+            return torch.full((k,), -1, dtype=torch.int64, device=target_device), \
+                   torch.full((k,), -float('inf'), dtype=torch.float32, device=target_device)
 
-        # 3. Retrieve the actual vectors for the candidates
-        candidate_vectors = self.data[candidate_indices]
+        # Concatenate indices from different clusters
+        candidate_sorted_idx_tensor = torch.cat(indices_to_fetch)
 
-        # 4. Calculate exact L2 distances between the query and candidate vectors
-        # distance_l2_triton returns actual L2 distances, shape (1, num_candidates)
-        dist_q_to_candidates = distance_dot(query_vec_prep, candidate_vectors)
+        # 4. Retrieve the actual normalized vectors for the candidates (already sorted and normalized)
+        candidate_vectors_norm = self.sorted_data_norm[candidate_sorted_idx_tensor] # Shape (total_candidates, dim)
 
-        # 5. Find the top k neighbors among the candidates
-        num_candidates = dist_q_to_candidates.shape[1]
-        actual_k = min(k, num_candidates) # We can only return as many neighbors as we found
+        # 5. Calculate exact dot products between the query and candidate vectors
+        # Use distance_dot_triton: query_norm @ candidate_vectors_norm.T
+        # Result shape: (1, total_candidates)
+        dot_q_to_candidates = distance_dot_tiled(query_norm, candidate_vectors_norm)
+
+        # 6. Find the top k most similar neighbors (largest dot product) among the candidates
+        actual_k = min(k, total_candidates) # Cannot return more than candidates found
 
         if actual_k == 0:
-             return torch.full((k,), -1, dtype=torch.int64), torch.full((k,), float('inf'), dtype=torch.float32)
+             return torch.full((k,), -1, dtype=torch.int64, device=target_device), \
+                    torch.full((k,), -float('inf'), dtype=torch.float32, device=target_device)
 
-        topk_dists, topk_relative_indices = torch.topk(
-            dist_q_to_candidates, k=actual_k, dim=1, largest=False, sorted=True
+        # Find k largest dot products
+        topk_similarities, topk_relative_indices = torch.topk(
+            dot_q_to_candidates, k=actual_k, dim=1, largest=True, sorted=True # Sort by similarity
         )
+        topk_similarities = topk_similarities.squeeze(0)          # Shape (actual_k,)
+        topk_relative_indices = topk_relative_indices.squeeze(0)  # Shape (actual_k,)
 
-        # Map relative indices (within candidates) back to original data indices
-        candidate_indices_tensor = torch.tensor(candidate_indices, device=self.data.device)
-        topk_original_indices = candidate_indices_tensor[topk_relative_indices.squeeze(0)]
+
+        # 7. Map relative indices (within candidates) back to **original** data indices
+        # First, get the indices within the *sorted* data array
+        topk_sorted_indices = candidate_sorted_idx_tensor[topk_relative_indices]
+        # Then, map these back to the original indices using the stored mapping
+        topk_original_indices = self.sorted_to_original_idx[topk_sorted_indices]
 
         # Prepare final output tensors of size k, padding if necessary
-        final_indices = torch.full((k,), -1, dtype=torch.int64, device=self.data.device)
-        final_distances = torch.full((k,), float('inf'), dtype=torch.float32, device=self.data.device)
+        final_indices = torch.full((k,), -1, dtype=torch.int64, device=target_device)
+        final_similarities = torch.full((k,), -float('inf'), dtype=torch.float32, device=target_device) # Pad with worst similarity
 
         final_indices[:actual_k] = topk_original_indices
-        final_distances[:actual_k] = topk_dists.squeeze(0)
+        final_similarities[:actual_k] = topk_similarities
 
-        return final_indices, final_distances # Returns actual L2 distances
+        # Return original indices and dot product similarities
+        return final_indices, final_similarities
 
-# Wrapper function for the K-Means ANN
-def our_ann_kmeans(N_A, D, A, X, K, k_clusters=100, nprobe=5, max_kmeans_iters=50):
+
+# Wrapper function needs slight modification for the new class
+def our_ann_kmeans_optimized(N_A, D, A, X, K, k_clusters=100, nprobe=5, max_kmeans_iters=50):
     """
-    Performs Approximate Nearest Neighbor search using K-Means (IVF).
+    Performs Optimized Approximate Nearest Neighbor search using K-Means (IVF)
+    with Dot Product similarity.
 
     Args:
         N_A (int): Number of database points.
@@ -469,8 +554,8 @@ def our_ann_kmeans(N_A, D, A, X, K, k_clusters=100, nprobe=5, max_kmeans_iters=5
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]:
-            - all_indices (torch.Tensor): Indices of the K nearest neighbors (Q, K).
-            - all_distances (torch.Tensor): L2 distances of the K nearest neighbors (Q, K).
+            - all_indices (torch.Tensor): Original indices of the K most similar neighbors (Q, K).
+            - all_similarities (torch.Tensor): Dot product similarity scores (Q, K). Higher is better.
     """
     target_device = X.device
     A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
@@ -481,37 +566,41 @@ def our_ann_kmeans(N_A, D, A, X, K, k_clusters=100, nprobe=5, max_kmeans_iters=5
     assert K > 0, "K must be positive"
     assert k_clusters > 0, "k_clusters must be positive"
     assert nprobe > 0, "nprobe must be positive"
-    assert nprobe <= k_clusters, "nprobe cannot be larger than k_clusters"
+    # assert nprobe <= k_clusters - handled internally now
 
-    print(f"Running ANN (KMeans-IVF): Q={Q}, N={N_A}, D={D}, K={K}")
+    print(f"Running Optimized ANN (KMeans-IVF / Dot Product): Q={Q}, N={N_A}, D={D}, K={K}")
     print(f"IVF Params: k_clusters={k_clusters}, nprobe={nprobe}")
 
-    # 1. Build the KMeansANN Index
-    index = KMeansANN(dim=D, k_clusters=k_clusters, nprobe=nprobe)
+    # 1. Build the KMeansANN_Optimized Index
+    index = KMeansANN_Optimized(dim=D, k_clusters=k_clusters, nprobe=nprobe)
     index.build_index(A_prep, max_kmeans_iters=max_kmeans_iters)
 
     if not index.is_built:
         print("Error: Index build failed.")
-        return torch.full((Q, K), -1, dtype=torch.int64), torch.full((Q, K), float('inf'), dtype=torch.float32)
+        return torch.full((Q, K), -1, dtype=torch.int64), torch.full((Q, K), -float('inf'), dtype=torch.float32)
 
     # 2. Perform Search for each query
     start_search = time.time()
     all_indices = torch.full((Q, K), -1, dtype=torch.int64, device=target_device)
-    all_distances = torch.full((Q, K), float('inf'), dtype=torch.float32, device=target_device) # Store L2
+    all_similarities = torch.full((Q, K), -float('inf'), dtype=torch.float32, device=target_device) # Store Dot Sim
 
     print("Searching queries...")
     for q_idx in range(Q):
-        q_indices, q_dists = index.search_knn(X_prep[q_idx], K)
+        # Returns original indices and dot product similarities
+        q_indices, q_sims = index.search_knn(X_prep[q_idx], K)
         all_indices[q_idx] = q_indices
-        all_distances[q_idx] = q_dists # Store L2 distances
+        all_similarities[q_idx] = q_sims # Store similarities
 
-        if (q_idx + 1) % (Q // 10 + 1) == 0:
+        if (q_idx + 1) % (max(1, Q // 10)) == 0: # Adjusted print frequency
              print(f"  Searched {q_idx+1}/{Q} queries...")
 
     end_search = time.time()
-    print(f"ANN search time: {end_search - start_search:.4f} seconds")
+    print(f"Optimized ANN search time: {end_search - start_search:.4f} seconds")
 
-    return all_indices, all_distances
+    # Returns indices and Dot Product similarities
+    return all_indices, all_similarities
+
+
 class SimpleHNSW_for_ANN:
     # Uses l2_dist_kernel_1_vs_M and distance_l2_triton internally now
     def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
@@ -770,13 +859,13 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
 # Example Usage (Illustrative) - MODIFIED
 # ============================================================================
 if __name__ == "__main__":
-    N_data = 5000    # Number of data points
-    N_queries = 100  # Number of query points
-    Dim = 128        # Dimension of vectors
-    K_val = 10       # Number of nearest neighbors to find
+    N_data = 20000    # Larger dataset to see benefits
+    N_queries = 500
+    Dim = 128
+    K_val = 10
 
     print("="*50)
-    print(" initializing Test Environment")
+    print(" Initializing Optimized IVF Test Environment")
     print("="*50)
     print(f"Dataset: N={N_data}, Queries={N_queries}, Dim={Dim}, K={K_val}")
 
@@ -795,118 +884,110 @@ if __name__ == "__main__":
     X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
     print("Data generated.")
 
-    # --- [Optional: Keep Distance Function Tests As Before] ---
-    # ... (dot, l2, cosine, manhattan tests using Triton and CuPy can be kept here) ...
-    # print("\nRunning distance function benchmarks...")
-    # _ = distance_l2_triton(X_queries[:2], A_data[:5]) # Warm-up
-    # start_bench = time.time()
-    # l2_dists_triton = distance_l2_triton(X_queries, A_data)
-    # end_bench = time.time()
-    # print(f"L2 Triton time: {end_bench - start_bench:.4f}s")
-    # print("Distance function benchmarks complete.")
+    # --- Brute-Force KNN using Dot Product for Ground Truth ---
+    # We need a brute-force KNN using the same metric (dot product) for fair recall comparison
+    def knn_bruteforce_dot(A, X, K):
+        print("Running Brute-Force k-NN (Dot Product)...")
+        target_device = X.device
+        A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
+        N, D = A_prep.shape
+        Q, _ = X_prep.shape
 
-    # --- Test k-NN (Brute Force - Ground Truth) ---
+        # Normalize
+        A_norm = normalize_vectors(A_prep)
+        X_norm = normalize_vectors(X_prep)
+
+        # Compute all pairwise dot products
+        # shape: (Q, N)
+        all_dot_products = distance_dot_triton(X_norm, A_norm)
+
+        # Find top K largest dot products for each query
+        k_actual = min(K, N)
+        topk_sims, topk_indices = torch.topk(all_dot_products, k=k_actual, dim=1, largest=True, sorted=True)
+
+        # Pad if K > k_actual (e.g., K > N)
+        if k_actual < K:
+             pad_indices = torch.full((Q, K - k_actual), -1, dtype=torch.int64, device=target_device)
+             pad_sims = torch.full((Q, K - k_actual), -float('inf'), dtype=torch.float32, device=target_device)
+             final_indices = torch.cat((topk_indices, pad_indices), dim=1)
+             final_sims = torch.cat((topk_sims, pad_sims), dim=1)
+        else:
+             final_indices = topk_indices
+             final_sims = topk_sims
+
+        return final_indices, final_sims # Return indices and similarities
+
     print("\n" + "="*40)
-    print(f"Testing Brute-Force k-NN (K={K_val})...")
+    print(f"Testing Brute-Force k-NN (Dot Product, K={K_val})...")
     print("="*40)
     start_knn = time.time()
-    # Ensure our_knn and its dependency distance_l2_triton are defined
-    knn_indices, knn_dists = our_knn(N_data, Dim, A_data, X_queries, K_val)
+    knn_indices_dot, knn_sims_dot = knn_bruteforce_dot(A_data, X_queries, K_val)
     end_knn = time.time()
-    print(f"Brute-Force k-NN Time: {end_knn - start_knn:.4f} seconds")
-    print("KNN results shape (Indices):", knn_indices.shape)
-    print("KNN results shape (Distances - L2):", knn_dists.shape)
-    print("Sample KNN Indices (Query 0):\n", knn_indices[0])
-    print("Sample KNN Dists (Query 0):\n", knn_dists[0])
+    print(f"Brute-Force k-NN (Dot) Time: {end_knn - start_knn:.4f} seconds")
+    print("KNN (Dot) results shape (Indices):", knn_indices_dot.shape)
+    print("KNN (Dot) results shape (Similarities):", knn_sims_dot.shape)
+    print("Sample KNN (Dot) Indices (Query 0):\n", knn_indices_dot[0])
+    print("Sample KNN (Dot) Sims (Query 0):\n", knn_sims_dot[0])
 
-    # --- Test ANN (HNSW) ---
-    print("\n" + "="*40)
-    print(f"Testing ANN Method 1: HNSW (K={K_val})...")
-    print("="*40)
-    # HNSW Parameters (adjust as needed for tuning)
-    hnsw_M = 32
-    hnsw_efC = 200
-    hnsw_efS = 100
-    start_ann_hnsw = time.time()
-    # Ensure SimpleHNSW_for_ANN class and our_ann function are defined
-    ann_indices_hnsw, ann_dists_hnsw = our_ann(N_data, Dim, A_data, X_queries, K_val,
-                                                M=hnsw_M, ef_construction=hnsw_efC, ef_search=hnsw_efS)
-    end_ann_hnsw = time.time()
-    hnsw_total_time = end_ann_hnsw - start_ann_hnsw
-    print(f"HNSW ANN Total Time: {hnsw_total_time:.4f} seconds")
-    print("HNSW ANN results shape (Indices):", ann_indices_hnsw.shape)
-    # Note: Original HNSW implementation returned Squared L2 distances
-    print("HNSW ANN results shape (Distances - Squared L2):", ann_dists_hnsw.shape)
-    print("Sample HNSW ANN Indices (Query 0):\n", ann_indices_hnsw[0])
-    print("Sample HNSW ANN Dists (Query 0 - Squared L2):\n", ann_dists_hnsw[0])
 
-    # --- Test ANN (K-Means IVF) ---
+    # --- Test Optimized ANN (K-Means IVF with Dot Product) ---
     print("\n" + "="*40)
-    print(f"Testing ANN Method 2: K-Means IVF (K={K_val})...")
+    print(f"Testing Optimized K-Means IVF ANN (Dot Product, K={K_val})...")
     print("="*40)
-    # K-Means IVF Parameters (adjust as needed for tuning)
-    num_clusters_ann = 50 # Example: sqrt(N_data) is a common heuristic start point
-    num_probes_ann = 5    # How many clusters to search
-    start_ann_kmeans = time.time()
-    # Ensure KMeansANN class and our_ann_kmeans function are defined
-    ann_indices_kmeans, ann_dists_kmeans = our_ann_kmeans(
+    # Parameters (tune these)
+    num_clusters_ann = int(math.sqrt(N_data)) # Heuristic starting point
+    num_probes_ann = 10 # Increase probes for potentially better recall
+    start_ann_kmeans_opt = time.time()
+    # Ensure KMeansANN_Optimized class and our_ann_kmeans_optimized function are defined
+    ann_indices_kmeans_opt, ann_sims_kmeans_opt = our_ann_kmeans_optimized(
         N_data, Dim, A_data, X_queries, K_val,
-        k_clusters=num_clusters_ann, nprobe=num_probes_ann
+        k_clusters=num_clusters_ann, nprobe=num_probes_ann, max_kmeans_iters=50 # Kmeans iters limit
         )
-    end_ann_kmeans = time.time()
-    kmeans_total_time = end_ann_kmeans - start_ann_kmeans
-    print(f"K-Means IVF ANN Total Time: {kmeans_total_time:.4f} seconds")
-    print("K-Means IVF ANN results shape (Indices):", ann_indices_kmeans.shape)
-    # Note: KMeansANN implementation returns actual L2 distances
-    print("K-Means IVF ANN results shape (Distances - L2):", ann_dists_kmeans.shape)
-    print("Sample K-Means IVF ANN Indices (Query 0):\n", ann_indices_kmeans[0])
-    print("Sample K-Means IVF ANN Dists (Query 0 - L2):\n", ann_dists_kmeans[0])
+    end_ann_kmeans_opt = time.time()
+    kmeans_opt_total_time = end_ann_kmeans_opt - start_ann_kmeans_opt
+    print(f"Optimized K-Means IVF ANN Total Time: {kmeans_opt_total_time:.4f} seconds")
+    print("Optimized ANN results shape (Indices):", ann_indices_kmeans_opt.shape)
+    print("Optimized ANN results shape (Similarities - Dot):", ann_sims_kmeans_opt.shape)
+    print("Sample Optimized ANN Indices (Query 0):\n", ann_indices_kmeans_opt[0])
+    print("Sample Optimized ANN Sims (Query 0):\n", ann_sims_kmeans_opt[0])
 
-    # --- Recall Calculation (Compare ANN methods vs Brute Force) ---
+    # --- Recall Calculation (Optimized IVF vs Brute Force Dot) ---
     print("\n" + "="*50)
-    print(f"Recall Calculation @ {K_val} (Comparison)")
+    print(f"Recall Calculation @ {K_val} (Optimized IVF vs Brute Force Dot)")
     print("="*50)
 
     if N_queries > 0 and K_val > 0:
-        correct_count_hnsw = 0
-        correct_count_kmeans = 0
+        correct_count_kmeans_opt = 0
         total_possible = 0
 
+        # Use the ground truth from the dot-product based KNN
+        true_knn_indices_for_recall = knn_indices_dot
+
         for i in range(N_queries):
-            # Ground truth neighbors for query i
-            true_knn_ids_set = set(knn_indices[i].cpu().tolist())
-            true_knn_ids_set.discard(-1) # Remove padding if K > N_data
+            # Ground truth neighbors for query i (using dot product KNN results)
+            true_knn_ids_set = set(true_knn_indices_for_recall[i].cpu().tolist())
+            true_knn_ids_set.discard(-1) # Remove padding
 
-            if not true_knn_ids_set: continue # Skip if no true neighbors (e.g., K=0 or N_data=0)
+            if not true_knn_ids_set: continue
 
-            # HNSW results for query i
-            approx_hnsw_ids_set = set(ann_indices_hnsw[i].cpu().tolist())
-            approx_hnsw_ids_set.discard(-1) # Remove padding
-
-            # K-Means IVF results for query i
-            approx_kmeans_ids_set = set(ann_indices_kmeans[i].cpu().tolist())
-            approx_kmeans_ids_set.discard(-1) # Remove padding
+            # Optimized K-Means IVF results for query i
+            approx_kmeans_opt_ids_set = set(ann_indices_kmeans_opt[i].cpu().tolist())
+            approx_kmeans_opt_ids_set.discard(-1) # Remove padding
 
             # Count correct matches
-            correct_count_hnsw += len(true_knn_ids_set.intersection(approx_hnsw_ids_set))
-            correct_count_kmeans += len(true_knn_ids_set.intersection(approx_kmeans_ids_set))
-
-            # Increment total possible correct neighbors (usually K_val, but use actual set size)
+            correct_count_kmeans_opt += len(true_knn_ids_set.intersection(approx_kmeans_opt_ids_set))
             total_possible += len(true_knn_ids_set)
 
         # Calculate overall recall
-        recall_hnsw = correct_count_hnsw / total_possible if total_possible > 0 else 0.0
-        recall_kmeans = correct_count_kmeans / total_possible if total_possible > 0 else 0.0
+        recall_kmeans_opt = correct_count_kmeans_opt / total_possible if total_possible > 0 else 0.0
 
-        print(f"HNSW ANN Recall @ {K_val}: {recall_hnsw:.2%}")
-        print(f" -> Total Time: {hnsw_total_time:.4f}s")
-        print(f"K-Means IVF ANN Recall @ {K_val}: {recall_kmeans:.2%}")
-        print(f" -> Total Time: {kmeans_total_time:.4f}s")
-        print(f"Brute-Force k-NN Time: {end_knn - start_knn:.4f}s (for reference)")
+        print(f"Optimized K-Means IVF ANN Recall @ {K_val}: {recall_kmeans_opt:.2%}")
+        print(f" -> Total Time: {kmeans_opt_total_time:.4f}s")
+        print(f" -> Brute-Force Dot KNN Time: {end_knn - start_knn:.4f}s (for reference)")
 
     else:
         print("Cannot calculate recall (N_queries=0 or K_val=0).")
 
     print("\n" + "="*50)
-    print(" Test Comparison Complete")
+    print(" Optimized IVF Test Complete")
     print("="*50)
