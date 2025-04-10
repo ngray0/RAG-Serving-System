@@ -400,30 +400,63 @@ class KMeansANN_Optimized:
         # 5. Create GPU-based cluster offsets and counts
         print("  Calculating cluster offsets and counts...")
         start_offset = time.time()
-        # Find unique cluster IDs present and their first occurrence index and counts
-        unique_clusters, first_occurrence_indices, counts = torch.unique_consecutive(
-            sorted_assignments, return_inverse=False, return_counts=True
+
+        # --- CORRECTED SECTION ---
+        # Find unique cluster IDs present and their counts using unique_consecutive
+        # It returns 2 values when return_counts=True
+        unique_clusters, counts = torch.unique_consecutive(
+            sorted_assignments, return_counts=True
         )
 
+        # Calculate the indices where each unique consecutive block starts
+        # The first block starts at index 0. Subsequent blocks start after the previous block ends.
+        first_occurrence_indices = torch.zeros_like(unique_clusters, dtype=torch.long) # Use long for indices
+        # Calculate cumulative sum of counts *excluding* the last one, then offset by 1 position
+        # Prepend a 0 for the start index of the very first block
+        if counts.numel() > 1:
+             # Compute offsets based on counts of preceding blocks
+             cumulative_counts = torch.cumsum(counts[:-1], dim=0)
+             # First index is 0, subsequent indices are the cumulative counts
+             first_occurrence_indices[1:] = cumulative_counts
+        elif counts.numel() == 0:
+            # Handle edge case of empty assignments (shouldn't happen if N_A > 0)
+            first_occurrence_indices = torch.empty(0, dtype=torch.long, device=target_device)
+        # If counts.numel() == 1, first_occurrence_indices remains [0], which is correct.
+
+        # --- End of Correction ---
+
         # Create full offset and count arrays (handling potentially empty clusters)
-        self.cluster_offsets = torch.full((self.k_clusters,), -1, dtype=torch.long, device=target_device) # Use -1 or N_A as sentinel
+        # Using N_A as the offset sentinel might be slightly cleaner than -1
+        self.cluster_offsets = torch.full((self.k_clusters,), self.original_n, dtype=torch.long, device=target_device)
         self.cluster_counts = torch.zeros(self.k_clusters, dtype=torch.long, device=target_device)
 
         # Fill in the values for clusters that actually have points
-        # Ensure unique_clusters are within the expected range [0, k_clusters-1]
+        # Ensure unique_clusters are within the expected range [0, k_clusters-1] before using them as indices
         valid_cluster_mask = (unique_clusters >= 0) & (unique_clusters < self.k_clusters)
         valid_unique_clusters = unique_clusters[valid_cluster_mask]
+
+        # Filter the calculated indices and counts to match the valid clusters
         valid_first_indices = first_occurrence_indices[valid_cluster_mask]
         valid_counts = counts[valid_cluster_mask]
 
-        self.cluster_offsets[valid_unique_clusters] = valid_first_indices
-        self.cluster_counts[valid_unique_clusters] = valid_counts
+        # Use scatter_ for safe assignment, especially if valid_unique_clusters might somehow
+        # contain duplicates (though unique_consecutive shouldn't cause this)
+        # Or use direct assignment which is likely fine here:
+        # self.cluster_offsets[valid_unique_clusters] = valid_first_indices
+        # self.cluster_counts[valid_unique_clusters] = valid_counts
+        if valid_unique_clusters.numel() > 0: # Check if there are any valid clusters to update
+             self.cluster_offsets.scatter_(0, valid_unique_clusters, valid_first_indices)
+             self.cluster_counts.scatter_(0, valid_unique_clusters, valid_counts)
+
         end_offset = time.time()
         print(f"  Offset calculation time: {end_offset - start_offset:.4f}s")
 
         # Cleanup intermediate tensors if needed
         del sorted_A, sorted_assignments, assignments, centroids
-        torch.cuda.empty_cache() # Optional
+        # Also cleanup tensors created in this step
+        del unique_clusters, counts, first_occurrence_indices, valid_cluster_mask, valid_unique_clusters, valid_first_indices, valid_counts
+        if 'cumulative_counts' in locals(): del cumulative_counts # Only delete if it was created
+        torch.cuda.empty_cache() # Optional aggressive cleanup
 
         self.is_built = True
         end_build = time.time()
