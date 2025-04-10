@@ -464,6 +464,25 @@ def distance_manhattan(X, A, **kwargs):
     # torch.cuda.synchronize()
     return Out
 
+def distance_dot3(X, Y):
+    """
+    Calculates pairwise dot products between rows of X and rows of Y.
+
+    Args:
+        X: cupy array of shape (Q, D) - Query points.
+        Y: cupy array of shape (N, D) - Reference data points.
+
+    Returns:
+        cupy array of shape (Q, N) where element (i, j) is dot(X[i], Y[j]).
+    """
+    # Ensure inputs are CuPy arrays (good practice, though matmul might handle some cases)
+    X_cp = cp.asarray(X)
+    Y_cp = cp.asarray(Y)
+    # X_cp shape: (Q, D), Y_cp shape: (N, D) -> Y_cp.T shape: (D, N)
+    # Output shape: (Q, N)
+    print(f"Calculating pairwise dot products via matmul for shapes: {X_cp.shape} and {Y_cp.T.shape}")
+    return X_cp @ Y_cp.T
+
 def distance_cosine2(X, Y):
     norm_X = cp.linalg.norm(X, axis=1) 
     norm_Y = cp.linalg.norm(Y, axis=1)
@@ -612,7 +631,7 @@ def our_knn_stream(N, D, A, X, K):
             # Calculate raw dot products (similarities) using the specified function
             # Input shapes: query_2d (1, D), A (N, D)
             # Output shape: raw_dot_products (1, N)
-            raw_dot_products = distance_dot(query_2d, A)
+            raw_dot_products = distance_dot3(query_2d, A)
 
             # We have scores for one query vs all dataset points, shape (1, N).
             # Get the 1D array of scores (shape N,)
