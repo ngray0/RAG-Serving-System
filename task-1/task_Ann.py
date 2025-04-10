@@ -186,6 +186,27 @@ def distance_dot_tiled(X, A, N_TILE=50000, prep = True): # Tile size, adjust if 
 
     return -Out
 
+def distance_cosine(X, A, epsilon=1e-8, **kwargs):
+    """
+    Computes pairwise Cosine distances using the tiled dot product kernel
+    and PyTorch operations for norms.
+    """
+    target_device = X.device
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+    # print(f"Calculating pairwise Cosine (Triton Dot + PyTorch Norm) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
+
+    dot_products = distance_dot_tiled(X_prep, A_prep, **kwargs) # (Q, N)
+    X_norm = torch.linalg.norm(X_prep, axis=1, keepdims=True) # (Q, 1)
+    A_norm = torch.linalg.norm(A_prep, axis=1, keepdims=True) # (N, 1)
+    norm_product = X_norm * A_norm.T # (Q, N)
+    cosine_similarity = dot_products / (norm_product + epsilon)
+    cosine_similarity.clamp_(min=-1.0, max=1.0)
+    cosine_distance = 1.0 - cosine_similarity
+    return cosine_distance
+
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
     Performs K-means clustering on data A using Triton kernel for assignment
@@ -300,7 +321,7 @@ def our_knn(N_A, D, A, X, K):
 
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
-    all_distances = distance_dot_tiled(X_prep, A_prep, prep = False) # Shape (Q, N_A)
+    all_distances = distance_cosine(X_prep, A_prep, prep = False) # Shape (Q, N_A)
 
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
@@ -496,7 +517,7 @@ class KMeansANN_Optimized:
         # 2. Find the `nprobe` most similar centroids (highest dot product)
         # Use distance_dot_triton: query_norm @ self.centroids_norm.T
         # Result shape: (1, k_clusters)
-        dot_q_to_centroids = distance_dot_tiled(query_norm, self.centroids_norm)
+        dot_q_to_centroids = distance_cosine(query_norm, self.centroids_norm)
 
         # Get the indices and dot products of the top `nprobe` most similar centroids
         # We want the LARGEST dot products
@@ -535,7 +556,7 @@ class KMeansANN_Optimized:
         # 5. Calculate exact dot products between the query and candidate vectors
         # Use distance_dot_triton: query_norm @ candidate_vectors_norm.T
         # Result shape: (1, total_candidates)
-        dot_q_to_candidates = distance_dot_tiled(query_norm, candidate_vectors_norm)
+        dot_q_to_candidates = distance_cosine(query_norm, candidate_vectors_norm)
 
         # 6. Find the top k most similar neighbors (largest dot product) among the candidates
         actual_k = min(k, total_candidates) # Cannot return more than candidates found
@@ -690,7 +711,7 @@ class SimpleHNSW_for_ANN:
 
         query_vectors = self.vectors[valid_query_indices]
         candidate_vectors = self.vectors[valid_candidate_indices]
-        pairwise_l2_distances = distance_dot_tiled(query_vectors, candidate_vectors)
+        pairwise_l2_distances = distance_cosine(query_vectors, candidate_vectors)
         return pairwise_l2_distances # Shape (len(valid_query), len(valid_candidate))
 
     def _select_neighbors_heuristic(self, query_vec, candidates, M_target):
@@ -932,7 +953,7 @@ if __name__ == "__main__":
 
         # Compute all pairwise dot products
         # shape: (Q, N)
-        all_dot_products = distance_dot_tiled(X_norm, A_norm)
+        all_dot_products = distance_cosine(X_norm, A_norm)
 
         # Find top K largest dot products for each query
         k_actual = min(K, N)
