@@ -1279,135 +1279,99 @@ def our_ann_optimized_hnsw(N_A, D, A, X, K, M=16, ef_construction=100, ef_search
 # Example Usage (Illustrative) - MODIFIED
 # ============================================================================
 if __name__ == "__main__":
-    N_data = 2000000    # Larger dataset to see benefits
-    N_queries = 500
-    Dim = 128
-    K_val = 10
+    # --- Test Parameters ---
+    N_A = 1000       # Number of database vectors
+    D = 128          # Dimension of vectors
+    Q = 50           # Number of query vectors
+    K = 10           # Number of nearest neighbors to find
 
-    print("="*50)
-    print(" Initializing Optimized IVF Test Environment")
-    print("="*50)
-    print(f"Dataset: N={N_data}, Queries={N_queries}, Dim={Dim}, K={K_val}")
+    # HNSW Parameters
+    M_test = 16
+    efC_test = 100
+    efS_test = 60
 
-    # --- Ensure GPU is available ---
-    if not torch.cuda.is_available():
-        print("CUDA not available, exiting.")
-        exit()
-    device = torch.device("cuda:0")
-    print(f"Using device: {device}")
+    print(f"\n--- HNSW Test Setup ---")
+    print(f"Database vectors (N_A): {N_A}")
+    print(f"Query vectors (Q): {Q}")
+    print(f"Vector dimension (D): {D}")
+    print(f"Neighbors to find (K): {K}")
+    print(f"HNSW Params: M={M_test}, ef_construction={efC_test}, ef_search={efS_test}")
 
-    # --- Generate Data ---
-    print("\n" + "="*40)
-    print("Generating Data...")
-    print("="*40)
-    A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
-    X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
-    print("Data generated.")
+    # --- Generate Random Test Data ---
+    print("\nGenerating random test data...")
+    # Generate random data and move to the target device immediately
+    A_data = torch.rand((N_A, D), dtype=torch.float32, device=device)
+    X_data = torch.rand((Q, D), dtype=torch.float32, device=device)
+    # Note: Normalization is handled *inside* the HNSW class methods now.
+    print("Test data generated.")
 
-    # --- Brute-Force KNN using Dot Product for Ground Truth ---
-    # We need a brute-force KNN using the same metric (dot product) for fair recall comparison
-    def knn_bruteforce_dot(A, X, K):
-        print("Running Brute-Force k-NN (Dot Product)...")
-        target_device = X.device
-        A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
-        N, D = A_prep.shape
-        Q, _ = X_prep.shape
-
-        # Normalize
-        A_norm = normalize_vectors(A_prep)
-        X_norm = normalize_vectors(X_prep)
-
-        # Compute all pairwise dot products
-        # shape: (Q, N)
-        all_dot_products = distance_cosine(X_norm, A_norm)
-
-        # Find top K largest dot products for each query
-        k_actual = min(K, N)
-        topk_sims, topk_indices = torch.topk(all_dot_products, k=k_actual, dim=1, largest=True, sorted=True)
-
-        # Pad if K > k_actual (e.g., K > N)
-        if k_actual < K:
-             pad_indices = torch.full((Q, K - k_actual), -1, dtype=torch.int64, device=target_device)
-             pad_sims = torch.full((Q, K - k_actual), -float('inf'), dtype=torch.float32, device=target_device)
-             final_indices = torch.cat((topk_indices, pad_indices), dim=1)
-             final_sims = torch.cat((topk_sims, pad_sims), dim=1)
-        else:
-             final_indices = topk_indices
-             final_sims = topk_sims
-
-        return final_indices, final_sims # Return indices and similarities
-
-    print("\n" + "="*40)
-    print(f"Testing Brute-Force k-NN (Dot Product, K={K_val})...")
-    print("="*40)
-    start_knn = time.time()
-    knn_indices_dot, knn_sims_dot = knn_bruteforce_dot(A_data, X_queries, K_val)
-    end_knn = time.time()
-    print(f"Brute-Force k-NN (Dot) Time: {end_knn - start_knn:.4f} seconds")
-    print("KNN (Dot) results shape (Indices):", knn_indices_dot.shape)
-    print("KNN (Dot) results shape (Similarities):", knn_sims_dot.shape)
-    print("Sample KNN (Dot) Indices (Query 0):\n", knn_indices_dot[0])
-    print("Sample KNN (Dot) Sims (Query 0):\n", knn_sims_dot[0])
-
-
-    # --- Test Optimized ANN (K-Means IVF with Dot Product) ---
-    print("\n" + "="*40)
-    print(f"Testing Optimized K-Means IVF ANN (Dot Product, K={K_val})...")
-    print("="*40)
-    # Parameters (tune these)
-    num_clusters_ann = int(math.sqrt(N_data)) # Heuristic starting point
-    num_probes_ann = 100 # Increase probes for potentially better recall
-    start_ann_kmeans_opt = time.time()
-    # Ensure KMeansANN_Optimized class and our_ann_kmeans_optimized function are defined
-    ann_indices_kmeans_opt, ann_sims_kmeans_opt = our_ann_kmeans_optimized(
-        N_data, Dim, A_data, X_queries, K_val,
-        k_clusters=num_clusters_ann, nprobe=num_probes_ann, max_kmeans_iters=50 # Kmeans iters limit
+    # --- Run the Test via the Wrapper Function ---
+    print("\nRunning our_ann_optimized_hnsw wrapper...")
+    try:
+        # Assuming SimpleHNSW_DotProduct_Optimized class and
+        # our_ann_optimized_hnsw function are defined above this block
+        indices, distances, build_time, search_time = our_ann_optimized_hnsw(
+            N_A, D, A_data, X_data, K,
+            M=M_test, ef_construction=efC_test, ef_search=efS_test
         )
-    end_ann_kmeans_opt = time.time()
-    kmeans_opt_total_time = end_ann_kmeans_opt - start_ann_kmeans_opt
-    print(f"Optimized K-Means IVF ANN Total Time: {kmeans_opt_total_time:.4f} seconds")
-    print("Optimized ANN results shape (Indices):", ann_indices_kmeans_opt.shape)
-    print("Optimized ANN results shape (Similarities - Dot):", ann_sims_kmeans_opt.shape)
-    print("Sample Optimized ANN Indices (Query 0):\n", ann_indices_kmeans_opt[0])
-    print("Sample Optimized ANN Sims (Query 0):\n", ann_sims_kmeans_opt[0])
 
-    # --- Recall Calculation (Optimized IVF vs Brute Force Dot) ---
-    print("\n" + "="*50)
-    print(f"Recall Calculation @ {K_val} (Optimized IVF vs Brute Force Dot)")
-    print("="*50)
+        # --- Print Results ---
+        print("\n--- HNSW Test Results ---")
+        print(f"Index Build Time: {build_time:.4f} seconds")
+        print(f"Search Time: {search_time:.4f} seconds")
+        print(f"Total Time: {build_time + search_time:.4f} seconds")
 
-    if N_queries > 0 and K_val > 0:
-        correct_count_kmeans_opt = 0
-        total_possible = 0
+        print(f"\nOutput Shapes:")
+        print(f"  Indices shape: {indices.shape}")      # Expected: (Q, K)
+        print(f"  Distances shape: {distances.shape}")  # Expected: (Q, K)
 
-        # Use the ground truth from the dot-product based KNN
-        true_knn_indices_for_recall = knn_indices_dot
+        # Validate shapes
+        assert indices.shape == (Q, K), f"Indices shape mismatch: expected ({Q},{K}), got {indices.shape}"
+        assert distances.shape == (Q, K), f"Distances shape mismatch: expected ({Q},{K}), got {distances.shape}"
 
-        for i in range(N_queries):
-            # Ground truth neighbors for query i (using dot product KNN results)
-            true_knn_ids_set = set(true_knn_indices_for_recall[i].cpu().tolist())
-            true_knn_ids_set.discard(-1) # Remove padding
 
-            if not true_knn_ids_set: continue
+        print("\nSample Results (Query 0):")
+        print(f"  Indices (Top 5): {indices[0, :min(5, K)].tolist()}")
+        # Distances are 1 - dot_product, smaller is better
+        print(f"  Distances (Top 5): {[f'{d:.4f}' for d in distances[0, :min(5, K)].tolist()]}")
 
-            # Optimized K-Means IVF results for query i
-            approx_kmeans_opt_ids_set = set(ann_indices_kmeans_opt[i].cpu().tolist())
-            approx_kmeans_opt_ids_set.discard(-1) # Remove padding
+        # --- Basic Sanity Checks ---
+        # Check if indices are within valid range (0 to N_A-1), ignoring -1 padding
+        valid_indices_mask = indices != -1
+        if valid_indices_mask.any():
+             max_index = indices[valid_indices_mask].max().item()
+             min_index = indices[valid_indices_mask].min().item()
+             print(f"\nIndex Range Check (ignoring -1 padding):")
+             print(f"  Min Index found: {min_index}")
+             print(f"  Max Index found: {max_index}")
+             assert min_index >= 0, "Found negative index other than -1"
+             assert max_index < N_A, f"Found index {max_index} >= N_A ({N_A})"
+        else:
+             print("\nIndex Range Check: No valid indices found (all -1).")
 
-            # Count correct matches
-            correct_count_kmeans_opt += len(true_knn_ids_set.intersection(approx_kmeans_opt_ids_set))
-            total_possible += len(true_knn_ids_set)
 
-        # Calculate overall recall
-        recall_kmeans_opt = correct_count_kmeans_opt / total_possible if total_possible > 0 else 0.0
+        # Check if distances are sensible (1 - dot_product should be >= 0, ideally <= 2)
+        valid_distances_mask = torch.isfinite(distances) & (indices != -1)
+        if valid_distances_mask.any():
+            max_dist = distances[valid_distances_mask].max().item()
+            min_dist = distances[valid_distances_mask].min().item()
+            print(f"\nDistance Range Check (ignoring inf/-1 padding):")
+            print(f"  Min Distance (1-dot) found: {min_dist:.4f}")
+            print(f"  Max Distance (1-dot) found: {max_dist:.4f}")
+            # Check if distances are non-negative (allowing for small float errors)
+            assert min_dist >= -1e-5, f"Found negative distance {min_dist}"
+            # Check if distances are not excessively large (should be <= 2 for 1 - dot)
+            assert max_dist <= 2.0 + 1e-5, f"Found distance > 2.0 ({max_dist})"
+        else:
+             print("\nDistance Range Check: No valid distances found.")
 
-        print(f"Optimized K-Means IVF ANN Recall @ {K_val}: {recall_kmeans_opt:.2%}")
-        print(f" -> Total Time: {kmeans_opt_total_time:.4f}s")
-        print(f" -> Brute-Force Dot KNN Time: {end_knn - start_knn:.4f}s (for reference)")
+        print("\nTest completed successfully.")
 
-    else:
-        print("Cannot calculate recall (N_queries=0 or K_val=0).")
-
-    print("\n" + "="*50)
-    print(" Optimized IVF Test Complete")
-    print("="*50)
+    except NameError as e:
+        print(f"\nError: Required class or function not defined.")
+        print(f"Please ensure 'SimpleHNSW_DotProduct_Optimized' class and 'our_ann_optimized_hnsw' function are defined before this `if __name__ == '__main__':` block.")
+        print(f"Specific error: {e}")
+    except Exception as e:
+        print(f"\nAn unexpected error occurred during the test: {e}")
+        import traceback
+        traceback.print_exc()
