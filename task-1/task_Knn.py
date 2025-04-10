@@ -587,7 +587,7 @@ def our_knn(N_A, D, A, X, K):
 
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
-    all_distances = distance_dot(X_prep, A_prep) # Shape (Q, N_A)
+    all_distances = distance_dot_tiled(X_prep, A_prep) # Shape (Q, N_A)
 
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
