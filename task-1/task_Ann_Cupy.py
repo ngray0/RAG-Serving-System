@@ -1216,9 +1216,9 @@ if __name__ == "__main__":
     N_data = 1000000
     Dim = 1024
     # N_queries will be set below
-    num_clusters_for_kmeans = 500
+    num_clusters_for_kmeans = 10000
     K1_probe = 200
-    K2_final = 150
+    K2_final = 190
 
     # --- Check CuPy ---
     try:
