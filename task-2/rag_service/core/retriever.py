@@ -566,11 +566,8 @@ class TritonKnnRetriever:
         except Exception as e:
             logging.error(f"Unexpected error during TritonKnnRetriever.batch_retrieve: {e}", exc_info=True)
             return [[] for _ in ks] # Return empty lists matching ks length on error
-class SimpleRetriever2:
-    """
-    A basic retriever using dense embeddings and dot-product similarity,
-    optimized with CuPy for GPU acceleration. Implements the SimpleRetriever interface.
-    """
+class CupyRetriever:
+   
     def __init__(self, doc_embeddings: np.ndarray, documents: List[str]):
         """
         Initializes the retriever, moves document embeddings to GPU via CuPy.
