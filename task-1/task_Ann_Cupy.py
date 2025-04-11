@@ -91,35 +91,32 @@ def l2_dist_kernel_1_vs_M( # Keep if HNSW uses it
 def pairwise_l2_squared_cupy(X_cp, C_cp):
     """
     Computes pairwise squared L2 distances between points in X and centroids C using CuPy.
-    X_cp: (N, D) data points
-    C_cp: (K, D) centroids
-    Returns: (N, K) tensor of squared distances.
+    X_cp: (N, D) data points OR (Q, D) query points
+    C_cp: (K, D) centroids OR (N, D) database points
+    Returns: (N, K) or (Q, K) or (Q, N) tensor of squared distances.
     """
-    # ||x - c||^2 = ||x||^2 - 2<x, c> + ||c||^2
-    X_norm_sq = cp.sum(X_cp**2, axis=1, keepdims=True) # Shape (N, 1)
-    C_norm_sq = cp.sum(C_cp**2, axis=1, keepdims=True) # Shape (K, 1)
-    dot_products = X_cp @ C_cp.T                       # Shape (N, K)
+    # Ensure inputs are CuPy arrays and float32
+    if not isinstance(X_cp, cp.ndarray): X_cp = cp.asarray(X_cp)
+    if not isinstance(C_cp, cp.ndarray): C_cp = cp.asarray(C_cp)
+    if X_cp.dtype != cp.float32: X_cp = X_cp.astype(cp.float32)
+    if C_cp.dtype != cp.float32: C_cp = C_cp.astype(cp.float32)
 
-    # Broadcasting: (N, 1) - 2*(N, K) + (1, K) -> (N, K)
+    # ||x - c||^2 = ||x||^2 - 2<x, c> + ||c||^2
+    X_norm_sq = cp.sum(X_cp**2, axis=1, keepdims=True) # Shape (N|Q, 1)
+    C_norm_sq = cp.sum(C_cp**2, axis=1, keepdims=True) # Shape (K|N, 1)
+
+    # Use gemm for dot product (generally fastest)
+    # Note: CuPy matmul uses cuBLAS
+    dot_products = cp.matmul(X_cp, C_cp.T) # Shape (N|Q, K|N)
+
+    # Broadcasting: (N|Q, 1) - 2*(N|Q, K|N) + (1, K|N) -> (N|Q, K|N)
     dist_sq = X_norm_sq - 2 * dot_products + C_norm_sq.T
-    return cp.maximum(0, dist_sq) # Clamp to avoid small negatives
+    return cp.maximum(0, dist_sq) # Clamp to avoid small numerical negatives due to precision
 
 def our_kmeans(N_A, D, A_cp, K, max_iters=100, tol=1e-4):
     """
     Performs K-means clustering entirely using CuPy. Corrected scatter_add usage.
-
-    Args:
-        N_A (int): Number of data points.
-        D (int): Dimensionality.
-        A_cp (cp.ndarray): Data points (N_A, D) on GPU (as CuPy ndarray).
-        K (int): Number of clusters.
-        max_iters (int): Maximum number of iterations.
-        tol (float): Tolerance for centroid movement convergence check.
-
-    Returns:
-        tuple[cp.ndarray, cp.ndarray]:
-            - centroids_cp (cp.ndarray): Final centroids (K, D).
-            - assignments_cp (cp.ndarray): Final cluster assignment (N_A,).
+    (Code from the original prompt - assumed correct and used by our_ann_cupy_ivf)
     """
     # --- Input Validation ---
     if not isinstance(A_cp, cp.ndarray):
@@ -133,15 +130,14 @@ def our_kmeans(N_A, D, A_cp, K, max_iters=100, tol=1e-4):
         print(f"Warning: Input data dtype is {A_cp.dtype}. Converting to float32.")
         A_cp = A_cp.astype(cp.float32)
 
-
-    print(f"Running K-Means (Pure CuPy - Corrected): N={N_A}, D={D}, K={K}")
+    print(f"Running K-Means (Pure CuPy): N={N_A}, D={D}, K={K}")
     start_time_total = time.time()
 
     # --- Initialization (using CuPy) ---
     initial_indices = cp.random.permutation(N_A)[:K]
     centroids_cp = A_cp[initial_indices].copy()
 
-    assignments_cp = cp.empty(N_A, dtype=cp.int32)
+    assignments_cp = cp.empty(N_A, dtype=cp.int32) # Use int32 for assignments
 
     for i in range(max_iters):
         iter_start_time = time.time()
@@ -156,17 +152,23 @@ def our_kmeans(N_A, D, A_cp, K, max_iters=100, tol=1e-4):
         update_start_time = time.time()
 
         new_sums_cp = cp.zeros((K, D), dtype=cp.float32)
+        # Ensure cluster_counts is float for scatter_add and division
         cluster_counts_cp = cp.zeros(K, dtype=cp.float32)
 
-        # Corrected scatter_add call: removed axis argument
-        cupyx.scatter_add(new_sums_cp, assignments_cp, A_cp)
-        cupyx.scatter_add(cluster_counts_cp, assignments_cp, 1.0)
+        # Use cupyx.scatter_add
+        cupyx.scatter_add(new_sums_cp, assignments_cp, A_cp) # Add vectors to assigned centroid sum
+        cupyx.scatter_add(cluster_counts_cp, assignments_cp, 1.0) # Increment count for assigned centroid
 
-        final_counts_safe_cp = cp.maximum(cluster_counts_cp, 1.0)
-        new_centroids_cp = new_sums_cp / final_counts_safe_cp[:, None]
+        # Avoid division by zero for empty clusters
+        # Add small epsilon or use maximum(count, 1) before division
+        final_counts_safe_cp = cp.maximum(cluster_counts_cp, 1.0) # Avoid div by zero
+        new_centroids_cp = new_sums_cp / final_counts_safe_cp[:, None] # Broadcast division
 
+        # Handle empty clusters: Re-assign old centroid or a random point
+        # Here, we keep the old centroid position if a cluster becomes empty
         empty_cluster_mask = (cluster_counts_cp == 0)
-        new_centroids_cp[empty_cluster_mask] = centroids_cp[empty_cluster_mask]
+        if cp.any(empty_cluster_mask):
+             new_centroids_cp[empty_cluster_mask] = centroids_cp[empty_cluster_mask]
 
         cp.cuda.Stream.null.synchronize()
         update_time = time.time() - update_start_time
@@ -175,7 +177,8 @@ def our_kmeans(N_A, D, A_cp, K, max_iters=100, tol=1e-4):
         centroid_diff_cp = cp.linalg.norm(new_centroids_cp - centroids_cp)
         centroids_cp = new_centroids_cp
 
-        print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff_cp:.4f} | Assign Time: {assign_time:.4f}s | Update Time: {update_time:.4f}s")
+        # Optional: Print iteration stats
+        # print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff_cp:.4f} | Assign Time: {assign_time:.4f}s | Update Time: {update_time:.4f}s")
 
         if centroid_diff_cp < tol:
             print(f"Converged after {i+1} iterations.")
@@ -187,13 +190,279 @@ def our_kmeans(N_A, D, A_cp, K, max_iters=100, tol=1e-4):
     total_time = time.time() - start_time_total
     print(f"Total K-Means time: {total_time:.4f}s")
 
-    return centroids_cp, assignments_cp.astype(cp.int64) # Return CuPy arrays
+    # Return assignments as int64 if required by subsequent code, otherwise int32 is fine
+    return centroids_cp, assignments_cp # .astype(cp.int64)
 
 # ============================================================================
-# Task 2.2: Approximate Nearest Neighbors (ANN - HNSW using PyTorch/Triton)
+# Task 2.2: Approximate Nearest Neighbors (ANN - HNSW - Keep if used)
 # ============================================================================
-# Keep the existing SimpleHNSW_for_ANN class and our_ann wrapper function
-# They use PyTorch/Triton internally.
+# class SimpleHNSW_for_ANN: ... (Keep original HNSW code if needed)
+# def our_ann(...): ... (Keep original HNSW wrapper if needed)
+
+# ============================================================================
+# Task 2.2: Approximate Nearest Neighbors (ANN - KMeans IVF - CuPy Optimized)
+# ============================================================================
+
+def our_ann_cupy_ivf_optimized(N_A, D, A_cp, X_cp, K, k_clusters=100, nprobe=5, max_kmeans_iters=100):
+    """
+    Performs Approximate Nearest Neighbor search using KMeans-IVF with CuPy,
+    optimized for GPU execution by minimizing CPU transfers.
+
+    Args:
+        N_A (int): Number of database points.
+        D (int): Dimensionality.
+        A_cp (cp.ndarray): Database vectors (N_A, D) on GPU. Should be float32.
+        X_cp (cp.ndarray): Query vectors (Q, D) on GPU. Should be float32.
+        K (int): Number of neighbors to find for each query.
+        k_clusters (int): Number of clusters for the K-Means index.
+        nprobe (int): Number of clusters to probe during search.
+        max_kmeans_iters (int): Max iterations for K-Means during index build.
+
+    Returns:
+        tuple[cp.ndarray, cp.ndarray, float, float]:
+            - all_indices_cp (cp.ndarray): Original indices of the K nearest neighbors (Q, K).
+            - all_distances_cp (cp.ndarray): Squared L2 distances of the K nearest neighbors (Q, K).
+            - build_time (float): Time taken to build the index (KMeans + Inverted Index).
+            - search_time (float): Time taken for searching all queries.
+    """
+    # --- Input Validation ---
+    if not isinstance(A_cp, cp.ndarray) or not isinstance(X_cp, cp.ndarray):
+        raise TypeError("Input data 'A_cp' and queries 'X_cp' must be CuPy ndarrays.")
+    if A_cp.dtype != cp.float32:
+        print("Warning: A_cp is not float32. Converting...")
+        A_cp = A_cp.astype(cp.float32)
+    if X_cp.dtype != cp.float32:
+        print("Warning: X_cp is not float32. Converting...")
+        X_cp = X_cp.astype(cp.float32)
+
+    Q = X_cp.shape[0]
+    if X_cp.shape[1] != D: raise ValueError(f"Query dimension mismatch: X_cp D={X_cp.shape[1]}, expected D={D}")
+    if A_cp.shape[0] != N_A: print(f"Warning: N_A mismatch ({N_A}) with A_cp shape ({A_cp.shape[0]}). Using shape from A_cp."); N_A = A_cp.shape[0]
+    if A_cp.shape[1] != D: raise ValueError(f"Database dimension mismatch: A_cp D={A_cp.shape[1]}, expected D={D}")
+    if not (K > 0): raise ValueError("K must be positive")
+    if not (k_clusters > 0): raise ValueError("k_clusters must be positive")
+    if not (nprobe > 0 and nprobe <= k_clusters): raise ValueError("nprobe must be between 1 and k_clusters")
+    K = min(K, N_A) # Cannot return more neighbors than exist
+
+    print(f"Running ANN (KMeans-IVF / CuPy Optimized): Q={Q}, N={N_A}, D={D}, K={K}")
+    print(f"IVF Params: k_clusters={k_clusters}, nprobe={nprobe}")
+
+    # --- 1. Build Index (K-Means) ---
+    build_start_time = time.time()
+    centroids_cp, assignments_cp = our_kmeans(N_A, D, A_cp, k_clusters, max_iters=max_kmeans_iters)
+    # Ensure assignments are int32 for sorting/indexing
+    assignments_cp = assignments_cp.astype(cp.int32)
+    cp.cuda.Stream.null.synchronize() # Sync after k-means
+    build_time_kmeans = time.time() - build_start_time
+    print(f"Index build time (KMeans): {build_time_kmeans:.4f}s")
+
+    # --- 2. Build Inverted Index (GPU Optimized) ---
+    build_invidx_start_time = time.time()
+
+    original_indices = cp.arange(N_A, dtype=cp.int64) # Keep original indices as int64
+
+    # Sort original indices based on cluster assignments
+    sort_permutation = cp.argsort(assignments_cp)
+    # Contains original indices sorted by the cluster they belong to
+    inv_idx_values_cp = original_indices[sort_permutation]
+    # Cluster assignments sorted according to the permutation
+    sorted_assignments = assignments_cp[sort_permutation]
+
+    # Find start positions and counts for each cluster ID that is actually present
+    # unique_clusters will be sorted cluster IDs that are actually present
+    unique_clusters, inv_idx_starts_cp, inv_idx_counts_cp = cp.unique(
+        sorted_assignments, return_index=True, return_counts=True
+    )
+
+    # Create mappings from potential cluster ID (0 to k_clusters-1) to the location
+    # in the unique_clusters/inv_idx_starts_cp/inv_idx_counts_cp arrays.
+    # This handles cases where some cluster IDs might be empty (not present in assignments_cp).
+    # We use -1 to indicate a cluster ID is not present.
+    cluster_id_to_unique_idx = cp.full(k_clusters, -1, dtype=cp.int32)
+    cluster_id_to_unique_idx[unique_clusters] = cp.arange(len(unique_clusters), dtype=cp.int32)
+
+    # Precompute starts and counts mapped to the full 0..k_clusters-1 range
+    # Use -1 index and 0 count for clusters that are empty/missing
+    full_inv_idx_starts = cp.full(k_clusters, -1, dtype=cp.int32) # Default: invalid start index
+    full_inv_idx_counts = cp.zeros(k_clusters, dtype=cp.int32)   # Default: zero count
+
+    present_mask = (cluster_id_to_unique_idx != -1) # Mask for clusters that are present
+    # Indices into unique_clusters/inv_idx_starts/counts for the present clusters
+    indices_in_unique = cluster_id_to_unique_idx[present_mask]
+
+    if indices_in_unique.size > 0:
+        # Get the actual cluster IDs (0..k_clusters-1) that are present
+        present_cluster_ids = cp.where(present_mask)[0]
+        # Use advanced indexing to populate the full arrays only for present clusters
+        full_inv_idx_starts[present_cluster_ids] = inv_idx_starts_cp[indices_in_unique]
+        full_inv_idx_counts[present_cluster_ids] = inv_idx_counts_cp[indices_in_unique]
+
+    # Cleanup intermediate arrays if memory is tight (optional)
+    # del sort_permutation, sorted_assignments, unique_clusters
+    # del inv_idx_starts_cp, inv_idx_counts_cp, cluster_id_to_unique_idx, present_mask, indices_in_unique
+
+    cp.cuda.Stream.null.synchronize() # Sync after index build
+    build_time_invidx = time.time() - build_invidx_start_time
+    build_time = build_time_kmeans + build_time_invidx # Total build time
+    print(f"Index build time (Inverted Index GPU): {build_time_invidx:.4f}s")
+    print(f"Index build time (Total): {build_time:.4f}s")
+
+    # --- 3. Perform Search ---
+    search_start_time = time.time()
+    all_indices_cp = cp.full((Q, K), -1, dtype=cp.int64)
+    all_distances_cp = cp.full((Q, K), cp.inf, dtype=cp.float32)
+
+    # --- Calculate all query-centroid distances at once (vectorized) ---
+    # Shape (Q, k_clusters)
+    all_query_centroid_dists_sq = pairwise_l2_squared_cupy(X_cp, centroids_cp)
+
+    # --- Find nprobe nearest clusters for all queries at once (vectorized) ---
+    # Shape (Q, nprobe) - Indices of the nearest clusters for each query
+    all_nearest_cluster_indices = cp.argpartition(all_query_centroid_dists_sq, nprobe, axis=1)[:, :nprobe]
+    # Ensure indices are int32 for indexing our helper arrays
+    all_nearest_cluster_indices = all_nearest_cluster_indices.astype(cp.int32)
+
+    # --- Iterate through queries (CPU loop, but GPU work inside) ---
+    # Fully vectorizing the rest across queries is complex due to variable candidate counts
+    for q_idx in range(Q):
+        query_cp = X_cp[q_idx:q_idx+1] # Keep it 2D: (1, D) for pairwise_l2_squared_cupy
+        # Indices of the nprobe nearest clusters for *this* query
+        nearest_cluster_indices = all_nearest_cluster_indices[q_idx] # Shape (nprobe,)
+
+        # b. Gather candidate points from selected clusters (GPU Optimized)
+        # Get the start positions and counts for the selected clusters
+        selected_starts = full_inv_idx_starts[nearest_cluster_indices] # Shape (nprobe,)
+        selected_counts = full_inv_idx_counts[nearest_cluster_indices] # Shape (nprobe,)
+
+        # Use a list to collect candidate arrays from GPU, then concatenate on GPU
+        candidate_indices_list_gpu = []
+        # This loop iterates nprobe times (CPU controlled, but small)
+        for i in range(nprobe):
+            start = selected_starts[i].item() # Get scalar value
+            count = selected_counts[i].item() # Get scalar value
+            # Check if cluster is valid (start index >= 0) and has points (count > 0)
+            if start >= 0 and count > 0:
+                # Append a view/slice of the GPU array (no data copy yet)
+                candidate_indices_list_gpu.append(inv_idx_values_cp[start : start + count])
+
+        if not candidate_indices_list_gpu:
+             # print(f"Query {q_idx}: No candidates found in probed clusters.") # Optional debug
+             continue # No candidates found for this query
+
+        # Concatenate candidates from different clusters ON THE GPU
+        candidate_indices_cp = cp.concatenate(candidate_indices_list_gpu)
+
+        # Remove duplicate candidates that might appear if a point is near boundaries probed
+        # This can be costly if candidate_indices_cp is huge, but necessary for correctness
+        # and potentially reduces work for distance calculation.
+        unique_candidate_indices_cp = cp.unique(candidate_indices_cp)
+
+        num_unique_candidates = unique_candidate_indices_cp.size
+        if num_unique_candidates == 0:
+            continue
+
+        # c. Fetch candidate vectors (GPU indexing)
+        candidate_vectors_cp = A_cp[unique_candidate_indices_cp]
+
+        # d. Calculate exact distances to candidates (vectorized on GPU)
+        query_candidate_dists_sq = pairwise_l2_squared_cupy(query_cp, candidate_vectors_cp) # Shape (1, num_unique_candidates)
+
+        # e. Find top K among candidates (vectorized on GPU)
+        actual_k = min(K, num_unique_candidates) # We can't return more candidates than we found
+
+        if actual_k > 0:
+            # Get indices of K smallest distances *within the unique candidate subset*
+            # argpartition is usually faster than argsort for finding k smallest
+            topk_relative_indices = cp.argpartition(query_candidate_dists_sq[0], actual_k)[:actual_k] # Indices relative to unique_candidate_indices_cp
+
+            # Get the distances corresponding to these top k relative indices
+            topk_distances_sq = query_candidate_dists_sq[0, topk_relative_indices]
+
+            # Sort these K results by distance
+            sort_order = cp.argsort(topk_distances_sq)
+
+            # Apply the sort order to get the final relative indices and distances
+            final_topk_relative_indices = topk_relative_indices[sort_order]
+            final_topk_distances_sq = topk_distances_sq[sort_order] # Or query_candidate_dists_sq[0, final_topk_relative_indices]
+
+            # Map relative indices back to the original database indices
+            final_topk_original_indices = unique_candidate_indices_cp[final_topk_relative_indices]
+
+            # Store results for this query
+            all_indices_cp[q_idx, :actual_k] = final_topk_original_indices
+            all_distances_cp[q_idx, :actual_k] = final_topk_distances_sq
+
+    cp.cuda.Stream.null.synchronize() # Sync after all queries are processed
+    search_time = time.time() - search_start_time
+    print(f"ANN search time (Optimized): {search_time:.4f} seconds")
+
+    return all_indices_cp, all_distances_cp, build_time, search_time
+
+
+# ============================================================================
+# Brute-Force k-NN (CuPy version for Recall Calculation - Keep as is)
+# ============================================================================
+def cupy_knn_bruteforce(N_A, D, A_cp, X_cp, K):
+    """
+    Finds the K nearest neighbors using brute-force pairwise L2 distance (CuPy).
+    (Code from the original prompt - assumed correct)
+    """
+    # --- Input Validation ---
+    if not isinstance(A_cp, cp.ndarray): A_cp = cp.asarray(A_cp)
+    if not isinstance(X_cp, cp.ndarray): X_cp = cp.asarray(X_cp)
+    if A_cp.dtype != cp.float32: A_cp = A_cp.astype(cp.float32)
+    if X_cp.dtype != cp.float32: X_cp = X_cp.astype(cp.float32)
+
+    Q = X_cp.shape[0]
+    if X_cp.shape[1] != D: raise ValueError("Query dimension mismatch")
+    if A_cp.shape[0] != N_A: print(f"Warning: N_A mismatch. Using A_cp.shape[0]={A_cp.shape[0]}"); N_A = A_cp.shape[0]
+    if A_cp.shape[1] != D: raise ValueError("Database dimension mismatch")
+    if not K > 0: raise ValueError("K must be positive")
+    K = min(K, N_A) # Cannot return more neighbors than exist
+
+    print(f"Running k-NN Brute Force (CuPy): Q={Q}, N={N_A}, D={D}, K={K}")
+    start_time = time.time()
+
+    all_distances_sq = pairwise_l2_squared_cupy(X_cp, A_cp) # Shape (Q, N_A)
+
+    # Partitioning is generally faster than full sort for finding top K
+    # Find indices of K smallest distances for each query (row)
+    # Ensure K is not larger than N_A before partitioning
+    k_partition = min(K, N_A -1) if N_A > 0 else 0 # argpartition needs k < N
+    if k_partition < 0: k_partition = 0 # Handle N_A=0 case
+
+    if N_A == 0: # Handle empty database case
+        topk_indices_cp = cp.full((Q, K), -1, dtype=cp.int64)
+        topk_distances_sq_cp = cp.full((Q, K), cp.inf, dtype=cp.float32)
+    elif K >= N_A: # If K is larger or equal N_A, just sort all distances
+        topk_indices_cp = cp.argsort(all_distances_sq, axis=1)[:, :K]
+        topk_distances_sq_cp = cp.take_along_axis(all_distances_sq, topk_indices_cp, axis=1)
+    else:
+        # Use argpartition to find the K smallest elements (indices)
+        topk_indices_unstructured = cp.argpartition(all_distances_sq, k_partition, axis=1)[:, :K] # Shape (Q, K)
+
+        # Get the actual distances for these K indices
+        topk_distances_unstructured = cp.take_along_axis(all_distances_sq, topk_indices_unstructured, axis=1) # Shape (Q, K)
+
+        # Sort within the retrieved K elements for each query based on distance
+        sorted_order_in_k = cp.argsort(topk_distances_unstructured, axis=1) # Shape (Q, K)
+
+        # Apply the sort order to get the final indices and distances
+        topk_indices_cp = cp.take_along_axis(topk_indices_unstructured, sorted_order_in_k, axis=1)
+        topk_distances_sq_cp = cp.take_along_axis(topk_distances_unstructured, sorted_order_in_k, axis=1)
+
+
+    cp.cuda.Stream.null.synchronize()
+    end_time = time.time()
+    print(f"k-NN Brute Force (CuPy) computation time: {end_time - start_time:.4f} seconds")
+
+    return topk_indices_cp, topk_distances_sq_cp
+
+
+# ============================================================================
+# Example Usage (Modified to use the optimized function)
+# ============================================================================
+
 
 class SimpleHNSW_for_ANN:
     def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
@@ -527,302 +796,103 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
      search_time = end_search - start_search
      print(f"ANN search time: {search_time:.4f} seconds")
      return all_indices, all_distances, build_time, search_time # Returns indices and SQUARED L2 distances
-def our_ann_cupy_ivf(N_A, D, A_cp, X_cp, K, k_clusters=100, nprobe=5, max_kmeans_iters=100):
-    """
-    Performs Approximate Nearest Neighbor search using KMeans-IVF with CuPy.
-
-    Args:
-        N_A (int): Number of database points.
-        D (int): Dimensionality.
-        A_cp (cp.ndarray): Database vectors (N_A, D) on GPU.
-        X_cp (cp.ndarray): Query vectors (Q, D) on GPU.
-        K (int): Number of neighbors to find for each query.
-        k_clusters (int): Number of clusters for the K-Means index.
-        nprobe (int): Number of clusters to probe during search.
-        max_kmeans_iters (int): Max iterations for K-Means during index build.
-
-    Returns:
-        tuple[cp.ndarray, cp.ndarray, float, float]:
-            - all_indices_cp (cp.ndarray): Original indices of the K nearest neighbors (Q, K).
-            - all_distances_cp (cp.ndarray): Squared L2 distances of the K nearest neighbors (Q, K).
-            - build_time (float): Time taken to build the index (KMeans).
-            - search_time (float): Time taken for searching all queries.
-    """
-    if not isinstance(A_cp, cp.ndarray) or not isinstance(X_cp, cp.ndarray):
-        raise TypeError("Input data 'A_cp' and queries 'X_cp' must be CuPy ndarrays.")
-
-    Q = X_cp.shape[0]
-    assert X_cp.shape[1] == D, "Query dimension mismatch"
-    assert K > 0, "K must be positive"
-    assert k_clusters > 0, "k_clusters must be positive"
-    assert nprobe > 0 and nprobe <= k_clusters, "nprobe must be between 1 and k_clusters"
-    # Ensure K is not larger than N_A
-    K = min(K, N_A)
-
-
-    print(f"Running ANN (KMeans-IVF / CuPy): Q={Q}, N={N_A}, D={D}, K={K}")
-    print(f"IVF Params: k_clusters={k_clusters}, nprobe={nprobe}")
-
-    # --- 1. Build Index (K-Means) ---
-    build_start_time = time.time()
-    centroids_cp, assignments_cp = our_kmeans(N_A, D, A_cp, k_clusters, max_iters=max_kmeans_iters)
-    build_time = time.time() - build_start_time
-    print(f"Index build time (KMeans): {build_time:.4f}s")
-
-    # --- 2. Build Inverted Index (CPU loop, could be optimized further on GPU) ---
-    # This part is often done on CPU for flexibility, but can be a bottleneck.
-    # For efficiency with large N, a GPU-based approach (e.g., using sorting and unique counts)
-    # similar to the PyTorch HNSW index build could be faster, but more complex.
-    inverted_index = [[] for _ in range(k_clusters)]
-    original_indices = cp.arange(N_A) # Keep track of original indices
-    # Transfer assignments and indices to CPU for building the Python list index
-    assignments_np = cp.asnumpy(assignments_cp)
-    original_indices_np = cp.asnumpy(original_indices)
-    for original_idx, cluster_id in zip(original_indices_np, assignments_np):
-        if 0 <= cluster_id < k_clusters: # Check bounds just in case
-             inverted_index[cluster_id].append(original_idx)
-    # Convert lists in index to CuPy arrays for potentially faster concatenation later
-    # This might use more memory if lists are very uneven.
-    # inverted_index_cp = [cp.array(lst, dtype=cp.int64) for lst in inverted_index]
-
-    # --- 3. Perform Search ---
-    search_start_time = time.time()
-    all_indices_cp = cp.full((Q, K), -1, dtype=cp.int64)
-    all_distances_cp = cp.full((Q, K), cp.inf, dtype=cp.float32)
-
-    for q_idx in range(Q):
-        query_cp = X_cp[q_idx:q_idx+1] # Keep it 2D: (1, D)
-
-        # a. Find nprobe nearest clusters
-        query_centroid_dists_sq = pairwise_l2_squared_cupy(query_cp, centroids_cp) # Shape (1, k_clusters)
-        # Need indices of nprobe *smallest* distances
-        nearest_cluster_indices = cp.argpartition(query_centroid_dists_sq[0], nprobe)[:nprobe] # Indices of clusters
-
-        # b. Gather candidate points from selected clusters
-        candidate_indices_list = []
-        for cluster_idx in cp.asnumpy(nearest_cluster_indices): # Iterate on CPU
-             candidate_indices_list.extend(inverted_index[cluster_idx]) # Extend with original indices
-
-        if not candidate_indices_list:
-             continue # No candidates found for this query
-
-        candidate_indices_cp = cp.array(candidate_indices_list, dtype=cp.int64)
-        unique_candidate_indices_cp = cp.unique(candidate_indices_cp) # Ensure uniqueness
-
-        if unique_candidate_indices_cp.size == 0:
-             continue
-
-        # c. Fetch candidate vectors
-        candidate_vectors_cp = A_cp[unique_candidate_indices_cp]
-
-        # d. Calculate exact distances to candidates
-        query_candidate_dists_sq = pairwise_l2_squared_cupy(query_cp, candidate_vectors_cp) # Shape (1, num_candidates)
-
-        # e. Find top K among candidates
-        num_candidates_found = query_candidate_dists_sq.shape[1]
-        actual_k = min(K, num_candidates_found)
-
-        if actual_k > 0:
-            # Get indices of K smallest distances *within the candidate subset*
-            topk_relative_indices = cp.argpartition(query_candidate_dists_sq[0], actual_k)[:actual_k]
-            # Sort these K relative indices by their actual distances
-            topk_distances_sq = query_candidate_dists_sq[0, topk_relative_indices]
-            sort_order = cp.argsort(topk_distances_sq)
-            final_topk_relative_indices = topk_relative_indices[sort_order]
-
-            # Map relative indices back to original indices
-            final_topk_original_indices = unique_candidate_indices_cp[final_topk_relative_indices]
-            final_topk_distances_sq = query_candidate_dists_sq[0, final_topk_relative_indices]
-
-            # Store results
-            all_indices_cp[q_idx, :actual_k] = final_topk_original_indices
-            all_distances_cp[q_idx, :actual_k] = final_topk_distances_sq
-
-    cp.cuda.Stream.null.synchronize()
-    search_time = time.time() - search_start_time
-    print(f"ANN search time: {search_time:.4f} seconds")
-
-    return all_indices_cp, all_distances_cp, build_time, search_time
-
-# ============================================================================
-# Brute-Force k-NN (CuPy version for Recall Calculation)
-# ============================================================================
-
-def cupy_knn_bruteforce(N_A, D, A_cp, X_cp, K):
-    """
-    Finds the K nearest neighbors using brute-force pairwise L2 distance (CuPy).
-
-    Args:
-        N_A (int): Number of database points.
-        D (int): Dimensionality.
-        A_cp (cp.ndarray): Database vectors (N_A, D) on GPU.
-        X_cp (cp.ndarray): Query vectors (Q, D) on GPU.
-        K (int): Number of neighbors to find.
-
-    Returns:
-        tuple[cp.ndarray, cp.ndarray]:
-            - topk_indices_cp (cp.ndarray): Indices of the K nearest neighbors (Q, K).
-            - topk_distances_sq_cp (cp.ndarray): Squared L2 distances (Q, K).
-    """
-    Q = X_cp.shape[0]
-    assert K > 0, "K must be positive"
-    K = min(K, N_A) # Cannot return more neighbors than exist
-
-    print(f"Running k-NN Brute Force (CuPy): Q={Q}, N={N_A}, D={D}, K={K}")
-    start_time = time.time()
-
-    all_distances_sq = pairwise_l2_squared_cupy(X_cp, A_cp) # Shape (Q, N_A)
-
-    # Partitioning is generally faster than full sort for finding top K
-    # Find indices of K smallest distances for each query (row)
-    topk_indices_cp = cp.argpartition(all_distances_sq, K, axis=1)[:, :K] # Shape (Q, K)
-
-    # Get the actual distances for the top K indices
-    topk_distances_sq_cp = cp.take_along_axis(all_distances_sq, topk_indices_cp, axis=1) # Shape (Q, K)
-
-    # Sort within the top K for each query based on distance
-    sorted_order_in_k = cp.argsort(topk_distances_sq_cp, axis=1) # Shape (Q, K)
-    topk_indices_cp = cp.take_along_axis(topk_indices_cp, sorted_order_in_k, axis=1)
-    topk_distances_sq_cp = cp.take_along_axis(topk_distances_sq_cp, sorted_order_in_k, axis=1)
-
-    cp.cuda.Stream.null.synchronize()
-    end_time = time.time()
-    print(f"k-NN Brute Force (CuPy) computation time: {end_time - start_time:.4f} seconds")
-
-    return topk_indices_cp, topk_distances_sq_cp
-
-# ============================================================================
-# Example Usage
-# ============================================================================
 if __name__ == "__main__":
-    N_data = 5000
+    # Ensure CuPy is available
+    if device is None:
+        print("CuPy device not available. Exiting example.")
+        exit()
+
+    N_data = 100000 # Increased size for better performance comparison
     Dim = 128
-    K_clusters = 5
-
-    print("="*40)
-    print("Generating K-Means Test Data (CuPy)...")
-    print("="*40)
-    A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
-
-    print("\n" + "="*40)
-    print(f"Testing our_kmeans (Pure CuPy - Corrected) (K={K_clusters})...")
-    print("="*40)
-
-    try:
-        kmeans_centroids_cp, kmeans_assignments_cp = our_kmeans(
-            N_data, Dim, A_data_cp, K_clusters, max_iters=20
-        )
-        print("KMeans centroids shape (CuPy):", kmeans_centroids_cp.shape)
-        print("KMeans assignments shape (CuPy):", kmeans_assignments_cp.shape)
-        ids_cp, counts_cp = cp.unique(kmeans_assignments_cp.astype(cp.int32), return_counts=True)
-        print("Cluster counts (CuPy):")
-        ids_np = cp.asnumpy(ids_cp); counts_np = cp.asnumpy(counts_cp)
-        for id_val, count_val in zip(ids_np, counts_np):
-            print(f"  Cluster {id_val}: {count_val}")
-    except ImportError:
-         print("Error: cupyx not found. Cannot use cupyx.scatter_add.")
-    except cp.cuda.runtime.CUDARuntimeError as e:
-         print(f"CUDA runtime error during K-Means: {e}")
-    except Exception as e:
-        print(f"Error during K-Means execution: {e}")
-        import traceback
-        traceback.print_exc()
-
-    # --- ANN Example (Requires PyTorch Input) ---
-    print("\n" + "="*40)
-    print("Generating ANN Test Data (PyTorch)...")
-    print("="*40)
-    N_queries = 100
+    N_queries = 500
     K_val = 10
-    # Ensure A_data_ann and X_queries_ann are created on the correct PyTorch device
-    A_data_ann = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
-    X_queries_ann = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
-
-
-    print("\n" + "="*40)
-    print(f"Testing our_ann (HNSW - PyTorch/Triton - Corrected) (K={K_val})...")
-    print("="*40)
-    try:
-        ann_indices, ann_dists_sq, build_t, search_t = our_ann(
-            N_data, Dim, A_data_ann, X_queries_ann, K_val,
-            M=32, ef_construction=200, ef_search=100
-        )
-        print("ANN results shape (Indices):", ann_indices.shape)
-        print("ANN results shape (Distances - Squared L2):", ann_dists_sq.shape)
-    except Exception as e:
-        print(f"Error during ANN execution: {e}")
-        import traceback
-        traceback.print_exc()
-    
-
-    N_data = 5000
-    Dim = 128
-    N_queries = 100
-    K_val = 10
-    K_clusters_ann = 50 # Number of clusters for ANN index
-    N_probe_ann = 20     # Number of clusters to probe
+    K_clusters_ann = 200 # Number of clusters for ANN index (adjust as needed)
+    N_probe_ann = 10     # Number of clusters to probe (adjust as needed)
 
     print("="*40)
     print("Generating Test Data (CuPy)...")
     print("="*40)
-    # Generate data directly as CuPy array
-    A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
-    X_queries_cp = cp.random.randn(N_queries, Dim, dtype=cp.float32)
+    # Generate data directly as CuPy arrays (float32 is crucial for speed)
+    try:
+        A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
+        X_queries_cp = cp.random.randn(N_queries, Dim, dtype=cp.float32)
+        print(f"Database shape: {A_data_cp.shape}, Query shape: {X_queries_cp.shape}")
+    except cp.cuda.memory.OutOfMemoryError as e:
+        print(f"Error: Out of GPU memory generating data. Reduce N_data or Dim. Details: {e}")
+        exit()
+    except Exception as e:
+        print(f"Error generating data: {e}")
+        exit()
 
     # --- Run Brute-Force k-NN (CuPy) for ground truth ---
     print("\n" + "="*40)
     print(f"Running Brute-Force k-NN (CuPy) (K={K_val})...")
     print("="*40)
+    knn_indices_cp = None # Initialize in case of error
     try:
         knn_indices_cp, knn_dists_sq_cp = cupy_knn_bruteforce(N_data, Dim, A_data_cp, X_queries_cp, K_val)
         print("KNN results shape (Indices):", knn_indices_cp.shape)
         print("KNN results shape (Squared Distances):", knn_dists_sq_cp.shape)
+    except cp.cuda.memory.OutOfMemoryError as e:
+        print(f"Error: Out of GPU memory during Brute-Force KNN. Reduce N_data or Q. Details: {e}")
     except Exception as e:
         print(f"Error during Brute-Force k-NN execution: {e}")
-        knn_indices_cp = None # Mark as unavailable for recall calculation
         import traceback
         traceback.print_exc()
 
-    # --- Run ANN (KMeans-IVF / CuPy) ---
+    # --- Run Optimized ANN (KMeans-IVF / CuPy) ---
     print("\n" + "="*40)
-    print(f"Testing our_ann_cupy_ivf (K={K_val})...")
+    print(f"Testing our_ann_cupy_ivf_optimized (K={K_val})...")
     print("="*40)
     try:
-        ann_indices_cp, ann_dists_sq_cp, build_t, search_t = our_ann_cupy_ivf(
+        ann_indices_cp, ann_dists_sq_cp, build_t, search_t = our_ann_cupy_ivf_optimized(
             N_data, Dim, A_data_cp, X_queries_cp, K_val,
-            k_clusters=K_clusters_ann, nprobe=N_probe_ann
+            k_clusters=K_clusters_ann, nprobe=N_probe_ann, max_kmeans_iters=50 # Reduce kmeans iters for faster example
         )
         print("ANN results shape (Indices):", ann_indices_cp.shape)
         print("ANN results shape (Squared Distances):", ann_dists_sq_cp.shape)
-        print(f"ANN Build Time: {build_t:.4f}s")
-        print(f"ANN Search Time: {search_t:.4f}s")
+        print(f"ANN Build Time (Optimized): {build_t:.4f}s")
+        print(f"ANN Search Time (Optimized): {search_t:.4f}s")
+        print(f"-> Throughput: {N_queries / search_t:.2f} queries/sec")
+
 
         # --- Recall Calculation ---
-        if knn_indices_cp is not None:
+        if knn_indices_cp is not None and ann_indices_cp is not None:
+            # Ensure K used for recall matches K used in functions
+            recall_K = K_val
             total_intersect = 0
-            # Transfer to CPU for set operations
-            knn_indices_np = cp.asnumpy(knn_indices_cp)
-            ann_indices_np = cp.asnumpy(ann_indices_cp)
+            # Move necessary parts to CPU for set operations
+            # Only move the top-K indices needed for recall calculation
+            knn_indices_np = cp.asnumpy(knn_indices_cp[:, :recall_K])
+            ann_indices_np = cp.asnumpy(ann_indices_cp[:, :recall_K])
 
             for i in range(N_queries):
+                # Consider only valid indices (>= 0) from ANN results
                 true_knn_ids = set(knn_indices_np[i])
-                approx_ann_ids = set(ann_indices_np[i])
-                approx_ann_ids.discard(-1)
+                approx_ann_ids = set(idx for idx in ann_indices_np[i] if idx >= 0)
 
-                total_intersect += len(true_knn_ids.intersection(approx_ann_ids))
+                intersect_count = len(true_knn_ids.intersection(approx_ann_ids))
+                total_intersect += intersect_count
 
-            if N_queries * K_val > 0:
-                avg_recall = total_intersect / (N_queries * K_val)
-                print(f"\nAverage ANN Recall @ {K_val} (vs brute-force CuPy KNN): {avg_recall:.2%}")
-                if avg_recall < 0.70:
-                     print("WARNING: Recall target (>70%) NOT met.")
+            if N_queries > 0 and recall_K > 0:
+                # Recall is defined as (number of true neighbors found) / (total number of true neighbors)
+                avg_recall = total_intersect / (N_queries * recall_K)
+                print(f"\nAverage ANN Recall @ {recall_K} (vs brute-force CuPy KNN): {avg_recall:.4f} ({avg_recall:.2%})")
+                # Set a reasonable recall target
+                if avg_recall < 0.80: # Example target
+                     print("INFO: Recall is below target threshold (e.g., 80%). Consider increasing nprobe.")
+                if N_probe_ann >= K_clusters_ann and avg_recall < 0.999:
+                    print("Warning: nprobe >= k_clusters, but recall is not ~100%. Check logic.")
+
             else:
                 print("\nCannot calculate recall (N_queries or K_val is zero).")
         else:
-            print("\nCannot calculate recall: Brute-force k-NN results unavailable.")
+            print("\nCannot calculate recall: Brute-force or ANN results unavailable.")
 
     except ImportError:
          print("Error: cupyx not found. Cannot use cupyx.scatter_add in K-Means.")
+    except cp.cuda.memory.OutOfMemoryError as e:
+        print(f"Error: Out of GPU memory during ANN. Reduce N_data, Q, K, or k_clusters. Details: {e}")
     except cp.cuda.runtime.CUDARuntimeError as e:
          print(f"CUDA runtime error during ANN execution: {e}")
     except Exception as e:
