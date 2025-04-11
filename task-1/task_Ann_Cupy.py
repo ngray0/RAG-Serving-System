@@ -899,3 +899,44 @@ if __name__ == "__main__":
         print(f"Error during ANN execution: {e}")
         import traceback
         traceback.print_exc()
+    D = 128  # The dimension of vectors in your index (A_cp)
+    Q_new = 500 # How many new queries you want to generate
+
+# --- Generate ---
+# Option A: Standard normal distribution (mean 0, variance 1)
+    new_queries_cp = cp.random.randn(Q_new, D, dtype=cp.float32)
+
+# Option B: Uniform distribution between [0, 1)
+# new_queries_cp = cp.random.rand(Q_new, D, dtype=cp.float32)
+
+    print(f"Generated {Q_new} new random queries with shape: {new_queries_cp.shape}")
+    print(f"\nSearching with {new_queries_cp.shape[0]} newly generated queries...")
+
+    try:
+        D = 128
+        Q_new = 500
+        noise_level = 0.05 # How much noise to add (adjust magnitude)
+# Assume A_cp (the database used for indexing) is available
+        N_A = A_data_cp.shape[0]
+
+    # Call the search function with the new queries
+        new_ann_indices, new_ann_dists, build_t_ignored, search_t_new = our_ann_cupy_ivf_optimized(
+        N_A, D, A_data_cp,           # Original database info
+        new_queries_cp,       # Your NEW query vectors
+        K_val,                    # Number of neighbors
+        k_clusters=K_clusters_ann, # Same index parameters
+        nprobe=N_probe_ann,        # Same index parameters
+        max_kmeans_iters=50        # K-Means iterations don't matter for search
+        )
+
+        print(f"New ANN search finished in: {search_t_new:.4f} seconds")
+        print(f"-> Throughput: {new_queries_cp.shape[0] / search_t_new:.2f} queries/sec")
+        print("New ANN results shape (Indices):", new_ann_indices.shape)
+        print("New ANN results shape (Squared Distances):", new_ann_dists.shape)
+
+    # You can now use new_ann_indices and new_ann_dists
+
+    except Exception as e:
+        print(f"Error during search with new queries: {e}")
+        import traceback
+        traceback.print_exc()
