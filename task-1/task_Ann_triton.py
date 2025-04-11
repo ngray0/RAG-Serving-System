@@ -428,11 +428,11 @@ def our_ann_user_pseudocode_impl_l2_triton(N_A, D, A, X, k_clusters, K1, K2,
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters for all dimension runs ---
-    N_data = 1000000
-    N_queries_new = 200000 # Number of new queries
+    N_data = 100000
+    N_queries_new = 1000 # Number of new queries
     num_clusters_for_kmeans = 1000 # Target cluster count
-    K1_probe = 200
-    K2_final = 190
+    K1_probe = 30
+    K2_final = 10
     kmeans_max_iters = 50
 
     # --- Dimensions to Test ---
