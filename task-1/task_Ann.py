@@ -287,6 +287,26 @@ def distance_cosine(X, A, epsilon=1e-8, **kwargs):
     cosine_distance = 1.0 - cosine_similarity
     return cosine_distance
 
+def distance_l2(X, A, **kwargs):
+    """
+    Computes pairwise L2 (Euclidean) distances using the tiled dot product kernel
+    and PyTorch operations for norms.
+    """
+    target_device = X.device
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
+    # print(f"Calculating pairwise L2 (Triton Dot + PyTorch Norm) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
+
+    dot_products = distance_dot(X_prep, A_prep, **kwargs) # (Q, N)
+    X_norm_sq = torch.sum(X_prep**2, axis=1, keepdims=True)  # (Q, 1)
+    A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # (N, 1)
+    dist_sq = X_norm_sq - 2 * dot_products + A_norm_sq.T # (Q, N)
+    dist_sq.clamp_(min=0.0)
+    #dist = torch.sqrt(dist_sq)
+    return dist_sq
+
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
     Performs K-means clustering on data A using Triton kernel for assignment
@@ -324,7 +344,7 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
         # --- 1. Assignment Step (Uses Triton Kernel) ---
         # Kernel expects int32 output, so create temp tensor
         assignments_int32 = torch.empty(N_A, dtype=torch.int32, device=device)
-        kmeans_assign_kernel_cosine[grid_assign](
+        kmeans_assign_kernel[grid_assign](
         A_norm, centroids_norm, assignments_int32, # Pass normalized tensors
         N_A, D, K,
         A_norm.stride(0), A_norm.stride(1),
@@ -403,7 +423,7 @@ def our_knn(N_A, D, A, X, K):
 
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
-    all_distances = distance_cosine(X_prep, A_prep, prep = False) # Shape (Q, N_A)
+    all_distances = distance_l2(X_prep, A_prep, prep = False) # Shape (Q, N_A)
 
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
