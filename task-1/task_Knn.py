@@ -374,25 +374,7 @@ def distance_dot(X, A):
     # Or return raw dot product if similarity maximization is intended
     return -Out
 
-def distance_l2(X, A, **kwargs):
-    """
-    Computes pairwise L2 (Euclidean) distances using the tiled dot product kernel
-    and PyTorch operations for norms.
-    """
-    target_device = X.device
-    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
-    Q, D = X_prep.shape
-    N, D_A = A_prep.shape
-    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
-    # print(f"Calculating pairwise L2 (Triton Dot + PyTorch Norm) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
 
-    dot_products = distance_dot(X_prep, A_prep, **kwargs) # (Q, N)
-    X_norm_sq = torch.sum(X_prep**2, axis=1, keepdims=True)  # (Q, 1)
-    A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # (N, 1)
-    dist_sq = X_norm_sq - 2 * dot_products + A_norm_sq.T # (Q, N)
-    dist_sq.clamp_(min=0.0)
-    #dist = torch.sqrt(dist_sq)
-    return dist_sq
 '''
 def distance_l2_triton2(X, A):
     X_prep, A_prep = _prepare_tensors(X, A)
@@ -413,56 +395,7 @@ def distance_l2_triton2(X, A):
     return Out
 '''
 
-def distance_cosine(X, A, epsilon=1e-8, **kwargs):
-    """
-    Computes pairwise Cosine distances using the tiled dot product kernel
-    and PyTorch operations for norms.
-    """
-    target_device = X.device
-    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
-    Q, D = X_prep.shape
-    N, D_A = A_prep.shape
-    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
-    # print(f"Calculating pairwise Cosine (Triton Dot + PyTorch Norm) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
 
-    dot_products = distance_dot(X_prep, A_prep, **kwargs) # (Q, N)
-    X_norm = torch.linalg.norm(X_prep, axis=1, keepdims=True) # (Q, 1)
-    A_norm = torch.linalg.norm(A_prep, axis=1, keepdims=True) # (N, 1)
-    norm_product = X_norm * A_norm.T # (Q, N)
-    cosine_similarity = dot_products / (norm_product + epsilon)
-    cosine_similarity.clamp_(min=-1.0, max=1.0)
-    cosine_distance = 1.0 - cosine_similarity
-    return cosine_distance
-
-def distance_manhattan(X, A, **kwargs):
-    """Computes pairwise Manhattan (L1) distance using the tiled Triton kernel."""
-    target_device = X.device
-    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
-    Q, D = X_prep.shape
-    N, D_A = A_prep.shape
-    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
-    # print(f"Calculating pairwise Manhattan (Tiled Triton Kernel) for shapes: {X_prep.shape} and {A_prep.shape}") # Optional verbose
-
-    Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
-    BLOCK_Q = kwargs.get('BLOCK_Q', DEFAULT_BLOCK_Q)
-    BLOCK_N = kwargs.get('BLOCK_N', DEFAULT_BLOCK_N)
-    grid = (ceil_div(Q, BLOCK_Q), ceil_div(N, BLOCK_N))
-    # print(f"Launching Triton Kernel manhattan_kernel_pairwise_tiled with grid={grid}") # Optional verbose
-
-    # Add synchronization for debugging hangs
-    manhattan_kernel_pairwise_tiled[grid](
-        X_prep, A_prep, Out,
-        Q, N, D,
-        X_prep.stride(0), X_prep.stride(1), A_prep.stride(0), A_prep.stride(1),
-        Out.stride(0), Out.stride(1),
-        # Pass fixed block sizes for debugging, comment out autotune on kernel
-        # BLOCK_Q=16, BLOCK_N=16, BLOCK_K=16
-        # Or pass from autotuner via kwargs if autotune is enabled
-         **kwargs
-    )
-    # Try uncommenting synchronize if debugging hangs persists
-    # torch.cuda.synchronize()
-    return Out
 
 def distance_dot3(X, Y):
     """
@@ -511,52 +444,101 @@ def compute_all_distances(A, X):
         "Dot": distance_dot2(A, X),
         "Manhattan": distance_manhattan2(A, X)
     }
-def distance_dot_tiled(X, A, N_TILE=50000, prep = True): # Tile size, adjust if needed
-    """
-    Computes pairwise dot product using Triton kernel, tiled over A
-    to avoid exceeding GPU grid dimension limits.
 
-    Args:
-        X (torch.Tensor): Query vectors (Q, D) on GPU.
-        A (torch.Tensor): Database vectors (N, D) on GPU.
-        N_TILE (int): The maximum number of rows of A to process in one kernel launch.
-
-    Returns:
-        torch.Tensor: Output tensor of dot products (Q, N) on GPU.
-    """
-    if prep == True:
-        X_prep, A_prep = _prepare_tensors(X, A) # Ensure tensors are ready
-    else:
-        X_prep, A_prep = X, A
-    Q, D = X_prep.shape
-    N, D_A = A_prep.shape
-    assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
-
-    # Output tensor remains the full size
+def distance_dot_tiled(X, A, N_TILE=32768, prep=True):
+    # ... (Keep the existing definition that returns POSITIVE dot product) ...
+    # This function does NOT take **kwargs relevant to kernel block sizes
+    if prep: X_prep, A_prep = _prepare_tensors(X, A)
+    else: X_prep, A_prep = X, A
+    Q, D = X_prep.shape; N, D_A = A_prep.shape
+    if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
     Out = torch.empty((Q, N), dtype=torch.float32, device=device)
-
-    print(f"Tiling dot product calculation with N_TILE={N_TILE}")
+    # Use DEFAULT_BLOCK_D defined globally or pass it explicitly if needed by the kernel
+    global DEFAULT_BLOCK_D # Make sure it's accessible or pass it
+    if 'DEFAULT_BLOCK_D' not in globals(): DEFAULT_BLOCK_D = 128 # Fallback
 
     for n_start in range(0, N, N_TILE):
-        n_end = min(n_start + N_TILE, N)
-        N_chunk = n_end - n_start # Size of the current chunk of A
-        A_chunk = A_prep[n_start:n_end, :] # Shape (N_chunk, D)
-        # Slice the relevant part of Out for this tile
-        Out_chunk = Out[:, n_start:n_end]   # Shape (Q, N_chunk)
-
+        n_end = min(n_start + N_TILE, N); N_chunk = n_end - n_start
+        if N_chunk <= 0: continue
+        A_chunk = A_prep[n_start:n_end, :]; Out_chunk = Out[:, n_start:n_end]
         grid = (Q, N_chunk)
-        if grid[0] == 0 or grid[1] == 0: continue 
-
-        dot_kernel_pairwise[grid](
-            X_prep, A_chunk, Out_chunk,       # Data pointers for the chunks
-            Q, N_chunk, D,                    # Dimensions for the chunk
-            X_prep.stride(0), X_prep.stride(1),
-            A_chunk.stride(0), A_chunk.stride(1), # Strides of A_chunk
-            Out_chunk.stride(0), Out_chunk.stride(1),# Strides of Out_chunk
-            BLOCK_SIZE_D=DEFAULT_BLOCK_D          # Kernel block size constant
+        if grid[0] == 0 or grid[1] == 0: continue
+        # Assuming dot_kernel_pairwise_tiled is the AUTOTUNED one now
+        dot_kernel_pairwise_tiled[grid]( # Pass grid lambda if kernel is autotuned on Q/N blocks
+            X_prep, A_chunk, Out_chunk, Q, N_chunk, D,
+            X_prep.stride(0), 1, A_chunk.stride(0), 1, Out_chunk.stride(0), 1
+            # BLOCK_Q, BLOCK_N, BLOCK_K set by autotuner, don't pass here
         )
-        # Potentially add torch.cuda.synchronize() here if debugging tile-by-tile issues
+        # If dot_kernel_pairwise_tiled is NOT autotuned on Q/N, use fixed grid and pass BLOCK_K:
+        # dot_kernel_pairwise[grid](...) # Assuming dot_kernel_pairwise is the simple one
+    return Out
 
+# Corrected distance_l2 (Removes kwargs, ensures prep=False passed correctly)
+def distance_l2(X, A): # Removed **kwargs
+    """
+    Computes pairwise SQUARED L2 distances using the tiled dot product kernel.
+    """
+    X_prep, A_prep = _prepare_tensors(X, A) # Prepare tensors internally
+    Q, D = X_prep.shape; N, D_A = A_prep.shape
+    if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
+
+    # Call distance_dot_tiled, tensors are prepared so prep=False
+    # Do NOT pass **kwargs
+    dot_products = distance_dot_tiled(X_prep, A_prep, prep=False) # Shape (Q, N)
+
+    X_norm_sq = torch.sum(X_prep**2, axis=1, keepdims=True)  # Shape (Q, 1)
+    A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # Shape (N, 1)
+    dist_sq = X_norm_sq + A_norm_sq.T - 2 * dot_products # Shape (Q, N)
+    dist_sq.clamp_(min=0.0)
+    return dist_sq
+
+# Corrected distance_cosine (Removes kwargs, calls corrected distance_dot_tiled)
+def distance_cosine(X, A, epsilon=1e-8): # Removed **kwargs
+    """
+    Computes pairwise Cosine distances using the tiled dot product kernel.
+    """
+    target_device = X.device if isinstance(X, torch.Tensor) else A.device
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    Q, D = X_prep.shape; N, D_A = A_prep.shape
+    if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
+
+    # Call distance_dot_tiled, tensors are prepared so prep=False
+    # Do NOT pass **kwargs
+    dot_products = distance_dot_tiled(X_prep, A_prep, prep=False) # (Q, N), POSITIVE dot
+
+    X_norm = torch.linalg.norm(X_prep, axis=1, keepdims=True) # (Q, 1)
+    A_norm = torch.linalg.norm(A_prep, axis=1, keepdims=True) # (N, 1)
+    norm_product = (X_norm + epsilon) * (A_norm.T + epsilon) # Add epsilon before multiplication
+    cosine_similarity = dot_products / norm_product
+    cosine_similarity.clamp_(min=-1.0, max=1.0)
+    cosine_distance = 1.0 - cosine_similarity
+    return cosine_distance
+
+# Corrected distance_manhattan (Removes kwargs, uses grid lambda for autotuned kernel)
+def distance_manhattan(X, A): # Removed **kwargs
+    """Computes pairwise Manhattan (L1) distance using the tiled, autotuned Triton kernel."""
+    target_device = X.device if isinstance(X, torch.Tensor) else A.device
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    Q, D = X_prep.shape; N, D_A = A_prep.shape
+    if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
+
+    Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
+
+    # Define the grid calculation based on meta information from autotuner config
+    # This grid calculates the number of program instances needed based on Q, N
+    # and the BLOCK_Q, BLOCK_N chosen by the autotuner config.
+    grid_man = lambda meta: (ceil_div(Q, meta['BLOCK_Q']), ceil_div(N, meta['BLOCK_N']))
+
+    # Launch the autotuned kernel, passing the grid lambda
+    # Ensure manhattan_kernel_pairwise_tiled has the @triton.autotune decorator
+    manhattan_kernel_pairwise_tiled[grid_man](
+        X_prep, A_prep, Out,
+        Q, N, D,
+        X_prep.stride(0), 1, A_prep.stride(0), 1, Out.stride(0), 1
+        # BLOCK_Q, BLOCK_N, BLOCK_K are set by the autotuner via meta
+        # DO NOT pass **kwargs here
+    )
+    torch.cuda.synchronize() # Sync after kernel call
     return Out
 
 def our_knn(N_A, D, A, X, K):
