@@ -416,20 +416,87 @@ def distance_dot3(X, Y):
     print(f"Calculating pairwise dot products via matmul for shapes: {X_cp.shape} and {Y_cp.T.shape}")
     return X_cp @ Y_cp.T
 
-def distance_cosine2(X, Y):
-    norm_X = cp.linalg.norm(X, axis=1) 
-    norm_Y = cp.linalg.norm(Y, axis=1)
-    cosine_similarity = cp.einsum('ij,ij->i', X, Y) / (norm_X * norm_Y)
-    return 1 - cosine_similarity
+def pairwise_l2_squared_cupy(X_cp, C_cp):
+    """ Computes pairwise SQUARED L2 distances using CuPy. """
+    if not isinstance(X_cp, cp.ndarray): X_cp = cp.asarray(X_cp, dtype=cp.float32)
+    elif X_cp.dtype != cp.float32: X_cp = X_cp.astype(cp.float32)
+    if not isinstance(C_cp, cp.ndarray): C_cp = cp.asarray(C_cp, dtype=cp.float32)
+    elif C_cp.dtype != cp.float32: C_cp = C_cp.astype(cp.float32)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :]
+    if C_cp.ndim == 1: C_cp = C_cp[None, :]
+    if X_cp.shape[1] != C_cp.shape[1]: raise ValueError("Dimension mismatch")
 
-def distance_l22(X, Y):
-    return cp.linalg.norm(X - Y, axis=1)
+    X_norm_sq = cp.einsum('ij,ij->i', X_cp, X_cp)[:, cp.newaxis]
+    C_norm_sq = cp.einsum('ij,ij->i', C_cp, C_cp)[cp.newaxis, :]
+    # Use matmul for dot product: (Q, D) @ (D, N) -> (Q, N)
+    dot_products = cp.matmul(X_cp, C_cp.T)
+    dist_sq = X_norm_sq - 2 * dot_products + C_norm_sq
+    return cp.maximum(0.0, dist_sq)
 
-def distance_dot2(X, Y):
-    return cp.einsum('ij,ij->i', X, Y)
+def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
+    """ Calculates pairwise dot products between rows of X and rows of Y using CuPy matmul. """
+    X_cp = cp.asarray(X, dtype=cp.float32)
+    Y_cp = cp.asarray(Y, dtype=cp.float32)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :] # Ensure X is 2D (Q, D)
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :] # Ensure Y is 2D (N, D)
+    if X_cp.shape[1] != Y_cp.shape[1]: raise ValueError("Dimension mismatch for dot product")
+    # print(f"CuPy Pairwise Dot: {X_cp.shape} @ {Y_cp.T.shape}")
+    return cp.matmul(X_cp, Y_cp.T) # (Q, D) @ (D, N) -> (Q, N)
 
-def distance_manhattan2(X, Y):
-    return cp.sum(cp.abs(X - Y), axis=1)
+def distance_l22(X, Y): # Corrected: Pairwise SQUARED L2
+    """ Calculates pairwise SQUARED L2 distance using CuPy. """
+    # Reuse the optimized squared L2 logic
+    return pairwise_l2_squared_cupy(X, Y)
+
+def distance_cosine2(X, Y, epsilon=1e-8): # Corrected: Pairwise Cosine Distance
+    """ Calculates pairwise cosine distance (1 - similarity) using CuPy. """
+    X_cp = cp.asarray(X, dtype=np.float32)
+    Y_cp = cp.asarray(Y, dtype=np.float32)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :]
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
+    if X_cp.shape[1] != Y_cp.shape[1]: raise ValueError("Dimension mismatch")
+
+    dot_products = distance_dot2(X_cp, Y_cp) # Pairwise dot (Q, N)
+    norm_X = cp.linalg.norm(X_cp, axis=1, keepdims=True) # (Q, 1)
+    norm_Y = cp.linalg.norm(Y_cp, axis=1, keepdims=True) # (N, 1)
+    norm_product = (norm_X + epsilon) @ (norm_Y.T + epsilon) # (Q, N)
+    cosine_similarity = dot_products / norm_product
+    cosine_similarity = cp.clip(cosine_similarity, -1.0, 1.0)
+    distance = cp.maximum(0.0, 1.0 - cosine_similarity)
+    return distance
+
+def distance_manhattan2(X, Y): # Corrected: Pairwise Manhattan (L1)
+    """ Calculates pairwise Manhattan (L1) distance using CuPy broadcasting. Warning: High memory usage. """
+    X_cp = cp.asarray(X, dtype=cp.float32)
+    Y_cp = cp.asarray(Y, dtype=np.float32)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :]
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
+    if X_cp.shape[1] != Y_cp.shape[1]: raise ValueError("Dimension mismatch")
+
+    Q, D = X_cp.shape
+    N = Y_cp.shape[0]
+    # print(f"CuPy Pairwise Manhattan: Shapes {X_cp.shape}, {Y_cp.shape}")
+    # Broadcasting X[:, None, :] - Y[None, :, :] -> shape (Q, N, D)
+    try:
+        # Process in chunks along query dimension Q to reduce peak memory
+        chunk_size_q = min(Q, max(1, 4096 // N)) # Simple heuristic, adjust as needed
+        l1_distance = cp.empty((Q, N), dtype=cp.float32)
+        for q_start in range(0, Q, chunk_size_q):
+            q_end = min(q_start + chunk_size_q, Q)
+            X_chunk = X_cp[q_start:q_end]
+            abs_diff_chunk = cp.abs(X_chunk[:, None, :] - Y_cp[None, :, :]) # Shape (chunk_Q, N, D)
+            l1_distance[q_start:q_end, :] = cp.sum(abs_diff_chunk, axis=2) # Sum over D -> shape (chunk_Q, N)
+            del X_chunk, abs_diff_chunk # Free intermediate memory
+            cp.get_default_memory_pool().free_all_blocks()
+    except cp.cuda.memory.OutOfMemoryError as e:
+        print(f"\n--- OOM Error in distance_manhattan2 (D={D}) ---")
+        print(f"--- Check intermediate tensor size / chunking strategy ---")
+        l1_distance = cp.full((Q, N), cp.inf, dtype=cp.float32) # Return dummy array
+    except Exception as e:
+        print(f"--- Error in distance_manhattan2 (D={D}): {e} ---")
+        l1_distance = cp.full((Q, N), cp.inf, dtype=cp.float32) # Return dummy array
+
+    return l1_distance
 
 def compute_all_distances(A, X):
     """
@@ -700,10 +767,13 @@ def our_knn_stream(N, D, A, X, K):
     # Return the list of results (or single result if B=1)
     return results if B > 1 else results[0]
 
+# ============================================================================
+# Main Execution Block (Benchmarking KNN and Distances across Dimensions)
+# ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data = 100000     # Reduced N for faster testing across dimensions
-    N_queries = 1000    # Number of queries
+    N_data = 100000
+    N_queries = 1000
     K_val = 10          # K for KNN
     NUM_RUNS = 10       # Number of timed runs for averaging
     WARMUP_RUNS = 2     # Number of warm-up runs
@@ -724,10 +794,8 @@ if __name__ == "__main__":
         cp.cuda.Device(0).use(); print(f"Using CuPy device: {cp.cuda.Device(0)}")
         cupy_device_ok = True
     except Exception as e: print(f"CuPy device error: {e}"); cupy_device_ok = False
-    # Exit if CuPy is needed but unavailable for parts of the benchmark
-    # if not cupy_device_ok: print("CuPy device required but not available."); exit()
 
-    # --- Storage for results across dimensions (optional) ---
+    # --- Storage for results across dimensions ---
     results = {}
 
     # Loop through each dimension
@@ -740,40 +808,31 @@ if __name__ == "__main__":
 
         # --- Generate Base Data (PyTorch and CuPy) ---
         print("\n" + "="*40); print(f"Generating Data (D={Dim})..."); print("="*40)
+        A_data = A_data_cp = X_queries = X_queries_cp = None # Ensure cleanup if generation fails
         try:
-            # PyTorch Data
             A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
             X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
             torch.cuda.synchronize(device=device)
             print(f"Database shape (Torch): {A_data.shape}")
             print(f"Query shape (Torch): {X_queries.shape}")
-
-            # CuPy Data (using DLPack for zero-copy transfer if possible)
             if cupy_device_ok:
-                # Ensure PyTorch tensors are contiguous before DLPack export
                 A_data_contig = A_data.contiguous()
                 X_queries_contig = X_queries.contiguous()
-                dlpack_A = torch.to_dlpack(A_data_contig)
-                dlpack_X = torch.to_dlpack(X_queries_contig)
-                A_data_cp = cp.from_dlpack(dlpack_A)
-                X_queries_cp = cp.from_dlpack(dlpack_X)
+                dlpack_A = torch.to_dlpack(A_data_contig); dlpack_X = torch.to_dlpack(X_queries_contig)
+                A_data_cp = cp.from_dlpack(dlpack_A); X_queries_cp = cp.from_dlpack(dlpack_X)
                 cp.cuda.Stream.null.synchronize()
                 print(f"Database shape (CuPy): {A_data_cp.shape}")
                 print(f"Query shape (CuPy): {X_queries_cp.shape}")
-            else:
-                A_data_cp, X_queries_cp = None, None
-                print("CuPy data generation skipped.")
-
-        except RuntimeError as e: # Catch CUDA OOM errors etc.
-             if "CUDA out of memory" in str(e): print(f"Error: OOM Generating Data (D={Dim}). Skipping.")
-             else: print(f"Runtime Error Generating Data (D={Dim}): {e}")
-             if 'A_data' in locals(): del A_data
-             if 'X_queries' in locals(): del X_queries
-             if 'A_data_cp' in locals(): del A_data_cp
-             if 'X_queries_cp' in locals(): del X_queries_cp
-             torch.cuda.empty_cache(); cp.get_default_memory_pool().free_all_blocks()
-             continue
-        except Exception as e: print(f"Error generating data (D={Dim}): {e}"); continue
+            else: print("CuPy data generation skipped.")
+        except Exception as e:
+            print(f"Error during Data Generation (D={Dim}): {e}")
+            if 'A_data' in locals() and A_data is not None: del A_data
+            if 'X_queries' in locals() and X_queries is not None: del X_queries
+            if cupy_device_ok and 'A_data_cp' in locals() and A_data_cp is not None: del A_data_cp
+            if cupy_device_ok and 'X_queries_cp' in locals() and X_queries_cp is not None: del X_queries_cp
+            torch.cuda.empty_cache();
+            if cupy_device_ok: cp.get_default_memory_pool().free_all_blocks()
+            continue # Skip dimension
 
         # ===--------------------------------------------------===
         # ===              WARM-UP RUNS                      ===
@@ -782,30 +841,30 @@ if __name__ == "__main__":
         try:
             for _ in range(WARMUP_RUNS):
                 # --- PyTorch/Triton Warm-up ---
-                # Distances (add try-except for each in case not defined)
+                try: _ = distance_dot_tiled(X_queries, A_data) # Added dot warmup
+                except NameError: pass
                 try: _ = distance_l2(X_queries, A_data)
                 except NameError: pass
-                try: _ = distance_cosine(X_queries, A_data)
+                try: _ = distance_cosine(X_queries, A_data) # Assuming exists
                 except NameError: pass
-                try: _ = distance_manhattan(X_queries, A_data)
+                try: _ = distance_manhattan(X_queries, A_data) # Assuming exists
                 except NameError: pass
-                # KNN
                 try: _ = our_knn(N_data, Dim, A_data, X_queries, K_val)
                 except NameError: pass
 
                 # --- CuPy Warm-up ---
-                if cupy_device_ok and A_data_cp is not None:
-                    # Distances
-                    try: _ = distance_l22(X_queries_cp, A_data_cp)
+                if cupy_device_ok:
+                    try: _ = distance_dot2(X_queries_cp, A_data_cp) # Added dot warmup
                     except NameError: pass
-                    try: _ = distance_cosine2(X_queries_cp, A_data_cp)
+                    try: _ = distance_l22(X_queries_cp, A_data_cp) # Uses corrected func
                     except NameError: pass
-                    try: _ = distance_manhattan2(X_queries_cp, A_data_cp)
+                    try: _ = distance_cosine2(X_queries_cp, A_data_cp) # Uses corrected func
                     except NameError: pass
-                    # KNNs
-                    try: _ = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val)
+                    try: _ = distance_manhattan2(X_queries_cp, A_data_cp) # Uses corrected func
                     except NameError: pass
-                    try: _ = our_knn_hierachy(N_data, Dim, A_data_cp, X_queries_cp[0], K_val) # Warm-up one query
+                    try: _ = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val) # Assuming exists
+                    except NameError: pass
+                    try: _ = our_knn_hierachy(N_data, Dim, A_data_cp, X_queries_cp[0], K_val) # Assuming exists
                     except NameError: pass
 
             torch.cuda.synchronize()
@@ -823,111 +882,113 @@ if __name__ == "__main__":
         # ===--------------------------------------------------===
         print("\n" + "="*40); print(f"Benchmarking Distance Functions (D={Dim})..."); print("="*40)
 
+        # --- PyTorch/Triton Dot Distance (distance_dot_tiled) --- ADDED
+        try:
+            start_event = torch.cuda.Event(enable_timing=True); end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_event.record()
+            for r in range(NUM_RUNS): _ = distance_dot_tiled(X_queries, A_data)
+            end_event.record(); torch.cuda.synchronize()
+            avg_time = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
+            print(f"PyTorch/Triton distance_dot_tiled Avg Time: {avg_time:.6f} seconds")
+            results[Dim]['dist_dot_torch'] = avg_time
+        except NameError: print("distance_dot_tiled not defined, skipping benchmark.")
+        except Exception as e: print(f"Error benchmarking distance_dot_tiled: {e}")
+
         # --- PyTorch/Triton L2 Distance (distance_l2) ---
         try:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize() # Ensure previous work is done
-            start_event.record()
-            for r in range(NUM_RUNS):
-                _ = distance_l2(X_queries, A_data) # Returns squared L2
-            end_event.record()
-            torch.cuda.synchronize()
-            avg_time_l2 = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS # Avg time in seconds
-            print(f"PyTorch/Triton distance_l2 Avg Time:   {avg_time_l2:.6f} seconds")
-            results[Dim]['dist_l2_torch'] = avg_time_l2
+            start_event = torch.cuda.Event(enable_timing=True); end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize(); start_event.record()
+            for r in range(NUM_RUNS): _ = distance_l2(X_queries, A_data)
+            end_event.record(); torch.cuda.synchronize()
+            avg_time = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
+            print(f"PyTorch/Triton distance_l2 Avg Time:      {avg_time:.6f} seconds")
+            results[Dim]['dist_l2_torch'] = avg_time
         except NameError: print("distance_l2 not defined, skipping benchmark.")
         except Exception as e: print(f"Error benchmarking distance_l2: {e}")
 
         # --- PyTorch/Triton Cosine Distance (distance_cosine) ---
         try:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-            for r in range(NUM_RUNS):
-                _ = distance_cosine(X_queries, A_data) # Assuming exists
-            end_event.record()
-            torch.cuda.synchronize()
-            avg_time_cos = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
-            print(f"PyTorch/Triton distance_cosine Avg Time: {avg_time_cos:.6f} seconds")
-            results[Dim]['dist_cos_torch'] = avg_time_cos
+            start_event = torch.cuda.Event(enable_timing=True); end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize(); start_event.record()
+            for r in range(NUM_RUNS): _ = distance_cosine(X_queries, A_data) # Assuming exists
+            end_event.record(); torch.cuda.synchronize()
+            avg_time = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
+            print(f"PyTorch/Triton distance_cosine Avg Time:   {avg_time:.6f} seconds")
+            results[Dim]['dist_cos_torch'] = avg_time
         except NameError: print("distance_cosine not defined, skipping benchmark.")
         except Exception as e: print(f"Error benchmarking distance_cosine: {e}")
 
         # --- PyTorch/Triton Manhattan Distance (distance_manhattan) ---
         try:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-            for r in range(NUM_RUNS):
-                _ = distance_manhattan(X_queries, A_data) # Assuming exists
-            end_event.record()
-            torch.cuda.synchronize()
-            avg_time_man = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
-            print(f"PyTorch/Triton distance_manhattan Avg Time: {avg_time_man:.6f} seconds")
-            results[Dim]['dist_man_torch'] = avg_time_man
+            start_event = torch.cuda.Event(enable_timing=True); end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize(); start_event.record()
+            for r in range(NUM_RUNS): _ = distance_manhattan(X_queries, A_data) # Assuming exists
+            end_event.record(); torch.cuda.synchronize()
+            avg_time = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
+            print(f"PyTorch/Triton distance_manhattan Avg Time:{avg_time:.6f} seconds")
+            results[Dim]['dist_man_torch'] = avg_time
         except NameError: print("distance_manhattan not defined, skipping benchmark.")
         except Exception as e: print(f"Error benchmarking distance_manhattan: {e}")
 
-        print("-" * 20) # Separator for CuPy distances
+        print("-" * 25) # Separator for CuPy distances
 
-        # --- CuPy L2 Distance (distance_l22) ---
-        if cupy_device_ok and A_data_cp is not None:
+        # --- CuPy Dot Distance (distance_dot2) --- ADDED
+        if cupy_device_ok:
             try:
-                start_event = cp.cuda.Event()
-                end_event = cp.cuda.Event()
-                cp.cuda.Stream.null.synchronize() # Ensure previous work is done
-                start_event.record()
-                for r in range(NUM_RUNS):
-                    _ = distance_l22(X_queries_cp, A_data_cp) # Assuming exists & pairwise
-                end_event.record()
-                end_event.synchronize()
-                avg_time_l2_cp = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
-                print(f"CuPy distance_l22 Avg Time:           {avg_time_l2_cp:.6f} seconds")
-                results[Dim]['dist_l2_cupy'] = avg_time_l2_cp
-            except NameError: print("distance_l22 not defined, skipping benchmark.")
-            # Add Warning if function exists but likely wrong:
-            except ValueError as e: print(f"ValueError benchmarking distance_l22 (check if pairwise): {e}")
-            except Exception as e: print(f"Error benchmarking distance_l22: {e}")
-        else: print("CuPy distance_l22 benchmark skipped (CuPy unavailable or data missing).")
-
-        # --- CuPy Cosine Distance (distance_cosine2) ---
-        if cupy_device_ok and A_data_cp is not None:
-            try:
-                start_event = cp.cuda.Event()
-                end_event = cp.cuda.Event()
+                start_event = cp.cuda.Event(); end_event = cp.cuda.Event()
                 cp.cuda.Stream.null.synchronize()
                 start_event.record()
-                for r in range(NUM_RUNS):
-                    _ = distance_cosine2(X_queries_cp, A_data_cp) # Assuming exists & pairwise
-                end_event.record()
-                end_event.synchronize()
-                avg_time_cos_cp = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
-                print(f"CuPy distance_cosine2 Avg Time:       {avg_time_cos_cp:.6f} seconds")
-                results[Dim]['dist_cos_cupy'] = avg_time_cos_cp
+                for r in range(NUM_RUNS): _ = distance_dot2(X_queries_cp, A_data_cp) # Uses corrected func
+                end_event.record(); end_event.synchronize()
+                avg_time = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
+                print(f"CuPy distance_dot2 Avg Time:            {avg_time:.6f} seconds")
+                results[Dim]['dist_dot_cupy'] = avg_time
+            except NameError: print("distance_dot2 not defined, skipping benchmark.")
+            except Exception as e: print(f"Error benchmarking distance_dot2: {e}")
+        else: print("CuPy distance_dot2 benchmark skipped.")
+
+        # --- CuPy L2 Distance (distance_l22) ---
+        if cupy_device_ok:
+            try:
+                start_event = cp.cuda.Event(); end_event = cp.cuda.Event()
+                cp.cuda.Stream.null.synchronize(); start_event.record()
+                for r in range(NUM_RUNS): _ = distance_l22(X_queries_cp, A_data_cp) # Uses corrected func
+                end_event.record(); end_event.synchronize()
+                avg_time = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
+                print(f"CuPy distance_l22 Avg Time:            {avg_time:.6f} seconds")
+                results[Dim]['dist_l2_cupy'] = avg_time
+            except NameError: print("distance_l22 not defined, skipping benchmark.")
+            except Exception as e: print(f"Error benchmarking distance_l22: {e}")
+        else: print("CuPy distance_l22 benchmark skipped.")
+
+        # --- CuPy Cosine Distance (distance_cosine2) ---
+        if cupy_device_ok:
+            try:
+                start_event = cp.cuda.Event(); end_event = cp.cuda.Event()
+                cp.cuda.Stream.null.synchronize(); start_event.record()
+                for r in range(NUM_RUNS): _ = distance_cosine2(X_queries_cp, A_data_cp) # Uses corrected func
+                end_event.record(); end_event.synchronize()
+                avg_time = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
+                print(f"CuPy distance_cosine2 Avg Time:       {avg_time:.6f} seconds")
+                results[Dim]['dist_cos_cupy'] = avg_time
             except NameError: print("distance_cosine2 not defined, skipping benchmark.")
-            except ValueError as e: print(f"ValueError benchmarking distance_cosine2 (check if pairwise): {e}")
             except Exception as e: print(f"Error benchmarking distance_cosine2: {e}")
         else: print("CuPy distance_cosine2 benchmark skipped.")
 
         # --- CuPy Manhattan Distance (distance_manhattan2) ---
-        if cupy_device_ok and A_data_cp is not None:
+        if cupy_device_ok:
             try:
-                start_event = cp.cuda.Event()
-                end_event = cp.cuda.Event()
-                cp.cuda.Stream.null.synchronize()
-                start_event.record()
-                for r in range(NUM_RUNS):
-                    _ = distance_manhattan2(X_queries_cp, A_data_cp) # Assuming exists & pairwise
-                end_event.record()
-                end_event.synchronize()
-                avg_time_man_cp = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
-                print(f"CuPy distance_manhattan2 Avg Time:    {avg_time_man_cp:.6f} seconds")
-                results[Dim]['dist_man_cupy'] = avg_time_man_cp
+                start_event = cp.cuda.Event(); end_event = cp.cuda.Event()
+                cp.cuda.Stream.null.synchronize(); start_event.record()
+                for r in range(NUM_RUNS): _ = distance_manhattan2(X_queries_cp, A_data_cp) # Uses corrected func
+                end_event.record(); end_event.synchronize()
+                avg_time = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
+                # Check if result indicates OOM
+                if cp.isinf(avg_time): print("CuPy distance_manhattan2 OOM occurred during benchmark runs.")
+                else: print(f"CuPy distance_manhattan2 Avg Time:     {avg_time:.6f} seconds")
+                results[Dim]['dist_man_cupy'] = avg_time
             except NameError: print("distance_manhattan2 not defined, skipping benchmark.")
-            except ValueError as e: print(f"ValueError benchmarking distance_manhattan2 (check if pairwise): {e}")
             except Exception as e: print(f"Error benchmarking distance_manhattan2: {e}")
         else: print("CuPy distance_manhattan2 benchmark skipped.")
 
@@ -939,118 +1000,88 @@ if __name__ == "__main__":
 
         # --- Triton/PyTorch KNN (our_knn) ---
         try:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize()
-            start_event.record()
-            for r in range(NUM_RUNS):
-                knn_indices_torch, _ = our_knn(N_data, Dim, A_data, X_queries, K_val)
-            end_event.record()
-            torch.cuda.synchronize()
-            avg_time_knn_torch = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
-            qps_knn_torch = N_queries / avg_time_knn_torch if avg_time_knn_torch > 0 else 0
-            print(f"Triton/Torch our_knn Avg Time:           {avg_time_knn_torch:.6f} seconds ({qps_knn_torch:.2f} QPS)")
-            results[Dim]['knn_torch'] = avg_time_knn_torch
+            start_event = torch.cuda.Event(enable_timing=True); end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize(); start_event.record()
+            for r in range(NUM_RUNS): knn_indices_torch, _ = our_knn(N_data, Dim, A_data, X_queries, K_val)
+            end_event.record(); torch.cuda.synchronize()
+            avg_time = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
+            qps = N_queries / avg_time if avg_time > 0 else 0
+            print(f"Triton/Torch our_knn Avg Time:           {avg_time:.6f} seconds ({qps:.2f} QPS)")
+            results[Dim]['knn_torch'] = avg_time
         except NameError: print("our_knn (Triton/Torch) not defined, skipping benchmark.")
         except Exception as e: print(f"Error benchmarking our_knn (Triton/Torch): {e}")
 
         # --- CuPy Hierarchy KNN (our_knn_hierachy - Looped) ---
-        if cupy_device_ok and A_data_cp is not None:
+        if cupy_device_ok:
             try:
-                start_event = cp.cuda.Event()
-                end_event = cp.cuda.Event()
+                start_event = cp.cuda.Event(); end_event = cp.cuda.Event()
                 times = []
-                # Time the whole loop including Python overhead NUM_RUNS times
                 for r in range(NUM_RUNS):
-                    all_knn_indices_hier = [None] * N_queries # Optional preallocation
-                    cp.cuda.Stream.null.synchronize() # Sync before starting timer for this run
-                    start_event.record()
+                    all_knn_indices_hier = [None] * N_queries
+                    cp.cuda.Stream.null.synchronize(); start_event.record()
                     for i in range(N_queries):
-                        query_vector_cp = X_queries_cp[i] # Shape (D,)
+                        query_vector_cp = X_queries_cp[i]
                         knn_indices_cp_hier = our_knn_hierachy(N_data, Dim, A_data_cp, query_vector_cp, K_val)
-                        # Storing results adds overhead, can comment out for pure timing
-                        # all_knn_indices_hier[i] = knn_indices_cp_hier
-                    end_event.record()
-                    end_event.synchronize() # Wait for all GPU ops in the loop for this run
+                        # all_knn_indices_hier[i] = knn_indices_cp_hier # Storing adds overhead
+                    end_event.record(); end_event.synchronize()
                     times.append(cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0)
-                avg_time_hier = sum(times) / NUM_RUNS
-                qps_hier = N_queries / avg_time_hier if avg_time_hier > 0 else 0
-                print(f"CuPy our_knn_hierachy (Looped) Avg Time: {avg_time_hier:.6f} seconds ({qps_hier:.2f} QPS)")
-                results[Dim]['knn_hier_cupy'] = avg_time_hier
+                avg_time = sum(times) / NUM_RUNS
+                qps = N_queries / avg_time if avg_time > 0 else 0
+                print(f"CuPy our_knn_hierachy (Looped) Avg Time: {avg_time:.6f} seconds ({qps:.2f} QPS)")
+                results[Dim]['knn_hier_cupy'] = avg_time
             except NameError: print("our_knn_hierachy not defined, skipping benchmark.")
             except Exception as e: print(f"Error benchmarking our_knn_hierachy: {e}")
         else: print("CuPy our_knn_hierachy benchmark skipped.")
 
         # --- CuPy Stream KNN (our_knn_stream) ---
-        if cupy_device_ok and A_data_cp is not None:
+        if cupy_device_ok:
             try:
-                start_event = cp.cuda.Event()
-                end_event = cp.cuda.Event()
-                times = []
-                cp.cuda.Stream.null.synchronize() # Sync before starting timer
-                start_event.record()
+                start_event = cp.cuda.Event(); end_event = cp.cuda.Event()
+                cp.cuda.Stream.null.synchronize(); start_event.record()
                 for r in range(NUM_RUNS):
                     knn_indices_stream = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val)
-                    # Assuming our_knn_stream synchronizes internally before returning
-                end_event.record()
-                end_event.synchronize() # Sync after all runs
-                avg_time_stream = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
-                qps_stream = N_queries / avg_time_stream if avg_time_stream > 0 else 0
-                print(f"CuPy our_knn_stream Avg Time:          {avg_time_stream:.6f} seconds ({qps_stream:.2f} QPS)")
-                results[Dim]['knn_stream_cupy'] = avg_time_stream
+                end_event.record(); end_event.synchronize()
+                avg_time = (cp.cuda.get_elapsed_time(start_event, end_event) / 1000.0) / NUM_RUNS
+                qps = N_queries / avg_time if avg_time > 0 else 0
+                print(f"CuPy our_knn_stream Avg Time:          {avg_time:.6f} seconds ({qps:.2f} QPS)")
+                results[Dim]['knn_stream_cupy'] = avg_time
             except NameError: print("our_knn_stream not defined, skipping benchmark.")
             except Exception as e: print(f"Error benchmarking our_knn_stream: {e}")
         else: print("CuPy our_knn_stream benchmark skipped.")
 
-
         print(f"\n--- Finished Benchmarks for Dimension D = {Dim} ---")
         # Clean up GPU memory
         del A_data, X_queries
-        if cupy_device_ok and A_data_cp is not None: del A_data_cp, X_queries_cp
+        if cupy_device_ok: del A_data_cp, X_queries_cp
         torch.cuda.empty_cache()
         if cupy_device_ok: cp.get_default_memory_pool().free_all_blocks()
 
+    print("\n" + "#"*70); print("# ALL DIMENSION BENCHMARKS FINISHED"); print("#"*70)
 
-    print("\n" + "#"*70)
-    print("# ALL DIMENSION BENCHMARKS FINISHED")
-    print("#"*70)
-
-    # --- Optional: Print Summary Table ---
+    # --- Print Summary Table ---
     print("\nBenchmark Summary (Average Times in Seconds):")
+    # ... (Summary table printing logic as before) ...
     print("-" * 150) # Adjust width maybe
     header = f"{'Dim':<6}"
-    # Dynamically build header based on actual results collected
     col_order = [ # Define preferred column order
-        'dist_l2_torch', 'dist_cos_torch', 'dist_man_torch',
-        'dist_l2_cupy', 'dist_cos_cupy', 'dist_man_cupy',
+        'dist_dot_torch', 'dist_l2_torch', 'dist_cos_torch', 'dist_man_torch',
+        'dist_dot_cupy', 'dist_l2_cupy', 'dist_cos_cupy', 'dist_man_cupy',
         'knn_torch', 'knn_hier_cupy', 'knn_stream_cupy'
     ]
-    present_cols = set()
-    for d in results:
-        present_cols.update(results[d].keys())
-
-    # Filter and order columns based on presence and preference
+    present_cols = set();
+    for d in results: present_cols.update(results[d].keys())
     final_cols = [col for col in col_order if col in present_cols]
-    for col in sorted(present_cols): # Add any other columns found that weren't in col_order
-        if col not in final_cols:
-            final_cols.append(col)
-
-    # Create header string
-    for col_key in final_cols:
-         header += f"{col_key:<25}" # Adjust spacing as needed
-    print(header)
-    print("-" * 150)
-
+    for col in sorted(present_cols):
+        if col not in final_cols: final_cols.append(col)
+    for col_key in final_cols: header += f"{col_key:<25}"
+    print(header); print("-" * 150)
     for Dim in dimensions_to_test:
         if Dim in results:
-            r = results[Dim]
-            row = f"{Dim:<6}"
-            for col_key in final_cols:
-                 row += f"{r.get(col_key, -1.0):<25.6f}"
-            print(row.replace('-1.000000', '        N/A            ')) # Basic formatting for missing results
+            r = results[Dim]; row = f"{Dim:<6}"
+            for col_key in final_cols: row += f"{r.get(col_key, -1.0):<25.6f}"
+            print(row.replace('-1.000000', '        N/A            '))
         else:
-            # Print dimension skipped row
-            row = f"{Dim:<6}"
+            row = f"{Dim:<6}";
             for _ in final_cols: row += f"{'Skipped':<25}"
             print(row)
     print("-" * 150)
