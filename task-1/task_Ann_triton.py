@@ -297,7 +297,7 @@ if __name__ == "__main__":
     kmeans_max_iters = 50 # Fewer iters to speed up testing
 
     # --- Dimensions to Test ---
-    dimensions_to_test = [16,16,32,2,2,4, 64, 256, 1024] # Focus on larger dimensions
+    dimensions_to_test = [16,16,32,2,2,4, 4, 64, 64,256, 256,1024, 1024] # Focus on larger dimensions
 
     print(f"--- Triton/PyTorch EXECUTION (AUTOTUNED KMEANS) ---")
     print(f"Fixed Params: N={N_data}, Q={N_queries_new}, k_clusters={num_clusters_for_kmeans}, K1={K1_probe}, K2={K2_final}")
