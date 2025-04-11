@@ -1213,7 +1213,7 @@ if __name__ == "__main__":
 # --- Example Usage ---
 if __name__ == "__main__":
     # --- Parameters ---
-    N_data = 100000
+    N_data = 1000000
     Dim = 128
     # N_queries will be set below
     num_clusters_for_kmeans = 10000
@@ -1250,7 +1250,7 @@ if __name__ == "__main__":
     except Exception as e: print(f"Error during initial KMeans build: {e}"); exit()
 
     # --- Generate 20000 NEW Queries ---
-    N_queries_new = 20000 # <--- Set desired number of new queries
+    N_queries_new = 200000 # <--- Set desired number of new queries
     print("\n" + "="*40); print(f"Generating {N_queries_new} NEW Test Queries..."); print("="*40)
     try:
         X_queries_cp_new = cp.random.randn(N_queries_new, Dim, dtype=cp.float32)
