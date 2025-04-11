@@ -212,9 +212,9 @@ def our_ann_user_pseudocode_impl_l2_cpu(N_A, D, A_np, X_np, k_clusters, K1, K2,
 # ============================================================================
 if __name__ == "__main__":
     # --- Parameters ---
-    N_data = 100000 # Smaller dataset for reasonable CPU KMeans time
-    Dim = 128      # Smaller dimension
-    N_queries = 1000 # Fewer queries
+    N_data = 1000000 # Smaller dataset for reasonable CPU KMeans time
+    Dim = 1024      # Smaller dimension
+    N_queries = 10000 # Fewer queries
     num_clusters_for_kmeans = 100 # Fewer clusters
     K1_probe = 30
     K2_final = 10
