@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 import time
 import json
+import cupy as cp
 # from test import testdata_kmeans, testdata_knn, testdata_ann # Assuming this exists if needed
 import csv
 import os
@@ -58,7 +59,6 @@ def dot_kernel_pairwise(
         tl.store(Out_ptr + out_offset, dot_prod)
 
 
-# --- SimpleRetriever (for reference) ---
 class SimpleRetriever:
     """
     A basic retriever using dense embeddings and dot-product similarity
@@ -171,7 +171,6 @@ class SimpleRetriever:
         return batch_results
 
 
-# --- Reworked TritonKnnRetriever ---
 class TritonKnnRetriever:
     """
     A retriever using dense embeddings and Triton for dot-product similarity,
@@ -567,92 +566,243 @@ class TritonKnnRetriever:
         except Exception as e:
             logging.error(f"Unexpected error during TritonKnnRetriever.batch_retrieve: {e}", exc_info=True)
             return [[] for _ in ks] # Return empty lists matching ks length on error
+class SimpleRetriever2:
+    """
+    A basic retriever using dense embeddings and dot-product similarity,
+    optimized with CuPy for GPU acceleration. Implements the SimpleRetriever interface.
+    """
+    def __init__(self, doc_embeddings: np.ndarray, documents: List[str]):
+        """
+        Initializes the retriever, moves document embeddings to GPU via CuPy.
 
-'''
-# --- Example Usage (Optional - uncomment to run) ---
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO) # Ensure logging is configured
-    logging.getLogger().setLevel(logging.INFO) # Set root logger level if needed
+        Args:
+            doc_embeddings: A NumPy array of shape (num_docs, embedding_dim)
+                            containing the precomputed document embeddings (CPU).
+            documents: A list of strings, where each string is the text
+                       content of a document, corresponding to the embeddings (CPU).
+        """
+        if doc_embeddings.dtype != np.float32:
+             logging.warning(f"Input doc_embeddings dtype is {doc_embeddings.dtype}, converting to float32 for CuPy.")
+             doc_embeddings = doc_embeddings.astype(np.float32)
 
-    # Example Data
-    num_docs = 5000
-    embedding_dim = 768 # Example dimension
-    # Ensure documents list matches num_docs
-    example_docs = [f"This is document content {i}" for i in range(num_docs)]
-    # Use float32 as standard for embeddings
-    example_embeddings_np = np.random.rand(num_docs, embedding_dim).astype(np.float32)
+        try:
+            # Move document embeddings to the current CuPy device
+            self.doc_embeddings_cp = cp.asarray(doc_embeddings)
+            logging.info(f"Moved document embeddings ({doc_embeddings.shape}) to CuPy device.")
+        except Exception as e:
+            logging.error(f"Failed to move document embeddings to CuPy device: {e}", exc_info=True)
+            raise
 
-    print("\n--- Initializing SimpleRetriever ---")
-    simple_retriever = SimpleRetriever(doc_embeddings=example_embeddings_np.copy(), documents=example_docs) # Use copy for safety
+        # Keep documents on CPU as a Python list for easy indexing later
+        self.documents = documents
+        self.N_A = self.doc_embeddings_cp.shape[0] # Number of documents
+        self.D = self.doc_embeddings_cp.shape[1]   # Embedding dimension
+        logging.info(f"Initialized SimpleRetriever2 with {self.N_A} documents (Dim={self.D}). Embeddings on GPU (CuPy).")
 
-    print("\n--- Initializing TritonKnnRetriever ---")
-    print("(Includes moving embeddings to device and potential warm-up)...")
-    start_init = time.time()
-    triton_retriever = TritonKnnRetriever(doc_embeddings=example_embeddings_np, documents=example_docs)
-    end_init = time.time()
-    print(f"TritonKnnRetriever Initialization took {end_init - start_init:.4f} seconds.")
+    def distance_cosine(self, X, Y, epsilon=1e-8):
+   
+        X_cp = cp.asarray(X)
+        Y_cp = cp.asarray(Y)
+        print(f"Calculating pairwise Cosine for shapes: {X_cp.shape} and {Y_cp.shape}")
 
-    # Example Queries
-    num_queries = 10
-    example_queries_np = np.random.rand(num_queries, embedding_dim).astype(np.float32)
-    example_single_query_np = np.random.rand(embedding_dim).astype(np.float32)
-    example_ks = [np.random.randint(1, 11) for _ in range(num_queries)] # Variable k, e.g., 1 to 10
-    single_k = 5
+        dot_products = X_cp @ Y_cp.T
 
-    # --- Test Single Retrieve ---
-    print(f"\n--- Testing retrieve (single query, k={single_k}) ---")
+        norm_X = cp.linalg.norm(X_cp, axis=1, keepdims=True)
+        norm_Y = cp.linalg.norm(Y_cp, axis=1, keepdims=True)
 
-    start_simple_single = time.time()
-    results_simple_single = simple_retriever.retrieve(example_single_query_np, k=single_k)
-    end_simple_single = time.time()
-    print(f"SimpleRetriever Single Time: {end_simple_single - start_simple_single:.6f}s")
-    print(f"SimpleRetriever Single Result Type: {type(results_simple_single)}, Length: {len(results_simple_single)}")
-    # print("SimpleRetriever Sample:", results_simple_single[0] if results_simple_single else "N/A")
+        norm_product = norm_X @ norm_Y.T
 
-    start_triton_single = time.time()
-    results_triton_single = triton_retriever.retrieve(example_single_query_np, k=single_k)
-    end_triton_single = time.time()
-    print(f"TritonRetriever Single Time: {end_triton_single - start_triton_single:.6f}s")
-    print(f"TritonRetriever Single Result Type: {type(results_triton_single)}, Length: {len(results_triton_single)}")
-    # print("TritonRetriever Sample:", results_triton_single[0] if results_triton_single else "N/A")
+        cosine_similarity = dot_products / (norm_product + epsilon)
 
-    # Optional: Check if results match (allow for floating point differences in order)
-    # print("Single Results Match (set comparison):", set(results_simple_single) == set(results_triton_single))
+        cosine_similarity = cp.clip(cosine_similarity, -1.0, 1.0)
 
-    # --- Test Batch Retrieve ---
-    print(f"\n--- Testing batch_retrieve (batch_size={num_queries}, variable k={example_ks[:3]}...) ---")
+        return cosine_similarity
 
-    start_simple_batch = time.time()
-    results_simple_batch = simple_retriever.batch_retrieve(example_queries_np, ks=example_ks)
-    end_simple_batch = time.time()
-    print(f"SimpleRetriever Batch Time: {end_simple_batch - start_simple_batch:.6f}s")
-    print(f"SimpleRetriever Batch Result Type: {type(results_simple_batch)}, Length: {len(results_simple_batch)}")
-    print(f"SimpleRetriever Batch Inner Lengths (first 3): {[len(r) for r in results_simple_batch[:3]]}")
-    # print("SimpleRetriever Sample:", results_simple_batch[0][0] if results_simple_batch and results_simple_batch[0] else "N/A")
+    # --- SimpleRetriever Interface Methods ---
+
+    def retrieve(self, query_emb: np.ndarray, k: int = 2) -> List[str]:
+        """
+        Retrieve top-k documents for a single query embedding using dot-product with CuPy.
+
+        Args:
+            query_emb: A 1D NumPy array representing the query embedding (shape: embedding_dim).
+            k: The number of top documents to retrieve.
+
+        Returns:
+            A list containing the text of the top-k documents. Returns empty list on error.
+        """
+        start_time = time.time()
+
+        # --- Input Validation ---
+        if not isinstance(query_emb, np.ndarray):
+             logging.error(f"SimpleRetriever2.retrieve expects query_emb as NumPy array, got {type(query_emb)}")
+             return []
+        if query_emb.ndim == 2 and query_emb.shape[0] == 1:
+             query_emb = query_emb.flatten() # Allow (1, dim)
+             logging.debug("Flattened input query_emb with shape (1, dim) to 1D.")
+        elif query_emb.ndim != 1:
+             logging.error(f"SimpleRetriever2.retrieve expects a 1D query embedding or (1, dim), got shape {query_emb.shape}")
+             return []
+        if query_emb.shape[0] != self.D:
+            logging.error(f"Query embedding dimension ({query_emb.shape[0]}) does not match document embedding dimension ({self.D})")
+            return []
+
+        # Ensure k is valid
+        actual_k = min(k, self.N_A)
+        if actual_k <= 0:
+            logging.warning(f"Requested k={k} results in actual_k={actual_k}. Returning empty list.")
+            return []
+
+        try:
+            # 1. Convert query to CuPy and ensure float32, shape (1, D)
+            if query_emb.dtype != np.float32:
+                 query_emb = query_emb.astype(np.float32)
+            query_cp = cp.asarray(query_emb).reshape(1, self.D)
+
+            # 2. Calculate dot products (scores) on GPU
+            # Input: (1, D), (N, D) -> Output: (1, N)
+            scores_cp = self.distance_cosine(query_cp, self.doc_embeddings_cp)
+            scores_1d_cp = scores_cp[0] # Shape (N,)
+
+            # 3. Find top K indices on GPU
+            # Use argpartition to find the top K candidates efficiently
+            # Partitioning based on scores; we want the largest `actual_k` scores.
+            k_indices_unsorted = cp.argpartition(scores_1d_cp, self.N_A - actual_k)[-actual_k:]
+
+            # Get the scores for only these candidates
+            k_scores_unsorted = scores_1d_cp[k_indices_unsorted]
+
+            # Sort just these K candidates by score (descending)
+            sorted_order_in_k = cp.argsort(-k_scores_unsorted) # Negative scores for descending sort
+            top_k_indices_cp = k_indices_unsorted[sorted_order_in_k] # Final top K indices on GPU
+
+            # 4. Transfer indices to CPU
+            top_k_indices_np = top_k_indices_cp.get() # CuPy -> NumPy (CPU)
+
+            # 5. Retrieve documents from CPU list
+            retrieved_docs = [self.documents[i] for i in top_k_indices_np]
+
+            end_time = time.time()
+            logging.debug(f"SimpleRetriever2.retrieve took {end_time - start_time:.6f}s")
+            return retrieved_docs
+
+        except Exception as e:
+            logging.error(f"Error during SimpleRetriever2.retrieve: {e}", exc_info=True)
+            return []
 
 
-    start_triton_batch = time.time()
-    results_triton_batch = triton_retriever.batch_retrieve(example_queries_np, ks=example_ks)
-    end_triton_batch = time.time()
-    print(f"TritonRetriever Batch Time: {end_triton_batch - start_triton_batch:.6f}s")
-    print(f"TritonRetriever Batch Result Type: {type(results_triton_batch)}, Length: {len(results_triton_batch)}")
-    print(f"TritonRetriever Batch Inner Lengths (first 3): {[len(r) for r in results_triton_batch[:3]]}")
-    # print("TritonRetriever Sample:", results_triton_batch[0][0] if results_triton_batch and results_triton_batch[0] else "N/A")
+    def batch_retrieve(self, query_embeddings: np.ndarray, ks: List[int]) -> List[List[str]]:
+        """
+        Retrieve top-k documents for a batch of query embeddings using CuPy dot product
+        and handling variable k per query.
 
-    # Optional: Check if batch results match
-    # match = True
-    # if len(results_simple_batch) == len(results_triton_batch):
-    #     for i in range(len(results_simple_batch)):
-    #         if set(results_simple_batch[i]) != set(results_triton_batch[i]):
-    #             match = False
-    #             print(f"Mismatch at index {i}")
-    #             # print(" Simple:", results_simple_batch[i])
-    #             # print(" Triton:", results_triton_batch[i])
-    #             break
-    # else:
-    #     match = False
-    # print("Batch Results Match (set comparison per query):", match)
+        Args:
+            query_embeddings: A NumPy array of query embeddings
+                              (shape: batch_size, embedding_dim).
+            ks: A list of integers, where each element is the 'k' value
+                for the corresponding query in the batch.
 
-    # Verify k values were respected
-    print("Batch Results Lengths Match Requested Ks:", all(len(results_triton_batch[i]) == example_ks[i] for i in range(num_queries) if example_ks[i]>0))
-'''
+        Returns:
+            A list of lists, where each inner list contains the text of the
+            top-k documents for the corresponding query.
+        """
+        start_time = time.time()
+        batch_size = query_embeddings.shape[0]
+
+        # --- Input Validation ---
+        if not isinstance(query_embeddings, np.ndarray):
+             logging.error(f"SimpleRetriever2.batch_retrieve expects query_embeddings as NumPy array, got {type(query_embeddings)}")
+             return [[] for _ in ks]
+        if query_embeddings.ndim != 2:
+             logging.error(f"SimpleRetriever2.batch_retrieve expects a 2D query_embeddings array, got {query_embeddings.ndim} dimensions.")
+             return [[] for _ in ks]
+        if batch_size == 0:
+             logging.info("Received empty batch of queries.")
+             return []
+        if not isinstance(ks, list) or batch_size != len(ks):
+            logging.error(f"Batch retrieve size mismatch: {batch_size} embeddings vs {len(ks)} k values.")
+            return [[] for _ in range(batch_size)] # Match query batch size on error
+        if query_embeddings.shape[1] != self.D:
+            logging.error(f"Batch query embedding dimension ({query_embeddings.shape[1]}) does not match document embedding dimension ({self.D})")
+            return [[] for _ in ks]
+        if not all(isinstance(k_val, int) for k_val in ks):
+             logging.error(f"List ks must contain only integers.")
+             return [[] for _ in ks]
+
+        # Determine max_k needed, ensuring it's valid
+        valid_ks = [k_val for k_val in ks if k_val > 0]
+        if not valid_ks:
+            logging.warning("All k values in ks are non-positive. Returning list of empty lists.")
+            return [[] for _ in ks]
+        max_k = max(valid_ks)
+        max_k = min(max_k, self.N_A) # Clamp max_k to number of documents
+        if max_k <= 0: # Should only happen if N_A is 0 or max(valid_ks) was 0 initially
+             return [[] for _ in ks]
+
+        try:
+            # 1. Convert query batch to CuPy and ensure float32
+            if query_embeddings.dtype != np.float32:
+                 query_embeddings = query_embeddings.astype(np.float32)
+            queries_cp = cp.asarray(query_embeddings) # Shape (batch_size, D)
+
+            # 2. Calculate all dot products (scores) on GPU in one go
+            # Input: (batch_size, D), (N, D) -> Output: (batch_size, N)
+            all_scores_cp = self._distance_dot(queries_cp, self.doc_embeddings_cp)
+
+            # 3. Find top max_k indices for all queries on GPU
+            # Allocate space for results (indices and their scores for sorting)
+            top_max_k_indices_cp = cp.empty((batch_size, max_k), dtype=cp.int64)
+            # We could try to optimize this part further if needed, but a loop
+            # with argpartition + argsort per row is feasible for moderate batch sizes.
+            # CuPy lacks a direct batch topk equivalent like torch.topk across a specific dim easily.
+            for i in range(batch_size):
+                 scores_1d_cp = all_scores_cp[i]
+                 # Handle cases where N_A < max_k properly with argpartition
+                 k_for_partition = min(max_k, self.N_A) # Number of elements to find
+                 if k_for_partition == 0: continue # Skip if no neighbors possible
+
+                 # Partition to find top k_for_partition elements (indices)
+                 k_indices_unsorted = cp.argpartition(scores_1d_cp, self.N_A - k_for_partition)[-k_for_partition:]
+                 # Get scores for these elements
+                 k_scores_unsorted = scores_1d_cp[k_indices_unsorted]
+                 # Sort these k_for_partition elements by score (descending)
+                 sorted_order_in_k = cp.argsort(-k_scores_unsorted)
+                 # Get final sorted indices for this row
+                 final_indices_row = k_indices_unsorted[sorted_order_in_k]
+                 # Store in the result array (handle cases where actual found < max_k if N_A < max_k)
+                 len_found = final_indices_row.shape[0]
+                 top_max_k_indices_cp[i, :len_found] = final_indices_row
+                 if len_found < max_k:
+                     # Pad with -1 if fewer than max_k elements exist (e.g., N_A < max_k)
+                     top_max_k_indices_cp[i, len_found:] = -1
+
+
+            # 4. Transfer all top max_k indices to CPU
+            top_max_k_indices_np = top_max_k_indices_cp.get() # (batch_size, max_k) NumPy array
+
+            # 5. Slice results per query and retrieve documents on CPU
+            batch_results = []
+            for i in range(batch_size):
+                k_i = ks[i]
+                if k_i <= 0:
+                    batch_results.append([])
+                    continue
+
+                # Get indices for this query (up to max_k)
+                query_indices_np = top_max_k_indices_np[i]
+                # Filter out any potential -1 padding and slice to k_i
+                valid_query_indices = query_indices_np[query_indices_np >= 0][:k_i]
+
+                # Retrieve documents using CPU indices
+                retrieved_docs = [self.documents[idx] for idx in valid_query_indices]
+                batch_results.append(retrieved_docs)
+
+            end_time = time.time()
+            logging.debug(f"SimpleRetriever2.batch_retrieve took {end_time - start_time:.6f}s")
+            return batch_results
+
+        except Exception as e:
+            logging.error(f"Error during SimpleRetriever2.batch_retrieve: {e}", exc_info=True)
+            # Return empty lists matching ks length on error
+            return [[] for _ in ks]
+
