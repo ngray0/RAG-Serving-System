@@ -937,6 +937,7 @@ def our_ann_user_pseudocode_impl(N_A, D, A_cp, X_cp, k_clusters, K1, K2, max_kme
 # ============================================================================
 # Example Usage (for the user's pseudocode implementation)
 # ============================================================================
+'''
 if __name__ == "__main__":
     # --- (Setup code: check cupy, set params, generate data A_cp, X_queries_cp) ---
     # ... (previous setup code remains the same) ...
@@ -1059,6 +1060,147 @@ if __name__ == "__main__":
          print("\nCannot calculate recall: ANN results are not available.")
 
 
+'''
+# --- Example Usage ---
+if __name__ == "__main__":
+    # ... (Ensure imports and definitions of helper functions like our_kmeans, pairwise_l2_squared_cupy) ...
+    # (Assume previous definitions of our_kmeans and pairwise_l2_squared_cupy are present)
+    
+    # --- Parameters ---
+    N_data = 10000000
+    Dim = 1024 # Keep same dimension as previous run
+    N_queries = 10000
+    num_clusters_for_kmeans = 500 # Target number for KMeans
+    K1_probe = 200                # K1: Probe nearest 50 centroids
+    K2_final = 150                # K2: Final desired number of nearest centroids
+
+    # --- Check CuPy ---
+    try:
+        cp.cuda.Device(0).use()
+        cupy_device_ok = True
+    except cp.cuda.runtime.CUDARuntimeError:
+        cupy_device_ok = False
+    if not cupy_device_ok: print("CuPy device not available."); exit()
+
+    # --- Generate Base Data ---
+    print("="*40); print("Generating Base Data (A_cp)..."); print("="*40)
+    try:
+        A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
+        print(f"Database shape: {A_data_cp.shape}")
+    except Exception as e: print(f"Error generating A_data_cp: {e}"); exit()
+
+    # --- Build Index ONCE ---
+    print("\n" + "="*40); print("Building Centroids via KMeans (Run Once)..."); print("="*40)
+    initial_centroids_cp = None
+    actual_k_clusters = 0
+    build_time_actual = 0
+    try:
+        build_start_actual = time.time()
+        initial_centroids_cp, _ = our_kmeans(N_data, Dim, A_data_cp, num_clusters_for_kmeans, max_iters=50)
+        if initial_centroids_cp.dtype != cp.float32: initial_centroids_cp = initial_centroids_cp.astype(cp.float32)
+        actual_k_clusters = initial_centroids_cp.shape[0]
+        build_time_actual = time.time() - build_start_actual
+        if actual_k_clusters == 0: raise ValueError("KMeans returned 0 centroids.")
+        print(f"KMeans completed. Found {actual_k_clusters} centroids.")
+        print(f"Actual Build Time: {build_time_actual:.4f}s")
+    except Exception as e:
+        print(f"Error during initial KMeans build: {e}"); exit()
+
+    # --- Generate NEW Queries ---
+    print("\n" + "="*40); print(f"Generating {N_queries} NEW Test Queries..."); print("="*40)
+    try:
+        X_queries_cp_new = cp.random.randn(N_queries, Dim, dtype=cp.float32)
+        print(f"New query shape: {X_queries_cp_new.shape}")
+    except Exception as e: print(f"Error generating new queries: {e}"); exit()
+
+    # --- Run ANN Search with NEW Queries and Prebuilt Centroids ---
+    print("\n" + "="*40)
+    print(f"Testing our_ann_user_pseudocode_impl with NEW queries...")
+    # Adjust K1/K2 based on actual cluster count for the run
+    k1_run = min(K1_probe, actual_k_clusters)
+    k2_run = min(K2_final, k1_run)
+    print(f"(Using {actual_k_clusters} centroids, K1={k1_run}, K2={k2_run})")
+    print("="*40)
+    ann_indices_centroids = None
+    ann_dists_centroids = None
+    centroids_used = None
+    search_t = 0
+    try:
+        # Call the modified function, passing precomputed centroids
+        ann_indices_centroids, ann_dists_centroids, centroids_used, build_t_ignored, search_t = our_ann_user_pseudocode_impl(
+            N_A=N_data, D=Dim, A_cp=A_data_cp, # Pass A_cp only needed if building index inside
+            X_cp=X_queries_cp_new,             # Use NEW queries
+            k_clusters=actual_k_clusters,      # Pass actual count (won't be used if centroids provided)
+            K1=k1_run,                         # Use adjusted K1
+            K2=k2_run,                         # Use adjusted K2
+            centroids_cp=initial_centroids_cp  # Pass precomputed centroids
+        )
+        print("User Pseudocode ANN results shape (Centroid Indices):", ann_indices_centroids.shape)
+        print("User Pseudocode ANN results shape (Squared Distances to Centroids):", ann_dists_centroids.shape)
+        # Build time reported by function will be 0 here
+        print(f"User Pseudocode ANN Search Time (New Queries): {search_t:.4f}s")
+        if search_t > 0:
+             print(f"-> Throughput: {N_queries / search_t:.2f} queries/sec")
+
+    except Exception as e:
+        print(f"Error during ANN execution with new queries: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+    # --- Calculate Recall against True Nearest Centroids (for NEW Queries) ---
+    if ann_indices_centroids is not None and centroids_used is not None and centroids_used.shape[0] > 0:
+        print("\n" + "="*40)
+        print("Calculating Recall vs. True Nearest Centroids (for NEW Queries)...")
+        print("="*40)
+
+        K_recall = k2_run # Recall is @K2 (adjusted K2)
+
+        try:
+            # Calculate ground truth: True K2 nearest centroids for the NEW queries
+            print("Calculating ground truth (Brute-force nearest centroids for new queries)...")
+            start_gt = time.time()
+            all_query_centroid_dists_sq_gt = pairwise_l2_squared_cupy(X_queries_cp_new, centroids_used)
+
+            k_recall_adjusted = min(K_recall, actual_k_clusters)
+
+            if k_recall_adjusted > 0:
+                true_knn_centroid_indices = cp.argsort(all_query_centroid_dists_sq_gt, axis=1)[:, :k_recall_adjusted]
+            else:
+                true_knn_centroid_indices = cp.empty((N_queries, 0), dtype=cp.int64)
+
+            cp.cuda.Stream.null.synchronize()
+            print(f"Ground truth calculation time: {time.time() - start_gt:.4f}s")
+
+            # Compare results
+            total_intersect_centroids = 0
+            ann_indices_np = cp.asnumpy(ann_indices_centroids[:, :k_recall_adjusted])
+            true_indices_np = cp.asnumpy(true_knn_centroid_indices)
+
+            for i in range(N_queries):
+                approx_centroid_ids = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                true_centroid_ids = set(true_indices_np[i])
+                total_intersect_centroids += len(approx_centroid_ids.intersection(true_centroid_ids))
+
+            if N_queries > 0 and k_recall_adjusted > 0:
+                avg_recall_centroids = total_intersect_centroids / (N_queries * k_recall_adjusted)
+                print(f"\nAverage Recall @ {k_recall_adjusted} (vs brute-force CENTROIDS on NEW QUERIES): {avg_recall_centroids:.4f} ({avg_recall_centroids:.2%})")
+                # Add commentary based on recall result
+                if avg_recall_centroids == 1.0:
+                    print("Result: 100% recall indicates K1 was large enough to contain the true K2 nearest centroids for all new queries.")
+                else:
+                    print(f"Result: Recall < 100%. The true {k_recall_adjusted} nearest centroids were not always within the initial K1={k1_run} probe set.")
+
+            else:
+                print("\nCannot calculate recall (N_queries=0 or K2=0).")
+
+        except cp.cuda.memory.OutOfMemoryError as e: print(f"OOM Error during recall calculation: {e}")
+        except Exception as e: print(f"Error during recall calculation: {e}"); traceback.print_exc()
+
+    elif centroids_used is None or centroids_used.shape[0] == 0:
+         print("\nCannot calculate recall: Centroids are not available or empty.")
+    else:
+         print("\nCannot calculate recall: ANN results are not available.")
 '''
 if __name__ == "__main__":
     # Ensure CuPy is available
