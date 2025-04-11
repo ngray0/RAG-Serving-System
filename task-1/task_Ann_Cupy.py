@@ -1067,7 +1067,7 @@ if __name__ == "__main__":
     # (Assume previous definitions of our_kmeans and pairwise_l2_squared_cupy are present)
     
     # --- Parameters ---
-    N_data = 10000000
+    N_data = 1000000
     Dim = 1024 # Keep same dimension as previous run
     N_queries = 10000
     num_clusters_for_kmeans = 500 # Target number for KMeans
