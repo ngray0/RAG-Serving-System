@@ -35,7 +35,7 @@ rsync --archive --update --compress --progress ${data_path}/MLS-G31 ${SCRATCH_HO
 
 
 
-COMMAND="python -u task_Ann_triton.py"
+COMMAND="python -u task_Knn.py"
 echo "Running provided command: ${COMMAND}"
 eval "${COMMAND}"
 echo "Command ran successfully!"
