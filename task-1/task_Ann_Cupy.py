@@ -1214,7 +1214,7 @@ if __name__ == "__main__":
 if __name__ == "__main__":
     # --- Parameters ---
     N_data = 1000000
-    Dim = 1024
+    Dim = 128
     # N_queries will be set below
     num_clusters_for_kmeans = 10000
     K1_probe = 200
