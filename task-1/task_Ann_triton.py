@@ -110,19 +110,37 @@ def kmeans_assign_kernel(
     tl.store(assignments_out_ptrs, best_assignment, mask=mask_n)
 
 
-# --- Helper Functions ---
 def _prepare_tensors(*tensors, target_device=device):
+    """
+    Ensure tensors are float32, contiguous, and on the correct device.
+    Modified return to try and satisfy specific unpacking requirement.
+    """
     prepared = []
     for t in tensors:
-        # ... preparation logic ...
-        prepared.append(t.contiguous())
-    # If only one tensor was processed, return it directly
-    if len(prepared) == 1:
-        return prepared[0]
-    # Otherwise, return the list of prepared tensors
-    else:
-        return prepared
+        # --- (Keep the preparation logic inside the loop exactly as provided by user) ---
+        if not isinstance(t, torch.Tensor):
+            try:
+                t = torch.tensor(t, dtype=torch.float32, device=target_device)
+            except Exception as e:
+                raise TypeError(f"Failed to convert input of type {type(t)} to torch.Tensor: {e}")
+        if t.device != target_device:
+            t = t.to(target_device)
+        if t.dtype != torch.float32:
+            t = t.to(dtype=torch.float32)
+        if not t.is_contiguous():
+            t = t.contiguous()
+        # --- (End of preparation logic) ---
+        prepared.append(t) # Append the prepared tensor
 
+    # --- Return Logic ---
+    if len(prepared) == 1:
+        # If only one tensor was passed in, return a TUPLE containing that single tensor
+        # This explicitly creates an iterable of length 1 for the unpacking `var, = ...`
+        return (prepared[0],) # Note the trailing comma to make it a tuple
+    else:
+        # If multiple tensors were passed in, return the list of prepared tensors
+        # (Unpacking `var1, var2 = ...` works correctly with lists/tuples of length > 1)
+        return prepared
 
 # --- Distance Functions (Using Triton Dot Kernel) ---
 def distance_dot_tiled(X, A, N_TILE=32768, prep=True): # Adjusted tile size, needs tuning
