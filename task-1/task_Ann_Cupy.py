@@ -527,7 +527,7 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
      search_time = end_search - start_search
      print(f"ANN search time: {search_time:.4f} seconds")
      return all_indices, all_distances, build_time, search_time # Returns indices and SQUARED L2 distances
-def our_ann_cupy_ivf(N_A, D, A_cp, X_cp, K, k_clusters=100, nprobe=5, max_kmeans_iters=20):
+def our_ann_cupy_ivf(N_A, D, A_cp, X_cp, K, k_clusters=100, nprobe=5, max_kmeans_iters=100):
     """
     Performs Approximate Nearest Neighbor search using KMeans-IVF with CuPy.
 
