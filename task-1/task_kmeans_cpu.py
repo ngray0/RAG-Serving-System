@@ -216,8 +216,8 @@ def our_ann_user_pseudocode_impl_l2_cpu(N_A, D, A_np, X_np, k_clusters, K1, K2,
 
 if __name__ == "__main__":
     # --- Fixed Parameters for all dimension runs ---
-    N_data = 1000000 # Using 1 Million points as requested
-    N_queries = 1000  # Reduced queries for faster testing per dimension
+    N_data = 100000 # Using 1 Million points as requested
+    N_queries = 1  # Reduced queries for faster testing per dimension
     num_clusters_for_kmeans = 100
     K1_probe = 30
     K2_final = 10
@@ -271,7 +271,7 @@ if __name__ == "__main__":
             print(f"Actual Build Time (D={Dim}): {build_time_actual:.4f}s")
         except Exception as e:
             print(f"Error during initial KMeans build (D={Dim}): {e}");
-            traceback.print_exc();
+            traceback.print_exc()
             continue # Skip to the next dimension
 
         # --- Generate NEW Queries (on CPU) for the current dimension ---
