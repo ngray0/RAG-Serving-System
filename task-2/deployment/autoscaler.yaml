@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoscaler-account
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-scaler
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "deployments/scale"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: autoscaler-role-binding
+subjects:
+- kind: ServiceAccount
+  name: autoscaler-account
+roleRef:
+  kind: Role
+  name: deployment-scaler
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-autoscaler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rag-autoscaler
+  template:
+    metadata:
+      labels:
+        app: rag-autoscaler
+    spec:
+      serviceAccountName: autoscaler-account
+      containers:
+      - name: autoscaler
+        image: your-registry/rag-autoscaler:latest  
+        env:
+        - name: REDIS_URL
+          value: "redis://redis-service:6379/0"
+        - name: DEPLOYMENT_NAME
+          value: "rag-service"
+        - name: MIN_REPLICAS
+          value: "1"
+        - name: MAX_REPLICAS
+          value: "4"
+        - name: WAIT_THRESHOLD
+          value: "10.0"
+        - name: QUEUE_SIZE_PER_REPLICA
+          value: "30"
