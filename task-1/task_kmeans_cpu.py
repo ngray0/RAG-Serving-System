@@ -1,7 +1,11 @@
-
 import numpy as np
-import cupy as cp
-import time # For timing within the function
+import time
+import traceback # For error printing
+
+# ============================================================================
+# CPU Helper Function (Pairwise Squared L2 Distance)
+# ============================================================================
+
 def pairwise_l2_squared_numpy(X_np, C_np):
     """
     Computes pairwise **squared** L2 distances using NumPy.
@@ -16,18 +20,15 @@ def pairwise_l2_squared_numpy(X_np, C_np):
     elif C_np.dtype != np.float32: C_np = C_np.astype(np.float32)
 
     # ||x - c||^2 = ||x||^2 - 2<x, c> + ||c||^2
-    # Use einsum for potentially better memory efficiency/speed for sum of squares
     X_norm_sq = np.einsum('ij,ij->i', X_np, X_np)[:, np.newaxis] # Shape (N|Q, 1)
     C_norm_sq = np.einsum('ij,ij->i', C_np, C_np)[np.newaxis, :] # Shape (1, K|N)
-
-    # Dot product using matrix multiplication
     dot_products = np.dot(X_np, C_np.T) # Shape (N|Q, K|N)
-
-    # Broadcasting: (N|Q, 1) - 2*(N|Q, K|N) + (1, K|N) -> (N|Q, K|N)
     dist_sq = X_norm_sq - 2 * dot_products + C_norm_sq
-    # Clamp to avoid small numerical negatives
-    return np.maximum(0.0, dist_sq)
+    return np.maximum(0.0, dist_sq) # Clamp negatives
 
+# ============================================================================
+# CPU KMeans Implementation
+# ============================================================================
 
 def our_kmeans_cpu(N_A, D, A_np, K, max_iters=100, tol=1e-4):
     """
@@ -47,31 +48,18 @@ def our_kmeans_cpu(N_A, D, A_np, K, max_iters=100, tol=1e-4):
             - assignments_np (np.ndarray): Final cluster assignment (N_A,).
     """
     # --- Input Validation ---
-    if not isinstance(A_np, np.ndarray):
-        raise TypeError("Input data 'A_np' must be a NumPy ndarray.")
+    if not isinstance(A_np, np.ndarray): raise TypeError("A_np must be NumPy ndarray.")
     actual_N, actual_D = A_np.shape
-    if actual_N != N_A or actual_D != D:
-        print(f"Warning: N_A/D ({N_A}/{D}) mismatch with A_np shape {A_np.shape}. Using shape from A_np.")
-        N_A, D = actual_N, actual_D
-    if not (K > 0):
-        raise ValueError("K must be positive.")
-    if K > N_A:
-         print(f"Warning: K ({K}) > N_A ({N_A}). Setting K = N_A.")
-         K = N_A
-    if A_np.dtype != np.float32:
-        print(f"Warning: Input data dtype is {A_np.dtype}. Converting to float32.")
-        A_np = A_np.astype(np.float32)
+    if actual_N != N_A or actual_D != D: N_A, D = actual_N, actual_D
+    if not (K > 0): raise ValueError("K must be positive.")
+    if K > N_A: K = N_A
+    if A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
 
-    print(f"Running K-Means (Pure NumPy CPU): N={N_A}, D={D}, K={K}")
+    # print(f"Running K-Means (Pure NumPy CPU): N={N_A}, D={D}, K={K}")
     start_time_total = time.time()
-
-    # Handle K=0 edge case
-    if K == 0:
-         print("Warning: K=0 requested for KMeans. Returning empty centroids.")
-         return np.empty((0, D), dtype=np.float32), np.empty((N_A,), dtype=np.int32)
+    if K == 0: return np.empty((0, D), dtype=np.float32), np.empty((N_A,), dtype=np.int32)
 
     # --- Initialization ---
-    # Randomly choose K unique points from A_np as initial centroids
     initial_indices = np.random.choice(N_A, K, replace=False)
     centroids_np = A_np[initial_indices].copy()
     assignments_np = np.empty(N_A, dtype=np.int32)
@@ -79,117 +67,262 @@ def our_kmeans_cpu(N_A, D, A_np, K, max_iters=100, tol=1e-4):
 
     # --- Iteration Loop ---
     for i in range(max_iters):
-        # Store old centroids for convergence check
         old_centroids_np = centroids_np.copy()
-
-        # --- 1. Assignment Step (NumPy) ---
-        # Calculate distances from all points to all centroids
-        all_dist_sq_np = pairwise_l2_squared_numpy(A_np, centroids_np) # Shape (N_A, K)
-        # Assign each point to the closest centroid
-        assignments_np = np.argmin(all_dist_sq_np, axis=1).astype(np.int32) # Shape (N_A,)
-
-        # --- 2. Update Step (NumPy - Optimized) ---
+        # --- Assignment Step ---
+        all_dist_sq_np = pairwise_l2_squared_numpy(A_np, centroids_np)
+        assignments_np = np.argmin(all_dist_sq_np, axis=1).astype(np.int32)
+        # --- Update Step (Optimized NumPy) ---
         new_sums_np = np.zeros((K, D), dtype=np.float32)
-        # Use np.add.at for efficient scatter-add like summing
-        np.add.at(new_sums_np, assignments_np, A_np)
-
-        # Count points in each cluster efficiently
+        np.add.at(new_sums_np, assignments_np, A_np) # Efficient sum
         cluster_counts_np = np.bincount(assignments_np, minlength=K).astype(np.float32)
-
-        # Avoid division by zero for empty clusters
+        # Avoid division by zero
         empty_cluster_mask = (cluster_counts_np == 0)
-        # Set count to 1 for empty clusters to avoid division error (their sum is 0 anyway)
         final_counts_safe_np = np.maximum(cluster_counts_np, 1.0)
-
-        # Calculate new centroids
-        centroids_np = new_sums_np / final_counts_safe_np[:, np.newaxis] # Broadcast division
-
-        # Handle empty clusters: keep their old position
+        centroids_np = new_sums_np / final_counts_safe_np[:, np.newaxis]
+        # Handle empty clusters
         if np.any(empty_cluster_mask):
             centroids_np[empty_cluster_mask] = old_centroids_np[empty_cluster_mask]
-
-        # Safety check for NaN/inf (shouldn't happen with maximum(1) but good practice)
+        # Handle potential NaN/inf
         if not np.all(np.isfinite(centroids_np)):
-            print(f"Warning: Non-finite values found in centroids at iteration {i+1}. Replacing with old.")
+            # print(f"Warning: Non-finite values found in centroids at iteration {i+1}.")
             centroids_np = np.nan_to_num(centroids_np, nan=old_centroids_np[np.isnan(centroids_np)])
-
-
         # --- Check Convergence ---
         centroid_diff_np = np.linalg.norm(centroids_np - old_centroids_np)
-        # Optional: Print iteration stats
-        # print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff_np:.4f}")
-
         if centroid_diff_np < tol:
-            print(f"Converged after {i+1} iterations.")
+            # print(f"Converged after {i+1} iterations.")
             break
+    # if i == max_iters - 1: print(f"Reached max iterations ({max_iters}).")
+    # print(f"Total CPU K-Means time: {time.time() - start_time_total:.4f}s")
+    return centroids_np, assignments_np.astype(np.int64)
 
-    if i == max_iters - 1:
-        print(f"Reached max iterations ({max_iters}).")
+# ============================================================================
+# CPU ANN Function (User Pseudocode, L2 Version)
+# ============================================================================
+def our_ann_user_pseudocode_impl_l2_cpu(N_A, D, A_np, X_np, k_clusters, K1, K2,
+                                        max_kmeans_iters=100, centroids_np=None):
+    """
+    Implements the user's specific 4-step pseudocode using L2 DISTANCE on the CPU (NumPy).
+    Uses SQUARED L2 internally for optimal neighbor finding speed.
+    Can optionally accept pre-computed centroids.
+    Note: Finds nearest K2 CLUSTER CENTERS based on L2 distance.
 
-    total_time = time.time() - start_time_total
-    print(f"Total CPU K-Means time: {total_time:.4f}s")
+    Args:
+        N_A (int): Number of database points (for KMeans if centroids_np is None).
+        D (int): Dimensionality.
+        A_np (np.ndarray): Database vectors (N_A, D) on CPU (for KMeans if centroids_np is None).
+        X_np (np.ndarray): Query vectors (Q, D) on CPU.
+        k_clusters (int): Target number of clusters for KMeans (if centroids_np is None).
+        K1 (int): Number of nearest cluster centers to initially identify (Step 2).
+        K2 (int): Number of nearest cluster centers to finally return from the K1 set (Step 3/4).
+        max_kmeans_iters (int): Max iterations for K-Means.
+        centroids_np (np.ndarray, optional): Pre-computed centroids (k, D). If provided, KMeans is skipped.
 
-    # Return NumPy arrays
-    return centroids_np, assignments_np.astype(np.int64) # Return int64 assignments if needed downstream
+    Returns:
+        tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+            - topk2_centroid_indices_np (np.ndarray): Indices of the final K2 nearest *centroids* (Q, K2).
+            - topk2_centroid_distances_sq_np (np.ndarray): **SQUARED** L2 distances to these K2 *centroids* (Q, K2).
+            - centroids_used_np (np.ndarray): The actual centroids used.
+            - build_time (float): Time taken for KMeans (0 if centroids_np was provided).
+            - search_time (float): Time taken for the search logic.
+    """
+    # --- Input Validation ---
+    Q = X_np.shape[0]
+    if not isinstance(X_np, np.ndarray): raise TypeError("X_np must be NumPy ndarray.")
+    if X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
+    if X_np.shape[1] != D: raise ValueError(f"Query dimension mismatch: X D={X_np.shape[1]}, expected D={D}")
 
-# --- Example Usage ---
+    build_time = 0.0
+    search_time = 0.0
+    actual_k_clusters = 0
+    centroids_used_np = None
+    final_topk2_centroid_indices_np = None
+    final_topk2_centroid_distances_sq_np = None
+
+    # --- Step 1: Use KMeans or provided centroids ---
+    if centroids_np is None:
+        # print("No precomputed centroids provided. Running CPU Euclidean KMeans...")
+        build_start_time = time.time()
+        if not isinstance(A_np, np.ndarray): raise TypeError("A_np needed for KMeans.")
+        #... (validate A_np)
+        if A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
+        if A_np.shape[1] != D: raise ValueError("A_np dimension mismatch.")
+
+        centroids_used_np, _ = our_kmeans_cpu(N_A, D, A_np, k_clusters, max_iters=max_kmeans_iters)
+        build_time = time.time() - build_start_time
+        # print(f"Build time (CPU KMeans): {build_time:.4f}s")
+    else:
+        # print("Using precomputed centroids.")
+        #... (validate provided centroids_np)
+        if not isinstance(centroids_np, np.ndarray): raise TypeError("Provided centroids invalid type.")
+        if centroids_np.ndim != 2 or centroids_np.shape[1] != D: raise ValueError(f"Provided centroids invalid shape/dim {centroids_np.shape}.")
+        if centroids_np.dtype != np.float32: centroids_np = centroids_np.astype(np.float32)
+        centroids_used_np = centroids_np
+
+    actual_k_clusters = centroids_used_np.shape[0]
+    if actual_k_clusters == 0: # Error handling
+        print("Error: No centroids available. Cannot proceed.")
+        empty_indices = np.full((Q, K2 if K2 > 0 else 1), -1, dtype=np.int64)
+        empty_dists = np.full((Q, K2 if K2 > 0 else 1), np.inf, dtype=np.float32)
+        return empty_indices, empty_dists, np.empty((0,D), dtype=np.float32), build_time, 0.0
+
+    # print(f"Using {actual_k_clusters} centroids for search.")
+    K1 = min(K1, actual_k_clusters); K2 = min(K2, K1)
+    if K1 <= 0 or K2 <= 0: # Error handling
+        print(f"Error: K1 ({K1}) or K2 ({K2}) is non-positive. Cannot proceed.")
+        empty_indices = np.full((Q, K2 if K2 > 0 else 1), -1, dtype=np.int64)
+        empty_dists = np.full((Q, K2 if K2 > 0 else 1), np.inf, dtype=np.float32)
+        return empty_indices, empty_dists, centroids_used_np, build_time, 0.0
+    # print(f"Adjusted params: K1={K1}, K2={K2}")
+
+    # --- Search Phase (Using SQUARED L2 Distance) ---
+    search_start_time = time.time()
+
+    # Calculate all query-centroid SQUARED L2 distances
+    all_query_centroid_dists_sq = pairwise_l2_squared_numpy(X_np, centroids_used_np)
+
+    # Step 2: Find K1 nearest centroids (based on squared L2 distance)
+    k1_partition = min(K1, actual_k_clusters) # np.argpartition takes k, not k-1
+    if K1 >= actual_k_clusters: topk1_centroid_indices = np.argsort(all_query_centroid_dists_sq, axis=1)[:, :K1]
+    else: topk1_centroid_indices = np.argpartition(all_query_centroid_dists_sq, kth=k1_partition-1, axis=1)[:, :K1] # kth is 0-based
+    topk1_centroid_dists_sq = np.take_along_axis(all_query_centroid_dists_sq, topk1_centroid_indices, axis=1)
+
+    # Step 3: Find K2 nearest among K1 (based on squared L2 distance)
+    k2_partition = min(K2, K1)
+    if K2 >= K1: relative_indices_k2 = np.argsort(topk1_centroid_dists_sq, axis=1)[:, :K2]
+    else: relative_indices_k2 = np.argpartition(topk1_centroid_dists_sq, kth=k2_partition-1, axis=1)[:, :K2]
+    topk2_subset_dists_sq = np.take_along_axis(topk1_centroid_dists_sq, relative_indices_k2, axis=1)
+    topk2_centroid_indices_np = np.take_along_axis(topk1_centroid_indices, relative_indices_k2, axis=1)
+
+    # Step 4: Sort final K2 results (based on squared L2 distance)
+    sort_order_k2 = np.argsort(topk2_subset_dists_sq, axis=1)
+    final_topk2_centroid_indices_np = np.take_along_axis(topk2_centroid_indices_np, sort_order_k2, axis=1)
+    final_topk2_centroid_distances_sq_np = np.take_along_axis(topk2_subset_dists_sq, sort_order_k2, axis=1) # SQUARED Distances
+
+    search_time = time.time() - search_start_time
+    # print(f"Search time (User Pseudocode, L2 CPU): {search_time:.4f}s")
+
+    return final_topk2_centroid_indices_np.astype(np.int64), \
+           final_topk2_centroid_distances_sq_np, \
+           centroids_used_np, \
+           build_time, \
+           search_time
+
+# ============================================================================
+# Main Execution Block (CPU ONLY)
+# ============================================================================
 if __name__ == "__main__":
     # --- Parameters ---
-    N_data = 10000
-    Dim = 1024
-    N_queries = 20000 # Example
-    num_clusters_for_kmeans = 500
-    K1_probe = 200
-    K2_final = 150
-    USE_CPU_KMEANS = True # <<<--- Set to True to use the CPU version
+    N_data = 100000 # Smaller dataset for reasonable CPU KMeans time
+    Dim = 128      # Smaller dimension
+    N_queries = 1000 # Fewer queries
+    num_clusters_for_kmeans = 100 # Fewer clusters
+    K1_probe = 30
+    K2_final = 10
 
-    # --- Check CuPy ---
-    # ... (cupy check) ...
+    print(f"--- CPU ONLY EXECUTION ---")
+    print(f"N={N_data}, D={Dim}, Q={N_queries}, k_clusters={num_clusters_for_kmeans}, K1={K1_probe}, K2={K2_final}")
 
-    # --- Generate Base Data (Still on GPU initially is fine) ---
-    print("="*40); print("Generating Base Data (A_cp on GPU)..."); print("="*40)
+    # --- Generate Base Data (on CPU) ---
+    print("\n" + "="*40); print("Generating Base Data (A_np on CPU)..."); print("="*40)
     try:
-        A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
-        print(f"Database shape (GPU): {A_data_cp.shape}")
-    except Exception as e: print(f"Error generating A_data_cp: {e}"); exit()
+        # Use NumPy directly
+        A_data_np = np.random.randn(N_data, Dim).astype(np.float32)
+        print(f"Database shape (CPU): {A_data_np.shape}")
+    except Exception as e: print(f"Error generating A_data_np: {e}"); exit()
 
-    # --- Build Index ONCE ---
-    print("\n" + "="*40)
-    print(f"Building Centroids via {'CPU' if USE_CPU_KMEANS else 'GPU'} KMeans (Run Once)...")
-    print("="*40)
-    initial_centroids_cp = None # This will store the final centroids on GPU
+    # --- Build Index ONCE (CPU KMeans) ---
+    print("\n" + "="*40); print("Building Centroids via CPU KMeans (Run Once)..."); print("="*40)
+    initial_centroids_np = None
     actual_k_clusters = 0
     build_time_actual = 0
     try:
         build_start_actual = time.time()
-        if USE_CPU_KMEANS:
-            print("Transferring data to CPU for KMeans...")
-            A_data_np = cp.asnumpy(A_data_cp) # GPU -> CPU transfer
-            print("Running CPU KMeans...")
-            centroids_np, _ = our_kmeans_cpu(N_data, Dim, A_data_np, num_clusters_for_kmeans, max_iters=50)
-            # Clear NumPy array if memory is tight
-            del A_data_np
-            print("Transferring computed centroids back to GPU...")
-            initial_centroids_cp = cp.asarray(centroids_np, dtype=cp.float32) # CPU -> GPU transfer
-        # Validate centroids computed either way
-        if initial_centroids_cp.dtype != cp.float32: initial_centroids_cp = initial_centroids_cp.astype(cp.float32)
-        actual_k_clusters = initial_centroids_cp.shape[0]
+        # Call CPU KMeans
+        initial_centroids_np, _ = our_kmeans_cpu(N_data, Dim, A_data_np, num_clusters_for_kmeans, max_iters=50)
+        actual_k_clusters = initial_centroids_np.shape[0]
         build_time_actual = time.time() - build_start_actual
         if actual_k_clusters == 0: raise ValueError("KMeans returned 0 centroids.")
-        print(f"{'CPU' if USE_CPU_KMEANS else 'GPU'} KMeans completed. Found {actual_k_clusters} centroids.")
+        print(f"CPU KMeans completed. Found {actual_k_clusters} centroids.")
         print(f"Actual Build Time: {build_time_actual:.4f}s")
+    except Exception as e: print(f"Error during initial KMeans build: {e}"); traceback.print_exc(); exit()
 
-    except Exception as e: print(f"Error during initial KMeans build: {e}"); import traceback; traceback.print_exc(); exit()
+    # --- Generate NEW Queries (on CPU) ---
+    print("\n" + "="*40); print(f"Generating {N_queries} NEW Test Queries (on CPU)..."); print("="*40)
+    try:
+        # Use NumPy directly
+        X_queries_np_new = np.random.randn(N_queries, Dim).astype(np.float32)
+        print(f"New query shape (CPU): {X_queries_np_new.shape}")
+    except Exception as e: print(f"Error generating new queries: {e}"); exit()
 
-    # --- Generate NEW Queries (on GPU) ---
-    # ... (Generate X_queries_cp_new as before) ...
+    # --- Run ANN Search (CPU Function, using centroids on CPU) ---
+    print("\n" + "="*40); print(f"Testing our_ann_user_pseudocode_impl_l2_cpu with {N_queries} NEW queries..."); print("="*40)
+    k1_run = min(K1_probe, actual_k_clusters)
+    k2_run = min(K2_final, k1_run)
+    print(f"(Using {actual_k_clusters} centroids, K1={k1_run}, K2={k2_run}, L2 Distance, CPU Search)")
+    print("="*40)
+    ann_indices_centroids_np = None
+    ann_dists_sq_centroids_np = None
+    centroids_used_np = None
+    search_t = 0
+    try:
+        # Call the CPU L2 version of the function
+        ann_indices_centroids_np, ann_dists_sq_centroids_np, centroids_used_np, build_t_ignored, search_t = our_ann_user_pseudocode_impl_l2_cpu(
+            N_A=N_data, D=Dim, A_np=A_data_np, # Pass A_np only if building index inside
+            X_np=X_queries_np_new,             # Use CPU queries
+            k_clusters=actual_k_clusters,
+            K1=k1_run,
+            K2=k2_run,
+            centroids_np=initial_centroids_np  # Pass CPU centroids
+        )
+        print("CPU User Pseudocode ANN results shape (Centroid Indices):", ann_indices_centroids_np.shape)
+        print("CPU User Pseudocode ANN results shape (**SQUARED** L2 Distances to Centroids):", ann_dists_sq_centroids_np.shape)
+        print(f"CPU User Pseudocode ANN Search Time ({N_queries} New Queries, L2): {search_t:.4f}s")
+        if search_t > 0: print(f"-> Throughput: {N_queries / search_t:.2f} queries/sec (CPU)")
 
-    # --- Run ANN Search (using centroids on GPU) ---
-    # The ANN search part remains unchanged as it expects centroids on the GPU ('initial_centroids_cp')
-    print("\n" + "="*40); print(f"Testing our_ann_user_pseudocode_impl_l2 with {N_queries} NEW queries..."); print("="*40)
-    # ... (Call our_ann_user_pseudocode_impl_l2 using initial_centroids_cp) ...
-    # ... (Print results) ...
+    except Exception as e: print(f"Error during ANN execution: {e}"); traceback.print_exc()
 
-    # --- Optional: Calculate Recall ---
-    # The recall calculation also uses initial_centroids_cp (on GPU)
-    # ... (Recall calculation as before) ...
+
+    # --- Calculate Recall against True Nearest Centroids (using L2 distance on CPU) ---
+    if ann_indices_centroids_np is not None and centroids_used_np is not None and centroids_used_np.shape[0] > 0:
+        print("\n" + "="*40); print("Calculating Recall vs. True Nearest Centroids (CPU L2)..."); print("="*40)
+        K_recall = k2_run
+        try:
+            # Ground truth calculation on CPU
+            print("Calculating ground truth (CPU Brute-force nearest centroids using SQUARED L2)...")
+            start_gt = time.time()
+            # Use NumPy pairwise distance
+            all_query_centroid_dists_sq_gt = pairwise_l2_squared_numpy(X_queries_np_new, centroids_used_np)
+
+            actual_num_centroids = centroids_used_np.shape[0]
+            k_recall_adjusted = min(K_recall, actual_num_centroids)
+
+            if k_recall_adjusted > 0:
+                # Find true nearest centroids using SQUARED L2 distance on CPU
+                true_knn_centroid_indices_np = np.argsort(all_query_centroid_dists_sq_gt, axis=1)[:, :k_recall_adjusted]
+            else:
+                true_knn_centroid_indices_np = np.empty((N_queries, 0), dtype=np.int64)
+            print(f"Ground truth calculation time: {time.time() - start_gt:.4f}s")
+
+            # Compare results (already NumPy arrays)
+            total_intersect_centroids = 0
+            ann_indices_np = ann_indices_centroids_np[:, :k_recall_adjusted] # Use the results directly
+            true_indices_np = true_knn_centroid_indices_np
+
+            for i in range(N_queries): # Loop on CPU
+                 approx_centroid_ids = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                 true_centroid_ids = set(true_indices_np[i])
+                 total_intersect_centroids += len(approx_centroid_ids.intersection(true_centroid_ids))
+
+            if N_queries > 0 and k_recall_adjusted > 0:
+                avg_recall_centroids = total_intersect_centroids / (N_queries * k_recall_adjusted)
+                print(f"\nAverage Recall @ {k_recall_adjusted} (vs CPU brute-force CENTROIDS w/ L2): {avg_recall_centroids:.4f} ({avg_recall_centroids:.2%})")
+                # Commentary
+                epsilon = 1e-9
+                if abs(avg_recall_centroids - 1.0) < epsilon: print("Result: 100% recall indicates K1 was large enough...")
+                else: print(f"Result: Recall ({avg_recall_centroids:.4f}) < 100%...")
+            else: print("\nCannot calculate recall (N_queries=0 or K2=0).")
+
+        except Exception as e: print(f"Error during recall calculation: {e}"); traceback.print_exc()
+    # ... (Error handling if results/centroids are None) ...
+
+    print("\n--- CPU ONLY EXECUTION FINISHED ---")
