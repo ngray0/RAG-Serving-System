@@ -1216,9 +1216,9 @@ if __name__ == "__main__":
     N_data = 1000000
     Dim = 1024
     N_queries = 10000
-    num_clusters_for_kmeans = 500 # Target number for KMeans
-    K1_probe = 200                # K1: Probe nearest 200 centroids
-    K2_final = 150                # K2: Final desired number of nearest centroids
+    num_clusters_for_kmeans = 1000 # Target number for KMeans
+    K1_probe = 10                # K1: Probe nearest 200 centroids
+    K2_final = 9               # K2: Final desired number of nearest centroids
 
     # --- (Check CuPy, Generate A_data_cp as before) ---
     # ...
