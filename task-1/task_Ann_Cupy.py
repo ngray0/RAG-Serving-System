@@ -1222,7 +1222,7 @@ if __name__ == "__main__":
     kmeans_max_iters = 50
 
     # --- Dimensions to Test ---
-    dimensions_to_test = [2, 4, 64, 256, 1024]
+    dimensions_to_test = [2,2,  4, 64, 256, 1024]
 
     print(f"--- GPU ONLY EXECUTION LOOPING THROUGH DIMENSIONS ---")
     print(f"Fixed Params: N={N_data}, Q={N_queries_new}, k_clusters={num_clusters_for_kmeans}, K1={K1_probe}, K2={K2_final}")
