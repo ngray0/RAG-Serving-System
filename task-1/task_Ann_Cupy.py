@@ -760,7 +760,7 @@ if __name__ == "__main__":
     N_queries = 100
     K_val = 10
     K_clusters_ann = 50 # Number of clusters for ANN index
-    N_probe_ann = 4     # Number of clusters to probe
+    N_probe_ann = 10     # Number of clusters to probe
 
     print("="*40)
     print("Generating Test Data (CuPy)...")
@@ -806,9 +806,8 @@ if __name__ == "__main__":
 
             for i in range(N_queries):
                 true_knn_ids = set(knn_indices_np[i])
-                # Remove potential -1 placeholders if K > actual neighbors found/available
                 approx_ann_ids = set(ann_indices_np[i])
-                approx_ann_ids.discard(-1) # Remove padding value
+                approx_ann_ids.discard(-1)
 
                 total_intersect += len(true_knn_ids.intersection(approx_ann_ids))
 
