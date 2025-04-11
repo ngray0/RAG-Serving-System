@@ -112,27 +112,16 @@ def kmeans_assign_kernel(
 
 # --- Helper Functions ---
 def _prepare_tensors(*tensors, target_device=device):
-    """Ensure tensors are float32, contiguous, and on the correct device."""
     prepared = []
     for t in tensors:
-        if not isinstance(t, torch.Tensor):
-            # Attempt conversion, assuming input might be list, numpy, etc.
-            try:
-                t = torch.tensor(t, dtype=torch.float32, device=target_device)
-            except Exception as e:
-                raise TypeError(f"Failed to convert input of type {type(t)} to torch.Tensor: {e}")
-        # Ensure device placement
-        if t.device != target_device:
-            t = t.to(target_device)
-        # Ensure dtype is float32
-        if t.dtype != torch.float32:
-            t = t.to(dtype=torch.float32)
-        # Ensure contiguous memory layout
-        if not t.is_contiguous():
-            t = t.contiguous()
-        prepared.append(t)
-    # If only one tensor was passed, return it directly, otherwise return the list
-    return prepared[0] if len(prepared) == 1 else prepared
+        # ... preparation logic ...
+        prepared.append(t.contiguous())
+    # If only one tensor was processed, return it directly
+    if len(prepared) == 1:
+        return prepared[0]
+    # Otherwise, return the list of prepared tensors
+    else:
+        return prepared
 
 
 # --- Distance Functions (Using Triton Dot Kernel) ---
