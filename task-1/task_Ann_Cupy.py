@@ -1210,129 +1210,210 @@ if __name__ == "__main__":
 
 
 '''
-# --- Example Usage ---
 if __name__ == "__main__":
-    # --- Parameters ---
-    N_data = 1000000
-    Dim = 128
-    # N_queries will be set below
-    num_clusters_for_kmeans = 10000
-    K1_probe = 200
-    K2_final = 190
+    # --- Fixed Parameters for all dimension runs ---
+    N_data = 100000
+    N_queries_new = 10000 # Number of new queries to generate and test
+    # Reduced cluster count to avoid potential OOM errors in GPU KMeans pairwise distance step
+    # (1M x 10k distance matrix is often too large for GPU memory)
+    num_clusters_for_kmeans = 1000 # Adjusted from 10000 to 1000
+    K1_probe = 30
+    K2_final = 10 # Note K2=190 is close to K1=200
+    kmeans_max_iters = 50
+
+    # --- Dimensions to Test ---
+    dimensions_to_test = [2, 4, 64, 256, 1024]
+
+    print(f"--- GPU ONLY EXECUTION LOOPING THROUGH DIMENSIONS ---")
+    print(f"Fixed Params: N={N_data}, Q={N_queries_new}, k_clusters={num_clusters_for_kmeans}, K1={K1_probe}, K2={K2_final}")
+    print(f"Testing Dimensions: {dimensions_to_test}")
 
     # --- Check CuPy ---
     try:
         cp.cuda.Device(0).use(); cupy_device_ok = True
-    except cp.cuda.runtime.CUDARuntimeError: cupy_device_ok = False
+        print(f"CuPy using GPU: {cp.cuda.Device(0)}")
+    except cp.cuda.runtime.CUDARuntimeError as e:
+        print(f"CuPy CUDA Error: {e}"); cupy_device_ok = False
     if not cupy_device_ok: print("CuPy device not available."); exit()
 
-    # --- Generate Base Data ---
-    print("="*40); print("Generating Base Data (A_cp)..."); print("="*40)
-    try:
-        A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
-        print(f"Database shape: {A_data_cp.shape}")
-    except Exception as e: print(f"Error generating A_data_cp: {e}"); exit()
 
-    # --- Build Index ONCE (Euclidean KMeans) ---
-    print("\n" + "="*40); print("Building Centroids via Euclidean KMeans (Run Once)..."); print("="*40)
-    initial_centroids_cp = None
-    actual_k_clusters = 0
-    build_time_actual = 0
-    try:
-        build_start_actual = time.time()
-        initial_centroids_cp, _ = our_kmeans(N_data, Dim, A_data_cp, num_clusters_for_kmeans, max_iters=50)
-        if initial_centroids_cp.dtype != cp.float32: initial_centroids_cp = initial_centroids_cp.astype(cp.float32)
-        actual_k_clusters = initial_centroids_cp.shape[0]
-        build_time_actual = time.time() - build_start_actual
-        if actual_k_clusters == 0: raise ValueError("KMeans returned 0 centroids.")
-        print(f"Euclidean KMeans completed. Found {actual_k_clusters} centroids.")
-        print(f"Actual Build Time: {build_time_actual:.4f}s")
-    except Exception as e: print(f"Error during initial KMeans build: {e}"); exit()
+    # Loop through each dimension
+    for Dim in dimensions_to_test:
+        print("\n" + "#"*70)
+        print(f"# Starting Test for Dimension D = {Dim}")
+        print("#"*70)
 
-    # --- Generate 20000 NEW Queries ---
-    N_queries_new = 200000 # <--- Set desired number of new queries
-    print("\n" + "="*40); print(f"Generating {N_queries_new} NEW Test Queries..."); print("="*40)
-    try:
-        X_queries_cp_new = cp.random.randn(N_queries_new, Dim, dtype=cp.float32)
-        print(f"New query shape: {X_queries_cp_new.shape}")
-    except Exception as e: print(f"Error generating new queries: {e}"); exit()
-
-    # --- Run ANN Search with 20k NEW Queries and Prebuilt Centroids ---
-    print("\n" + "="*40)
-    print(f"Testing our_ann_user_pseudocode_impl_l2 with {N_queries_new} NEW queries...")
-    k1_run = min(K1_probe, actual_k_clusters)
-    k2_run = min(K2_final, k1_run)
-    print(f"(Using {actual_k_clusters} centroids, K1={k1_run}, K2={k2_run}, L2 Distance)")
-    print("="*40)
-    ann_indices_centroids = None
-    ann_dists_sq_centroids = None
-    centroids_used = None
-    search_t = 0
-    try:
-        # Call the L2 version of the function
-        ann_indices_centroids, ann_dists_sq_centroids, centroids_used, build_t_ignored, search_t = our_ann_user_pseudocode_impl_l2(
-            N_A=N_data, D=Dim, A_cp=A_data_cp,
-            X_cp=X_queries_cp_new, # Use the 20k new queries
-            k_clusters=actual_k_clusters,
-            K1=k1_run,
-            K2=k2_run,
-            centroids_cp=initial_centroids_cp # Pass precomputed centroids
-        )
-        print("User Pseudocode ANN results shape (Centroid Indices):", ann_indices_centroids.shape)
-        print("User Pseudocode ANN results shape (**SQUARED** L2 Distances to Centroids):", ann_dists_sq_centroids.shape)
-        print(f"User Pseudocode ANN Search Time ({N_queries_new} New Queries, L2): {search_t:.4f}s")
-        if search_t > 0: print(f"-> Throughput: {N_queries_new / search_t:.2f} queries/sec")
-
-        # --- Example: Get non-squared distances if needed ---
-        # ann_dists_l2_centroids = cp.sqrt(ann_dists_sq_centroids)
-        # print("Non-squared L2 distances (example first 5):", cp.asnumpy(ann_dists_l2_centroids[:5,:5]))
-        # ----------------------------------------------------
-
-    except Exception as e: print(f"Error during ANN execution: {e}"); import traceback; traceback.print_exc()
-
-
-    # --- Optional: Calculate Recall against True Nearest Centroids (for 20k NEW Queries) ---
-    if ann_indices_centroids is not None and centroids_used is not None and centroids_used.shape[0] > 0:
-        print("\n" + "="*40); print("Calculating Recall vs. True Nearest Centroids (L2 distance)..."); print("="*40)
-        K_recall = k2_run # Recall is @K2
+        # --- Generate Base Data (on GPU) for the current dimension ---
+        print("\n" + "="*40); print(f"Generating Base Data (D={Dim}, GPU)..."); print("="*40)
         try:
-            print("Calculating ground truth (Brute-force nearest centroids using SQUARED L2)...")
-            start_gt = time.time()
-            all_query_centroid_dists_sq_gt = pairwise_l2_squared_cupy(X_queries_cp_new, centroids_used)
+            # Use CuPy directly
+            A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
+            cp.cuda.Stream.null.synchronize() # Ensure data is generated
+            print(f"Database shape (GPU): {A_data_cp.shape}")
+            mem_gb = A_data_cp.nbytes / (1024**3)
+            print(f"Approx. memory for A_data_cp: {mem_gb:.2f} GB")
+            if mem_gb > 16: # Arbitrary threshold for very large GPU data
+                 print("Warning: GPU Dataset size is large.")
 
-            actual_num_centroids = centroids_used.shape[0]
-            k_recall_adjusted = min(K_recall, actual_num_centroids)
+        except cp.cuda.memory.OutOfMemoryError:
+             print(f"Error: Failed to allocate GPU memory for A_data_cp (D={Dim}). Skipping this dimension.")
+             # Clean up potentially allocated array before continuing
+             if 'A_data_cp' in locals(): del A_data_cp
+             cp.get_default_memory_pool().free_all_blocks()
+             continue # Skip to the next dimension
+        except Exception as e:
+            print(f"Error generating A_data_cp (D={Dim}): {e}");
+            continue # Skip to the next dimension
 
-            if k_recall_adjusted > 0:
-                true_knn_centroid_indices = cp.argsort(all_query_centroid_dists_sq_gt, axis=1)[:, :k_recall_adjusted]
-            else:
-                true_knn_centroid_indices = cp.empty((N_queries_new, 0), dtype=cp.int64)
-            cp.cuda.Stream.null.synchronize()
-            print(f"Ground truth calculation time: {time.time() - start_gt:.4f}s")
+        # --- Build Index ONCE (GPU KMeans) for the current dimension ---
+        print("\n" + "="*40); print(f"Building Centroids via GPU KMeans (D={Dim})..."); print("="*40)
+        initial_centroids_cp = None
+        actual_k_clusters = 0
+        build_time_actual = 0
+        try:
+            build_start_actual = time.time()
+            # Call GPU KMeans
+            # Make sure our_kmeans is the GPU version defined elsewhere
+            initial_centroids_cp, _ = our_kmeans(N_data, Dim, A_data_cp, num_clusters_for_kmeans, max_iters=kmeans_max_iters)
+            actual_k_clusters = initial_centroids_cp.shape[0]
+            build_time_actual = time.time() - build_start_actual
+            if actual_k_clusters == 0: raise ValueError("KMeans returned 0 centroids.")
+            print(f"GPU KMeans completed. Found {actual_k_clusters} centroids.")
+            print(f"Actual Build Time (D={Dim}): {build_time_actual:.4f}s")
+        except cp.cuda.memory.OutOfMemoryError as e:
+            print(f"OOM Error during GPU KMeans build (D={Dim}): {e}");
+            print("Consider reducing N_data or num_clusters_for_kmeans.")
+            # Clean up and skip dimension
+            if 'initial_centroids_cp' in locals(): del initial_centroids_cp
+            del A_data_cp
+            cp.get_default_memory_pool().free_all_blocks()
+            continue
+        except Exception as e:
+            print(f"Error during initial KMeans build (D={Dim}): {e}");
+            traceback.print_exc()
+            # Clean up and skip dimension
+            if 'initial_centroids_cp' in locals(): del initial_centroids_cp
+            del A_data_cp
+            cp.get_default_memory_pool().free_all_blocks()
+            continue
 
-            # Compare results
-            total_intersect_centroids = 0
-            ann_indices_np = cp.asnumpy(ann_indices_centroids[:, :k_recall_adjusted])
-            true_indices_np = cp.asnumpy(true_knn_centroid_indices)
-            for i in range(N_queries_new): # Iterate over all new queries
-                 approx_centroid_ids = set(idx for idx in ann_indices_np[i] if idx >= 0)
-                 true_centroid_ids = set(true_indices_np[i])
-                 total_intersect_centroids += len(approx_centroid_ids.intersection(true_centroid_ids))
+        # --- Generate NEW Queries (on GPU) for the current dimension ---
+        print("\n" + "="*40); print(f"Generating {N_queries_new} NEW Test Queries (D={Dim}, GPU)..."); print("="*40)
+        try:
+            # Use CuPy directly
+            X_queries_cp_new = cp.random.randn(N_queries_new, Dim, dtype=cp.float32)
+            cp.cuda.Stream.null.synchronize() # Ensure data is generated
+            print(f"New query shape (GPU): {X_queries_cp_new.shape}")
+        except cp.cuda.memory.OutOfMemoryError:
+             print(f"Error: Failed to allocate GPU memory for {N_queries_new} queries (D={Dim}). Skipping this dimension.")
+             # Clean up
+             if 'X_queries_cp_new' in locals(): del X_queries_cp_new
+             del initial_centroids_cp, A_data_cp
+             cp.get_default_memory_pool().free_all_blocks()
+             continue
+        except Exception as e:
+            print(f"Error generating new queries (D={Dim}): {e}");
+            # Clean up
+            del initial_centroids_cp, A_data_cp
+            cp.get_default_memory_pool().free_all_blocks()
+            continue
 
-            if N_queries_new > 0 and k_recall_adjusted > 0:
-                avg_recall_centroids = total_intersect_centroids / (N_queries_new * k_recall_adjusted)
-                print(f"\nAverage Recall @ {k_recall_adjusted} (vs brute-force CENTROIDS w/ L2 distance for {N_queries_new} queries): {avg_recall_centroids:.4f} ({avg_recall_centroids:.2%})")
-                # Use corrected commentary logic
-                epsilon = 1e-9
-                if abs(avg_recall_centroids - 1.0) < epsilon:
-                    print("Result: 100% recall indicates K1 was large enough to contain the true K2 nearest centroids (by L2 distance) for all new queries.")
+        # --- Run ANN Search (GPU Function) for the current dimension ---
+        print("\n" + "="*40); print(f"Testing GPU ANN Search (D={Dim})..."); print("="*40)
+        # Adjust K1/K2 based on actual clusters found
+        k1_run = min(K1_probe, actual_k_clusters)
+        k2_run = min(K2_final, k1_run)
+        print(f"(Using {actual_k_clusters} centroids, K1={k1_run}, K2={k2_run}, L2 Distance, GPU Search)")
+        print("="*40)
+        ann_indices_centroids = None
+        ann_dists_sq_centroids = None
+        centroids_used = None
+        search_t = 0
+        try:
+            # Call the GPU L2 version of the function
+            # Make sure our_ann_user_pseudocode_impl_l2 is the GPU version defined elsewhere
+            ann_indices_centroids, ann_dists_sq_centroids, centroids_used, build_t_ignored, search_t = our_ann_user_pseudocode_impl_l2(
+                N_A=N_data, D=Dim, A_cp=A_data_cp, # Pass A_cp (might be needed for validation inside)
+                X_cp=X_queries_cp_new,             # Use GPU queries
+                k_clusters=actual_k_clusters,      # Pass actual count
+                K1=k1_run,                         # Use adjusted K1
+                K2=k2_run,                         # Use adjusted K2
+                centroids_cp=initial_centroids_cp  # Pass precomputed GPU centroids
+            )
+            print("GPU User Pseudocode ANN results shape (Centroid Indices):", ann_indices_centroids.shape)
+            print("GPU User Pseudocode ANN results shape (**SQUARED** L2 Distances to Centroids):", ann_dists_sq_centroids.shape)
+            print(f"GPU User Pseudocode ANN Search Time (D={Dim}): {search_t:.4f}s")
+            if search_t > 0: print(f"-> Throughput: {N_queries_new / search_t:.2f} queries/sec (GPU)")
+
+        except cp.cuda.memory.OutOfMemoryError as e:
+            print(f"OOM Error during GPU ANN execution (D={Dim}): {e}")
+            ann_indices_centroids = None # Ensure recall doesn't run
+        except Exception as e:
+            print(f"Error during ANN execution (D={Dim}): {e}")
+            import traceback
+            traceback.print_exc()
+            ann_indices_centroids = None # Ensure recall doesn't run
+
+
+        # --- Optional: Calculate Recall (GPU) for the current dimension ---
+        if ann_indices_centroids is not None and centroids_used is not None and centroids_used.shape[0] > 0:
+            print("\n" + "="*40); print(f"Calculating Recall (D={Dim}, GPU L2)..."); print("="*40)
+            K_recall = k2_run # Recall is @K2
+            try:
+                # Ground truth calculation on GPU
+                # print("Calculating ground truth (GPU Brute-force nearest centroids using SQUARED L2)...")
+                start_gt = time.time()
+                # Make sure pairwise_l2_squared_cupy is the GPU version
+                all_query_centroid_dists_sq_gt = pairwise_l2_squared_cupy(X_queries_cp_new, centroids_used)
+
+                actual_num_centroids = centroids_used.shape[0]
+                k_recall_adjusted = min(K_recall, actual_num_centroids)
+
+                if k_recall_adjusted > 0:
+                    # Find true nearest centroids using SQUARED L2 distance on GPU
+                    true_knn_centroid_indices = cp.argsort(all_query_centroid_dists_sq_gt, axis=1)[:, :k_recall_adjusted]
                 else:
-                    print(f"Result: Recall ({avg_recall_centroids:.4f}) < 100%. The true {k_recall_adjusted} nearest centroids (by L2 distance) were not always within the initial K1={k1_run} probe set.")
-            else: print("\nCannot calculate recall (N_queries=0 or K2=0).")
+                    true_knn_centroid_indices = cp.empty((N_queries_new, 0), dtype=cp.int64)
+                cp.cuda.Stream.null.synchronize() # Wait for GPU argsort
+                # print(f"Ground truth calculation time: {time.time() - start_gt:.4f}s")
 
-        except cp.cuda.memory.OutOfMemoryError as e: print(f"OOM Error during recall calculation: {e}")
-        except Exception as e: print(f"Error during recall calculation: {e}"); traceback.print_exc()
-    # ... (End of main block) ...
+                # Compare results (transfer minimal data to CPU)
+                total_intersect_centroids = 0
+                # Transfer only the necessary slices for comparison
+                ann_indices_np = cp.asnumpy(ann_indices_centroids[:, :k_recall_adjusted])
+                true_indices_np = cp.asnumpy(true_knn_centroid_indices)
+                # Comparison loop on CPU
+                for i in range(N_queries_new):
+                     approx_centroid_ids = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                     true_centroid_ids = set(true_indices_np[i])
+                     total_intersect_centroids += len(approx_centroid_ids.intersection(true_centroid_ids))
+
+                if N_queries_new > 0 and k_recall_adjusted > 0:
+                    avg_recall_centroids = total_intersect_centroids / (N_queries_new * k_recall_adjusted)
+                    print(f"\nAverage Recall @ {k_recall_adjusted} (vs GPU brute-force CENTROIDS w/ L2, D={Dim}): {avg_recall_centroids:.4f} ({avg_recall_centroids:.2%})")
+                    # Use corrected commentary logic
+                    epsilon = 1e-9
+                    if abs(avg_recall_centroids - 1.0) < epsilon: print("Result: 100% recall indicates K1 was large enough...")
+                    else: print(f"Result: Recall ({avg_recall_centroids:.4f}) < 100%...")
+                else: print("\nCannot calculate recall (N_queries=0 or K2=0).")
+
+            except cp.cuda.memory.OutOfMemoryError as e: print(f"OOM Error during recall calculation (D={Dim}): {e}")
+            except Exception as e: print(f"Error during recall calculation (D={Dim}): {e}"); traceback.print_exc()
+        else:
+             print("\nSkipping recall calculation as ANN results or centroids are unavailable.")
+
+        print(f"\n--- Finished Test for Dimension D = {Dim} ---")
+        # Clean up GPU memory before next potentially larger dimension run
+        del A_data_cp, X_queries_cp_new, initial_centroids_cp, centroids_used
+        if 'ann_indices_centroids' in locals(): del ann_indices_centroids
+        if 'ann_dists_sq_centroids' in locals(): del ann_dists_sq_centroids
+        if 'all_query_centroid_dists_sq_gt' in locals(): del all_query_centroid_dists_sq_gt
+        if 'true_knn_centroid_indices' in locals(): del true_knn_centroid_indices
+        cp.get_default_memory_pool().free_all_blocks() # Clear GPU memory pool
+
+
+    print("\n--- ALL GPU DIMENSION TESTS FINISHED ---")
+
 '''
 if __name__ == "__main__":
     # Ensure CuPy is available
