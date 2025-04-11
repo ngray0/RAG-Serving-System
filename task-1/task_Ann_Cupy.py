@@ -1,34 +1,39 @@
-# task-1/task_Ann.py (Modified)
+# task-1/task_Ann.py (Modified for Pure CuPy K-Means)
+
+# Keep PyTorch and Triton imports if needed by HNSW or other parts of the file
 import torch
-# Removed triton imports as they are no longer needed for k-means
 import triton
 import triton.language as tl
 import math
 import heapq # For HNSW priority queues
 import random
 import time
-import cupy as cp # Ensure cupy is imported
+import cupy as cp
+import cupyx # Required for cupyx.scatter_add
 
 # --- Device Setup ---
-if not torch.cuda.is_available():
-    print("CUDA not available, exiting.")
-    exit()
-# Check if CuPy recognizes the GPU
+# Keep PyTorch device setup if HNSW/other parts use it
+if torch.cuda.is_available():
+    device = torch.device("cuda:0")
+    print(f"PyTorch using device: {device}")
+else:
+    # Fallback for PyTorch if needed, but CuPy requires CUDA
+    device = torch.device("cpu")
+    print("PyTorch falling back to CPU.")
+
+# Check and set CuPy device
 try:
     cp.cuda.Device(0).use()
     print(f"CuPy using GPU: {cp.cuda.Device(0)}")
 except cp.cuda.runtime.CUDARuntimeError as e:
     print(f"CuPy CUDA Error: {e}")
-    print("Falling back to CPU for PyTorch, but CuPy K-Means will fail.")
-    device = torch.device("cpu")
-# PyTorch device setup remains the same
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f"PyTorch using device: {device}")
+    print("Cannot run CuPy K-Means without CUDA.")
+    # Decide how to handle this - exit or let subsequent CuPy calls fail?
+    # exit()
 
 
-# --- Helper Functions ---
-# (Keep _prepare_tensors and normalize_vectors as they might be used elsewhere)
-def _prepare_tensors(*tensors, target_device = device):
+# --- Helper Functions (Keep if needed by HNSW/Other PyTorch parts) ---
+def _prepare_tensors(*tensors, target_device=device):
     """Ensure tensors are float32, contiguous, and on the correct device."""
     prepared = []
     for t in tensors:
@@ -43,13 +48,13 @@ def _prepare_tensors(*tensors, target_device = device):
 
 def normalize_vectors(vectors, epsilon=1e-12):
     """L2 normalize vectors row-wise using PyTorch."""
+    # Keep this if HNSW needs it
     norms = torch.linalg.norm(vectors, dim=1, keepdim=True)
     return vectors / (norms + epsilon)
 
-# --- Distance Functions (Keep any that might be used by other parts like ANN) ---
-# (Keep distance_dot, distance_cosine if needed by ANN or other parts)
-# (Keep L2 distance kernels if needed by ANN)
-
+# --- Distance Functions & Kernels (Keep if needed by HNSW/Other Parts) ---
+# (Keep Triton kernels like dot_kernel_pairwise, l2_dist_kernel_1_vs_M, etc.
+# and their PyTorch wrappers like distance_dot, distance_cosine if HNSW uses them)
 @triton.jit
 def l2_dist_kernel_1_vs_M( # Keep if HNSW uses it
     query_ptr, candidates_ptr, output_ptr,
@@ -69,11 +74,10 @@ def l2_dist_kernel_1_vs_M( # Keep if HNSW uses it
         diff = query_vals - cand_vals
         dist_sq += tl.sum(diff * diff, axis=0)
     tl.store(output_ptr + pid_m, dist_sq)
-    pass # Keep kernel if needed elsewhere
-
+    pass
 
 # ============================================================================
-# Task 2.1: K-Means Clustering (CuPy Implementation)
+# Task 2.1: K-Means Clustering (Pure CuPy Implementation)
 # ============================================================================
 
 def pairwise_l2_squared_cupy(X_cp, C_cp):
@@ -90,125 +94,87 @@ def pairwise_l2_squared_cupy(X_cp, C_cp):
 
     # Broadcasting: (N, 1) - 2*(N, K) + (1, K) -> (N, K)
     dist_sq = X_norm_sq - 2 * dot_products + C_norm_sq.T
-    # Clamp to avoid small negative values due to float precision
-    return cp.maximum(0, dist_sq)
+    return cp.maximum(0, dist_sq) # Clamp to avoid small negatives
 
-def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
+def our_kmeans(N_A, D, A_cp, K, max_iters=100, tol=1e-4):
     """
-    Performs K-means clustering on data A using CuPy for assignment
-    and PyTorch scatter_add_ for the update step.
+    Performs K-means clustering entirely using CuPy.
 
     Args:
         N_A (int): Number of data points.
         D (int): Dimensionality.
-        A (torch.Tensor): Data points (N_A, D) on GPU (as PyTorch Tensor).
+        A_cp (cp.ndarray): Data points (N_A, D) on GPU (as CuPy ndarray).
         K (int): Number of clusters.
         max_iters (int): Maximum number of iterations.
         tol (float): Tolerance for centroid movement convergence check.
 
     Returns:
-        tuple[torch.Tensor, torch.Tensor]:
-            - centroids (torch.Tensor): Final centroids (K, D).
-            - assignments (torch.Tensor): Final cluster assignment (N_A,).
+        tuple[cp.ndarray, cp.ndarray]:
+            - centroids_cp (cp.ndarray): Final centroids (K, D).
+            - assignments_cp (cp.ndarray): Final cluster assignment (N_A,).
     """
-    # Prepare input tensor (ensure it's on the right device and contiguous)
-    A_prep, = _prepare_tensors(A, target_device=device)
-    assert A_prep.shape[0] == N_A, "N_A doesn't match A.shape[0]"
-    assert A_prep.shape[1] == D, "D doesn't match A.shape[1]"
-    assert K > 0, "K must be positive"
-    assert K <= N_A, "K cannot be larger than the number of data points"
+    # --- Input Validation ---
+    if not isinstance(A_cp, cp.ndarray):
+        raise TypeError("Input data 'A_cp' must be a CuPy ndarray.")
+    if A_cp.shape[0] != N_A or A_cp.shape[1] != D:
+         # Warning or error if N_A/D don't match shape
+         print(f"Warning: N_A/D ({N_A}/{D}) mismatch with A_cp shape {A_cp.shape}. Using shape from A_cp.")
+         N_A, D = A_cp.shape
+    if not (K > 0 and K <= N_A):
+         raise ValueError("K must be positive and less than or equal to N_A.")
+    if A_cp.dtype != cp.float32:
+        print(f"Warning: Input data dtype is {A_cp.dtype}. Converting to float32.")
+        A_cp = A_cp.astype(cp.float32)
 
-    print(f"Running K-Means (Assignment: CuPy, Update: PyTorch): N={N_A}, D={D}, K={K}")
+
+    print(f"Running K-Means (Pure CuPy): N={N_A}, D={D}, K={K}")
     start_time_total = time.time()
 
-    # --- Initialization (using PyTorch on the target device) ---
-    initial_indices = torch.randperm(N_A, device=device)[:K]
-    centroids_torch = A_prep[initial_indices].clone()
+    # --- Initialization (using CuPy) ---
+    initial_indices = cp.random.permutation(N_A)[:K]
+    centroids_cp = A_cp[initial_indices].copy() # Use copy to avoid modifying A_cp
 
-    # --- Convert Initial Centroids and Data to CuPy ---
-    # Use DLPack for efficient zero-copy transfer if possible
-    try:
-        A_cp = cp.from_dlpack(torch.to_dlpack(A_prep))
-        centroids_cp = cp.from_dlpack(torch.to_dlpack(centroids_torch))
-    except Exception as e:
-        print(f"DLPack conversion failed ({e}), falling back to .numpy() conversion.")
-        A_cp = cp.asarray(A_prep.cpu().numpy())
-        centroids_cp = cp.asarray(centroids_torch.cpu().numpy())
-        # If using numpy conversion, ensure data is moved back to GPU if needed by CuPy
-        A_cp = cp.asarray(A_cp)
-        centroids_cp = cp.asarray(centroids_cp)
-
-    assignments_cp = cp.empty(N_A, dtype=cp.int32) # CuPy assignments
+    assignments_cp = cp.empty(N_A, dtype=cp.int32) # Use int32 for assignments
 
     for i in range(max_iters):
         iter_start_time = time.time()
 
-        # --- 1. Assignment Step (Uses CuPy) ---
-        # Calculate pairwise squared L2 distances
+        # --- 1. Assignment Step (CuPy) ---
         all_dist_sq_cp = pairwise_l2_squared_cupy(A_cp, centroids_cp) # Shape (N_A, K)
-
-        # Find the index of the closest centroid for each point
         assignments_cp = cp.argmin(all_dist_sq_cp, axis=1).astype(cp.int32) # Shape (N_A,)
-
-        # Synchronize CuPy operations before potentially switching back to PyTorch
         cp.cuda.Stream.null.synchronize()
         assign_time = time.time() - iter_start_time
 
-        # --- Convert Assignments back to PyTorch for Update Step ---
-        # Use DLPack if possible
-        try:
-            # Ensure assignments_cp is int64 for scatter_add index
-            assignments_torch = torch.from_dlpack(cp.to_dlpack(assignments_cp.astype(cp.int64)))
-        except Exception as e:
-             print(f"DLPack conversion failed ({e}), falling back to .numpy() conversion.")
-             # Cast to int64 needed by scatter_add
-             assignments_torch = torch.tensor(cp.asnumpy(assignments_cp), dtype=torch.int64, device=device)
-
-
-        # --- 2. Update Step (Uses PyTorch scatter_add_) ---
+        # --- 2. Update Step (CuPy using cupyx.scatter_add) ---
         update_start_time = time.time()
 
-        new_sums_torch = torch.zeros_like(centroids_torch) # Shape (K, D)
-        cluster_counts_torch = torch.zeros(K, dtype=torch.float32, device=device) # Shape (K,)
+        new_sums_cp = cp.zeros((K, D), dtype=cp.float32)
+        cluster_counts_cp = cp.zeros(K, dtype=cp.float32)
 
-        # Expand assignments to match the dimensions of A_prep for scatter_add_ on sums
-        idx_expand = assignments_torch.unsqueeze(1).expand(N_A, D)
-
-        # Add data points (A_prep is still the PyTorch tensor) to corresponding centroid sums
-        new_sums_torch.scatter_add_(dim=0, index=idx_expand, src=A_prep)
-
-        # Add 1 to counts for each data point's assigned cluster
-        cluster_counts_torch.scatter_add_(dim=0, index=assignments_torch, src=torch.ones_like(assignments_torch, dtype=torch.float32))
+        # Use cupyx.scatter_add for efficient update
+        # Add each point in A_cp to the sum of its assigned cluster
+        cupyx.scatter_add(new_sums_cp, assignments_cp, A_cp, axis=0)
+        # Count points in each cluster by scattering 1s
+        cupyx.scatter_add(cluster_counts_cp, assignments_cp, 1.0)
 
         # Calculate new centroids, handle empty clusters
-        final_counts_safe = cluster_counts_torch.clamp(min=1.0)
-        new_centroids_torch = new_sums_torch / final_counts_safe.unsqueeze(1)
+        final_counts_safe_cp = cp.maximum(cluster_counts_cp, 1.0) # Avoid division by zero
+        new_centroids_cp = new_sums_cp / final_counts_safe_cp[:, None] # Broadcast counts
 
-        # Keep old centroid if cluster becomes empty
-        empty_cluster_mask = (cluster_counts_torch == 0)
-        new_centroids_torch[empty_cluster_mask] = centroids_torch[empty_cluster_mask]
+        # Handle empty clusters (where count is 0) - keep old centroid
+        empty_cluster_mask = (cluster_counts_cp == 0)
+        new_centroids_cp[empty_cluster_mask] = centroids_cp[empty_cluster_mask]
 
-        # Synchronize PyTorch operations
-        torch.cuda.synchronize()
+        cp.cuda.Stream.null.synchronize()
         update_time = time.time() - update_start_time
 
         # --- Check Convergence ---
-        # Calculate difference on PyTorch tensors
-        centroid_diff = torch.norm(new_centroids_torch - centroids_torch)
+        centroid_diff_cp = cp.linalg.norm(new_centroids_cp - centroids_cp)
+        centroids_cp = new_centroids_cp # Update centroids
 
-        # Update centroids (both PyTorch and CuPy versions)
-        centroids_torch = new_centroids_torch
-        try:
-            centroids_cp = cp.from_dlpack(torch.to_dlpack(centroids_torch))
-        except Exception as e:
-            print(f"DLPack conversion failed ({e}), falling back to .numpy() conversion.")
-            centroids_cp = cp.asarray(centroids_torch.cpu().numpy())
-            centroids_cp = cp.asarray(centroids_cp) # Ensure on GPU if numpy was used
+        print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff_cp:.4f} | Assign Time: {assign_time:.4f}s | Update Time: {update_time:.4f}s")
 
-
-        print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff:.4f} | Assign Time (CuPy): {assign_time:.4f}s | Update Time (PyTorch): {update_time:.4f}s")
-
-        if centroid_diff < tol:
+        if centroid_diff_cp < tol:
             print(f"Converged after {i+1} iterations.")
             break
 
@@ -218,34 +184,20 @@ def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     total_time = time.time() - start_time_total
     print(f"Total K-Means time: {total_time:.4f}s")
 
-    # Return PyTorch tensors consistent with the original function signature
-    # Final assignments need to be converted back to PyTorch if not already done in loop
-    try:
-        final_assignments_torch = torch.from_dlpack(cp.to_dlpack(assignments_cp.astype(cp.int64)))
-    except Exception as e:
-        print(f"DLPack conversion failed ({e}), falling back to .numpy() conversion.")
-        final_assignments_torch = torch.tensor(cp.asnumpy(assignments_cp), dtype=torch.int64, device=device)
-
-    return centroids_torch, final_assignments_torch
+    # Return CuPy arrays
+    return centroids_cp, assignments_cp.astype(cp.int64) # Cast assignments to int64 if needed downstream
 
 # ============================================================================
 # Task 2.2: Approximate Nearest Neighbors (ANN - Placeholder/Keep Original)
 # ============================================================================
 # Keep the existing SimpleHNSW_for_ANN class and our_ann wrapper function
-# if they are needed by the rest of the script (e.g., for recall comparison)
-# Ensure they use the necessary kernels (like l2_dist_kernel_1_vs_M) which
-# were kept above.
+# They use PyTorch/Triton internally. If they need to interact with the
+# CuPy K-Means output, the CALLER of our_kmeans would need to handle
+# the CuPy -> PyTorch conversion (e.g., via DLPack).
 
-# (Paste the SimpleHNSW_for_ANN class and our_ann function here from task_Ann.py)
-# Make sure distance functions used internally by HNSW (like _distance, _distance_batch)
-# rely on the correct kernels or PyTorch/Triton implementations as needed.
-
-
-# --- HNSW Class (Keep if needed, ensure internal distances are correct) ---
 class SimpleHNSW_for_ANN:
-    # Paste the full class definition from task_Ann.py here
-    # Ensure the internal _distance and _distance_batch methods use the
-    # appropriate distance calculations (likely the Triton kernels or PyTorch equivalents)
+     # (Paste the full HNSW class definition from the previous version here)
+     # Ensure it uses PyTorch/_prepare_tensors/Triton kernels as intended
     def __init__(self, dim, M=16, ef_construction=200, ef_search=50, mL=0.5):
         self.dim = dim
         self.M = M
@@ -258,7 +210,6 @@ class SimpleHNSW_for_ANN:
         self.node_count = 0
         self.entry_point = -1
         self.max_level = -1
-        # Use a reasonable block size, maybe link to a global default?
         self.BLOCK_SIZE_D_DIST = 128 # Or link to DEFAULT_BLOCK_D if defined globally
 
     def _get_level_for_new_node(self):
@@ -291,9 +242,8 @@ class SimpleHNSW_for_ANN:
         Calculates pairwise L2 distances between batches using distance_l2_triton.
         ASSUMES distance_l2_triton exists and computes L2 distances.
         """
-        # This requires a pairwise L2 function. If task_Ann.py defined one
-        # (like `distance_l2_triton`), use it. Otherwise, implement one.
-        # Let's assume distance_l2_triton exists from task_Ann.py:
+        # This requires a pairwise L2 function. If not available, this fails.
+        # Using torch.cdist as a PyTorch alternative:
         if not query_indices or not candidate_indices:
             return torch.empty((len(query_indices), len(candidate_indices)), device=device)
         target_device = self.vectors.device
@@ -305,29 +255,11 @@ class SimpleHNSW_for_ANN:
 
         query_vectors = self.vectors[valid_query_indices]
         candidate_vectors = self.vectors[valid_candidate_indices]
-
-        # Assuming distance_l2_triton calculates pairwise L2 distance
         try:
-             # Need a pairwise L2 distance function. If not available, this fails.
-             # Using torch.cdist as a PyTorch alternative:
-             query_vec_prep, cand_vec_prep = _prepare_tensors(query_vectors, candidate_vectors, target_device=target_device)
-             pairwise_l2_distances = torch.cdist(query_vec_prep, cand_vec_prep, p=2) # L2 distance
-
-             # Alternatively, if distance_l2_triton exists and returns L2 (not squared):
-             # pairwise_l2_distances = distance_l2_triton(query_vectors, candidate_vectors)
-
-             # If distance_l2_triton computes SQUARED L2, take sqrt:
-             # pairwise_l2_dist_sq = distance_l2_squared_triton(query_vectors, candidate_vectors)
-             # pairwise_l2_distances = torch.sqrt(pairwise_l2_dist_sq)
-
-        except NameError:
-            print("Error: Pairwise L2 distance function (e.g., distance_l2_triton) not found for HNSW _distance_batch.")
-            # Fallback to basic PyTorch cdist (might be slower than optimized Triton)
             query_vec_prep, cand_vec_prep = _prepare_tensors(query_vectors, candidate_vectors, target_device=target_device)
-            pairwise_l2_distances = torch.cdist(query_vec_prep, cand_vec_prep, p=2)
-
+            pairwise_l2_distances = torch.cdist(query_vec_prep, cand_vec_prep, p=2) # L2 distance
         except Exception as e:
-            print(f"Error in _distance_batch: {e}")
+            print(f"Error in _distance_batch using torch.cdist: {e}")
             return torch.empty((len(valid_query_indices), len(valid_candidate_indices)), device=target_device)
 
         return pairwise_l2_distances # Shape (len(valid_query), len(valid_candidate))
@@ -392,15 +324,16 @@ class SimpleHNSW_for_ANN:
 
         ep = [current_entry_point]
         for level in range(current_max_level, node_level, -1):
-             if level >= len(self.graph) or not ep or ep[0] >= len(self.graph[level]): continue
+             if level >= len(self.graph) or not ep or ep[0] < 0 or ep[0] >= len(self.graph[level]): continue
              search_results = self._search_layer(point_vec_prep, ep, level, ef=1) # Uses squared L2
              if not search_results: break
              ep = [search_results[0][1]]
 
         for level in range(min(node_level, current_max_level), -1, -1):
-             if level >= len(self.graph) or not ep or any(idx >= len(self.graph[level]) for idx in ep):
-                 if current_entry_point < len(self.graph[level]): ep = [current_entry_point]
-                 else: continue
+             if level >= len(self.graph) or not ep or any(idx < 0 or idx >= len(self.graph[level]) for idx in ep): # Check all ep elements
+                 if current_entry_point >=0 and current_entry_point < len(self.graph[level]):
+                      ep = [current_entry_point]
+                 else: continue # Cannot proceed
 
              neighbors_found_with_dist_sq = self._search_layer(point_vec_prep, ep, level, self.ef_construction) # Uses squared L2
              if not neighbors_found_with_dist_sq: continue
@@ -408,7 +341,7 @@ class SimpleHNSW_for_ANN:
              self.graph[level][new_node_id] = selected_neighbor_ids
 
              for neighbor_id in selected_neighbor_ids:
-                 if neighbor_id >= len(self.graph[level]): continue
+                 if neighbor_id < 0 or neighbor_id >= len(self.graph[level]): continue # Ensure neighbor_id is valid
                  neighbor_connections = self.graph[level][neighbor_id]
                  if new_node_id not in neighbor_connections:
                      if len(neighbor_connections) < self.M:
@@ -416,7 +349,7 @@ class SimpleHNSW_for_ANN:
                      else:
                          # Pruning logic (uses squared L2 from _distance)
                          dist_new_sq, valid_new = self._distance(self.vectors[neighbor_id], [new_node_id])
-                         if not valid_new or dist_new_sq.numel() == 0: continue # Check if distance calculation succeeded
+                         if not valid_new or dist_new_sq.numel() == 0: continue
                          dist_new_sq = dist_new_sq[0].item()
 
                          current_neighbor_ids = list(neighbor_connections)
@@ -424,13 +357,10 @@ class SimpleHNSW_for_ANN:
 
                          if dists_to_current_sq.numel() > 0:
                               furthest_dist_sq = -1.0; furthest_idx_in_list = -1
-                              # Map valid distances back to original indices
                               dist_map = {nid.item(): d.item() for nid, d in zip(valid_curr_ids, dists_to_current_sq)}
                               for list_idx, current_nid in enumerate(current_neighbor_ids):
-                                   # Use get with infinity if the neighbor was invalid for distance calc
                                    d_sq = dist_map.get(current_nid, float('inf'))
                                    if d_sq > furthest_dist_sq: furthest_dist_sq = d_sq; furthest_idx_in_list = list_idx
-
                               if furthest_idx_in_list != -1 and dist_new_sq < furthest_dist_sq:
                                    neighbor_connections[furthest_idx_in_list] = new_node_id
 
@@ -443,16 +373,16 @@ class SimpleHNSW_for_ANN:
     def _search_layer(self, query_vec, entry_points, target_level, ef):
         """Performs greedy search on a single layer (returns squared L2 dists)."""
         if self.entry_point == -1: return []
-        valid_entry_points = [ep for ep in entry_points if ep < self.node_count and ep >=0]
+        valid_entry_points = [ep for ep in entry_points if ep >= 0 and ep < self.node_count]
         if not valid_entry_points:
-             if self.entry_point != -1 and self.entry_point < self.node_count: valid_entry_points = [self.entry_point]
+             if self.entry_point >= 0 and self.entry_point < self.node_count: valid_entry_points = [self.entry_point]
              else: return []
 
         initial_distances_sq, valid_indices_init = self._distance(query_vec, valid_entry_points) # Squared L2
-        if valid_indices_init.numel() == 0: return [] # Changed check from initial_distances_sq
+        if valid_indices_init.numel() == 0: return []
 
         dist_map_init = {nid.item(): d.item() for nid, d in zip(valid_indices_init, initial_distances_sq)}
-        candidate_heap = [(dist_map_init.get(ep, float('inf')), ep) for ep in valid_entry_points]
+        candidate_heap = [(dist_map_init.get(ep, float('inf')), ep) for ep in valid_entry_points if ep in dist_map_init] # Only add valid EPs
         heapq.heapify(candidate_heap)
         results_heap = [(-dist_sq, node_id) for dist_sq, node_id in candidate_heap if dist_sq != float('inf')]
         heapq.heapify(results_heap)
@@ -471,11 +401,11 @@ class SimpleHNSW_for_ANN:
             if unvisited_neighbors:
                  visited.update(unvisited_neighbors)
                  neighbor_distances_sq, valid_neighbor_indices = self._distance(query_vec, unvisited_neighbors) # Squared L2
-                 if valid_neighbor_indices.numel() == 0: continue # Changed check
+                 if valid_neighbor_indices.numel() == 0: continue
 
                  dist_map_neighbors = {nid.item(): d.item() for nid, d in zip(valid_neighbor_indices, neighbor_distances_sq)}
-                 for neighbor_id_tensor in valid_neighbor_indices: # Iterate through tensor
-                      neighbor_id = neighbor_id_tensor.item() # Get Python int
+                 for neighbor_id_tensor in valid_neighbor_indices:
+                      neighbor_id = neighbor_id_tensor.item()
                       neighbor_dist_sq_val = dist_map_neighbors[neighbor_id]
                       furthest_dist_sq = -results_heap[0][0] if results_heap else float('inf')
                       if len(results_heap) < ef or neighbor_dist_sq_val < furthest_dist_sq:
@@ -493,20 +423,15 @@ class SimpleHNSW_for_ANN:
         ep = [self.entry_point]
         current_max_level = self.max_level
         for level in range(current_max_level, 0, -1):
-             if level >= len(self.graph) or not ep or ep[0] < 0 or ep[0] >= len(self.graph[level]): # Added check ep[0] >= 0
-                 # Fallback if ep becomes invalid
-                 if self.entry_point >= 0 and self.entry_point < len(self.graph[level]):
-                     ep = [self.entry_point]
-                 else:
-                     break # Cannot proceed
-                 # Add a check here if ep is still invalid after fallback
-                 if ep[0] < 0 or ep[0] >= len(self.graph[level]):
-                     break
+             if level >= len(self.graph) or not ep or ep[0] < 0 or ep[0] >= len(self.graph[level]):
+                 if self.entry_point >= 0 and self.entry_point < len(self.graph[level]): ep = [self.entry_point]
+                 else: break
+                 if ep[0] < 0 or ep[0] >= len(self.graph[level]): break # Check again after fallback
 
              search_results = self._search_layer(query_vec_prep, ep, level, ef=1) # Squared L2
              if not search_results: break
              ep = [search_results[0][1]]
-        if 0 >= len(self.graph) or not ep or ep[0] < 0 or ep[0] >= len(self.graph[0]): # Added check ep[0] >= 0
+        if 0 >= len(self.graph) or not ep or ep[0] < 0 or ep[0] >= len(self.graph[0]):
              if self.entry_point != -1 and 0 < len(self.graph) and self.entry_point < len(self.graph[0]): ep = [self.entry_point]
              else: return []
         neighbors_found = self._search_layer(query_vec_prep, ep, 0, self.ef_search) # Squared L2
@@ -515,6 +440,8 @@ class SimpleHNSW_for_ANN:
 
 # --- our_ann function remains the same, calling this class ---
 def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
+     # This function assumes A and X are PyTorch tensors
+     # It calls SimpleHNSW_for_ANN which uses PyTorch/Triton internally
      target_device = X.device
      A_prep, X_prep = _prepare_tensors(A, X, target_device=target_device)
      Q = X_prep.shape[0]
@@ -545,53 +472,72 @@ def our_ann(N_A, D, A, X, K, M=16, ef_construction=100, ef_search=50):
      return all_indices, all_distances, build_time, search_time # Returns indices and SQUARED L2 distances
 
 # ============================================================================
-# Example Usage (Keep or comment out as needed)
+# Example Usage
 # ============================================================================
 if __name__ == "__main__":
     N_data = 5000
-    N_queries = 100
     Dim = 128
-    K_val = 10
-
-    print("="*40)
-    print("Generating K-Means Test Data...")
-    print("="*40)
-    A_data_kmeans = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
     K_clusters = 5
 
+    print("="*40)
+    print("Generating K-Means Test Data (CuPy)...")
+    print("="*40)
+    # Generate data directly as CuPy array
+    A_data_cp = cp.random.randn(N_data, Dim, dtype=cp.float32)
+
     print("\n" + "="*40)
-    print(f"Testing our_kmeans (CuPy Assign, PyTorch Update) (K={K_clusters})...")
+    print(f"Testing our_kmeans (Pure CuPy) (K={K_clusters})...")
     print("="*40)
 
     try:
-        kmeans_centroids, kmeans_assignments = our_kmeans(N_data, Dim, A_data_kmeans, K_clusters, max_iters=20) # Limit iters for example
-        print("KMeans centroids shape:", kmeans_centroids.shape)
-        print("KMeans assignments shape:", kmeans_assignments.shape)
-        ids, counts = torch.unique(kmeans_assignments, return_counts=True)
-        print("Cluster counts:")
-        for id_val, count_val in zip(ids.tolist(), counts.tolist()):
+        # Pass the CuPy array directly
+        kmeans_centroids_cp, kmeans_assignments_cp = our_kmeans(
+            N_data, Dim, A_data_cp, K_clusters, max_iters=20
+        )
+        print("KMeans centroids shape (CuPy):", kmeans_centroids_cp.shape)
+        print("KMeans assignments shape (CuPy):", kmeans_assignments_cp.shape)
+
+        # Verify counts using CuPy
+        ids_cp, counts_cp = cp.unique(kmeans_assignments_cp.astype(cp.int32), return_counts=True) # unique needs int32 or int64 usually
+        print("Cluster counts (CuPy):")
+        # Convert to numpy for printing if needed
+        ids_np = cp.asnumpy(ids_cp)
+        counts_np = cp.asnumpy(counts_cp)
+        for id_val, count_val in zip(ids_np, counts_np):
             print(f"  Cluster {id_val}: {count_val}")
+
+    except ImportError:
+         print("Error: cupyx not found. Cannot use cupyx.scatter_add.")
+         print("Please install cupyx or modify the update step.")
+    except cp.cuda.runtime.CUDARuntimeError as e:
+         print(f"CUDA runtime error during K-Means: {e}")
     except Exception as e:
         print(f"Error during K-Means execution: {e}")
         import traceback
         traceback.print_exc()
 
-    # --- You can add back the ANN tests here if needed ---
-    # print("\n" + "="*40)
-    # print("Generating ANN Test Data...")
-    # print("="*40)
-    # A_data_ann = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
-    # X_queries_ann = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
-    #
-    # print("\n" + "="*40)
-    # print(f"Testing our_ann (HNSW, K={K_val})...")
-    # print("="*40)
-    # try:
-    #     ann_indices, ann_dists, build_t, search_t = our_ann(N_data, Dim, A_data_ann, X_queries_ann, K_val,
-    #                              M=32, ef_construction=200, ef_search=100)
-    #     print("ANN results shape (Indices):", ann_indices.shape)
-    #     print("ANN results shape (Distances - Squared L2):", ann_dists.shape)
-    # except Exception as e:
-    #      print(f"Error during ANN execution: {e}")
-    #      import traceback
-    #      traceback.print_exc()
+    # --- ANN Example (Requires PyTorch Input) ---
+    # If you want to test HNSW, you'll need PyTorch tensors
+    print("\n" + "="*40)
+    print("Generating ANN Test Data (PyTorch)...")
+    print("="*40)
+    N_queries = 100
+    K_val = 10
+    A_data_ann = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
+    X_queries_ann = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
+
+    print("\n" + "="*40)
+    print(f"Testing our_ann (HNSW - PyTorch/Triton) (K={K_val})...")
+    print("="*40)
+    try:
+        # our_ann expects PyTorch tensors
+        ann_indices, ann_dists_sq, build_t, search_t = our_ann(
+            N_data, Dim, A_data_ann, X_queries_ann, K_val,
+            M=32, ef_construction=200, ef_search=100
+        )
+        print("ANN results shape (Indices):", ann_indices.shape)
+        print("ANN results shape (Distances - Squared L2):", ann_dists_sq.shape)
+    except Exception as e:
+        print(f"Error during ANN execution: {e}")
+        import traceback
+        traceback.print_exc()
