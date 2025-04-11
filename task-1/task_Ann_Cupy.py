@@ -942,10 +942,10 @@ if __name__ == "__main__":
     # ... (previous setup code remains the same) ...
     N_data = 1000000
     Dim = 1024
-    N_queries = 500
+    N_queries = 10000
     num_clusters_for_kmeans = 500
-    K1_probe = 50 # K1: Probe nearest 20 centroids
-    K2_final = 50 # K2: Final desired number of nearest centroids
+    K1_probe = 200 # K1: Probe nearest 20 centroids
+    K2_final = 190 # K2: Final desired number of nearest centroids
 
     print("="*40)
     print("Generating Test Data (CuPy)...")
