@@ -940,12 +940,12 @@ def our_ann_user_pseudocode_impl(N_A, D, A_cp, X_cp, k_clusters, K1, K2, max_kme
 if __name__ == "__main__":
     # --- (Setup code: check cupy, set params, generate data A_cp, X_queries_cp) ---
     # ... (previous setup code remains the same) ...
-    N_data = 1000000
+    N_data = 10000000
     Dim = 1024
-    N_queries = 10000
+    N_queries = 100000
     num_clusters_for_kmeans = 500
-    K1_probe = 200 # K1: Probe nearest 20 centroids
-    K2_final = 190 # K2: Final desired number of nearest centroids
+    K1_probe = 400 # K1: Probe nearest 20 centroids
+    K2_final = 390 # K2: Final desired number of nearest centroids
 
     print("="*40)
     print("Generating Test Data (CuPy)...")
