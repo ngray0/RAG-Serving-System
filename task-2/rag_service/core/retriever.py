@@ -3,15 +3,10 @@ import numpy as np
 import torch
 from typing import List, Union
 import logging
-import triton
-import triton.language as tl
+#import triton
+#import triton.language as tl
 import time
-import json
 import cupy as cp
-# from test import testdata_kmeans, testdata_knn, testdata_ann # Assuming this exists if needed
-import csv
-import os
-import math
 
 # --- Device Setup ---
 if not torch.cuda.is_available():
@@ -24,7 +19,7 @@ else:
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- Triton Kernel (Unchanged) ---
+'''
 @triton.jit
 def dot_kernel_pairwise(
     X_ptr, A_ptr, Out_ptr,
@@ -57,7 +52,7 @@ def dot_kernel_pairwise(
 
         out_offset = pid_q * stride_outq + pid_n * stride_outn
         tl.store(Out_ptr + out_offset, dot_prod)
-
+'''
 
 class SimpleRetriever:
     """
@@ -744,7 +739,7 @@ class CupyRetriever:
 
             # 2. Calculate all dot products (scores) on GPU in one go
             # Input: (batch_size, D), (N, D) -> Output: (batch_size, N)
-            all_scores_cp = self._distance_dot(queries_cp, self.doc_embeddings_cp)
+            all_scores_cp = self.distance_cosine(queries_cp, self.doc_embeddings_cp)
 
             # 3. Find top max_k indices for all queries on GPU
             # Allocate space for results (indices and their scores for sorting)

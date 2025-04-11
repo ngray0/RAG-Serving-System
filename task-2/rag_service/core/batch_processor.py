@@ -8,7 +8,7 @@ from typing import List, Union
 from datasets import Dataset
 
 from .request_queue import RequestQueue, RedisRequestQueue
-from .retriever import SimpleRetriever, TritonKnnRetriever
+from .retriever import CupyRetriever
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -18,7 +18,7 @@ class BatchProcessor(threading.Thread):
                  request_queue: Union[RequestQueue, RedisRequestQueue],
                  embedding_model: dict,
                  llm_model, 
-                 retriever: TritonKnnRetriever, 
+                 retriever: CupyRetriever, 
                  device: str = 'cuda',
                  polling_interval: float = 0.1): 
         super().__init__(daemon=True) 
@@ -100,9 +100,9 @@ class BatchProcessor(threading.Thread):
             all_contexts = ["\n---\n".join(docs) for docs in all_retrieved_docs] 
 
             # 3 Batch LLM generation
-            prompts = [f"Context:\n{c}\n\nQuestion: {q}\n\nAnswer:" for q, c in zip(queries, all_contexts)]
+            prompts = [f"Context:\n{c}\n\nQuestion: {q}\n\nThe Answer to this question is: " for q, c in zip(queries, all_contexts)]
             dataset = Dataset.from_dict({"text": prompts}) 
-            outputs = self.llm_model(dataset["text"], max_new_tokens=25, do_sample=True, batch_size=len(prompts))
+            outputs = self.llm_model(dataset["text"], max_new_tokens=10, do_sample=True, batch_size=len(prompts))
 
             # 4 stores results
             for i, request_id in enumerate(request_ids):

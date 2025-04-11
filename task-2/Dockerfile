@@ -9,6 +9,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir cupy-cuda12x  
+#RUN pip install --no-cache-dir cupy-cuda11x  # For CUDA 11.x
+
+# Pre-download models
+RUN python -c "from transformers import AutoTokenizer, AutoModel; \
+    AutoTokenizer.from_pretrained('intfloat/multilingual-e5-large-instruct'); \
+    AutoModel.from_pretrained('intfloat/multilingual-e5-large-instruct'); \
+    AutoTokenizer.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct'); \
+    from transformers import pipeline; \
+    pipeline('text-generation', model='Qwen/Qwen2.5-1.5B-Instruct')"
+    
 
 COPY . .
 

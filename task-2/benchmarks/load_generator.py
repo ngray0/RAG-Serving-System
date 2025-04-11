@@ -93,9 +93,10 @@ def load_test_data():
 def send_request(endpoint, query, timeout, metrics, request_id, timestamp_data):
     """Send a request and poll for the result"""
     # Record actual request time
-    timestamp_data["actual_sent_time"] = time.time()
+    
     
     metrics.record_request_start(request_id)
+    timestamp_data["actual_sent_time"] = time.time()
     
     try:
         # Step 1: Submit the request

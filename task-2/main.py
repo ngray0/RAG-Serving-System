@@ -9,7 +9,7 @@ from rag_service.config import Settings
 from rag_service.core.request_queue import RequestQueue
 from rag_service.core.request_queue import RedisRequestQueue
 from rag_service.core.batch_processor import BatchProcessor
-from rag_service.core.retriever import TritonKnnRetriever, SimpleRetriever
+from rag_service.core.retriever import CupyRetriever
 from rag_service.api.endpoints import create_api
 
 def main():
@@ -23,11 +23,13 @@ def main():
     doc_embeddings = np.load(settings.document_embeddings_file)
     
     # Load models
-    embed_tokenizer = AutoTokenizer.from_pretrained(settings.embed_model_name, padding_side='left')
-    embed_model = AutoModel.from_pretrained(settings.embed_model_name, )
+    embed_tokenizer = AutoTokenizer.from_pretrained(settings.embed_model_name)
+    embed_model = AutoModel.from_pretrained(settings.embed_model_name)
     embedding_model = {"tokenizer": embed_tokenizer, "model": embed_model}
     
-    llm_model = pipeline("text-generation", model=settings.llm_model_name)
+    llm_tokenizer = AutoTokenizer.from_pretrained(settings.llm_model_name)
+    llm_tokenizer.padding_side = 'left'
+    llm_model = pipeline("text-generation", model=settings.llm_model_name, tokenizer=llm_tokenizer)
     
     # Create request queue - use Redis if REDIS_URL is set
     redis_url = os.environ.get("REDIS_URL")
@@ -47,7 +49,7 @@ def main():
         )
 
     # retriever object
-    retriever = SimpleRetriever(
+    retriever = CupyRetriever(
         doc_embeddings=doc_embeddings,
         documents=documents
     )
