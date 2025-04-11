@@ -807,7 +807,7 @@ if __name__ == "__main__":
     N_queries = 500
     K_val = 10
     K_clusters_ann = 200 # Number of clusters for ANN index (adjust as needed)
-    N_probe_ann = 30     # Number of clusters to probe (adjust as needed)
+    N_probe_ann = 60     # Number of clusters to probe (adjust as needed)
 
     print("="*40)
     print("Generating Test Data (CuPy)...")
