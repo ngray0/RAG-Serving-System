@@ -210,119 +210,162 @@ def our_ann_user_pseudocode_impl_l2_cpu(N_A, D, A_np, X_np, k_clusters, K1, K2,
 # ============================================================================
 # Main Execution Block (CPU ONLY)
 # ============================================================================
+# Assume necessary imports (numpy as np, time, traceback) and function definitions
+# (pairwise_l2_squared_numpy, our_kmeans_cpu, our_ann_user_pseudocode_impl_l2_cpu)
+# are present above this block.
+
 if __name__ == "__main__":
-    # --- Parameters ---
-    N_data = 1000000 # Smaller dataset for reasonable CPU KMeans time
-    Dim = 1024      # Smaller dimension
-    N_queries = 10000 # Fewer queries
-    num_clusters_for_kmeans = 100 # Fewer clusters
+    # --- Fixed Parameters for all dimension runs ---
+    N_data = 1000000 # Using 1 Million points as requested
+    N_queries = 1000  # Reduced queries for faster testing per dimension
+    num_clusters_for_kmeans = 100
     K1_probe = 30
     K2_final = 10
+    kmeans_max_iters = 50 # Max iterations for KMeans
 
-    print(f"--- CPU ONLY EXECUTION ---")
-    print(f"N={N_data}, D={Dim}, Q={N_queries}, k_clusters={num_clusters_for_kmeans}, K1={K1_probe}, K2={K2_final}")
+    # --- Dimensions to Test ---
+    dimensions_to_test = [2, 4, 64, 256, 1024]
 
-    # --- Generate Base Data (on CPU) ---
-    print("\n" + "="*40); print("Generating Base Data (A_np on CPU)..."); print("="*40)
-    try:
-        # Use NumPy directly
-        A_data_np = np.random.randn(N_data, Dim).astype(np.float32)
-        print(f"Database shape (CPU): {A_data_np.shape}")
-    except Exception as e: print(f"Error generating A_data_np: {e}"); exit()
+    print(f"--- CPU ONLY EXECUTION LOOPING THROUGH DIMENSIONS ---")
+    print(f"Fixed Params: N={N_data}, Q={N_queries}, k_clusters={num_clusters_for_kmeans}, K1={K1_probe}, K2={K2_final}")
+    print(f"Testing Dimensions: {dimensions_to_test}")
 
-    # --- Build Index ONCE (CPU KMeans) ---
-    print("\n" + "="*40); print("Building Centroids via CPU KMeans (Run Once)..."); print("="*40)
-    initial_centroids_np = None
-    actual_k_clusters = 0
-    build_time_actual = 0
-    try:
-        build_start_actual = time.time()
-        # Call CPU KMeans
-        initial_centroids_np, _ = our_kmeans_cpu(N_data, Dim, A_data_np, num_clusters_for_kmeans, max_iters=50)
-        actual_k_clusters = initial_centroids_np.shape[0]
-        build_time_actual = time.time() - build_start_actual
-        if actual_k_clusters == 0: raise ValueError("KMeans returned 0 centroids.")
-        print(f"CPU KMeans completed. Found {actual_k_clusters} centroids.")
-        print(f"Actual Build Time: {build_time_actual:.4f}s")
-    except Exception as e: print(f"Error during initial KMeans build: {e}"); traceback.print_exc(); exit()
+    # Loop through each dimension
+    for Dim in dimensions_to_test:
+        print("\n" + "#"*70)
+        print(f"# Starting Test for Dimension D = {Dim}")
+        print("#"*70)
 
-    # --- Generate NEW Queries (on CPU) ---
-    print("\n" + "="*40); print(f"Generating {N_queries} NEW Test Queries (on CPU)..."); print("="*40)
-    try:
-        # Use NumPy directly
-        X_queries_np_new = np.random.randn(N_queries, Dim).astype(np.float32)
-        print(f"New query shape (CPU): {X_queries_np_new.shape}")
-    except Exception as e: print(f"Error generating new queries: {e}"); exit()
-
-    # --- Run ANN Search (CPU Function, using centroids on CPU) ---
-    print("\n" + "="*40); print(f"Testing our_ann_user_pseudocode_impl_l2_cpu with {N_queries} NEW queries..."); print("="*40)
-    k1_run = min(K1_probe, actual_k_clusters)
-    k2_run = min(K2_final, k1_run)
-    print(f"(Using {actual_k_clusters} centroids, K1={k1_run}, K2={k2_run}, L2 Distance, CPU Search)")
-    print("="*40)
-    ann_indices_centroids_np = None
-    ann_dists_sq_centroids_np = None
-    centroids_used_np = None
-    search_t = 0
-    try:
-        # Call the CPU L2 version of the function
-        ann_indices_centroids_np, ann_dists_sq_centroids_np, centroids_used_np, build_t_ignored, search_t = our_ann_user_pseudocode_impl_l2_cpu(
-            N_A=N_data, D=Dim, A_np=A_data_np, # Pass A_np only if building index inside
-            X_np=X_queries_np_new,             # Use CPU queries
-            k_clusters=actual_k_clusters,
-            K1=k1_run,
-            K2=k2_run,
-            centroids_np=initial_centroids_np  # Pass CPU centroids
-        )
-        print("CPU User Pseudocode ANN results shape (Centroid Indices):", ann_indices_centroids_np.shape)
-        print("CPU User Pseudocode ANN results shape (**SQUARED** L2 Distances to Centroids):", ann_dists_sq_centroids_np.shape)
-        print(f"CPU User Pseudocode ANN Search Time ({N_queries} New Queries, L2): {search_t:.4f}s")
-        if search_t > 0: print(f"-> Throughput: {N_queries / search_t:.2f} queries/sec (CPU)")
-
-    except Exception as e: print(f"Error during ANN execution: {e}"); traceback.print_exc()
-
-
-    # --- Calculate Recall against True Nearest Centroids (using L2 distance on CPU) ---
-    if ann_indices_centroids_np is not None and centroids_used_np is not None and centroids_used_np.shape[0] > 0:
-        print("\n" + "="*40); print("Calculating Recall vs. True Nearest Centroids (CPU L2)..."); print("="*40)
-        K_recall = k2_run
+        # --- Generate Base Data (on CPU) for the current dimension ---
+        print("\n" + "="*40); print(f"Generating Base Data (D={Dim})..."); print("="*40)
         try:
-            # Ground truth calculation on CPU
-            print("Calculating ground truth (CPU Brute-force nearest centroids using SQUARED L2)...")
-            start_gt = time.time()
-            # Use NumPy pairwise distance
-            all_query_centroid_dists_sq_gt = pairwise_l2_squared_numpy(X_queries_np_new, centroids_used_np)
+            # Use NumPy directly
+            A_data_np = np.random.randn(N_data, Dim).astype(np.float32)
+            print(f"Database shape (CPU): {A_data_np.shape}")
+            # Check memory usage roughly
+            mem_gb = A_data_np.nbytes / (1024**3)
+            print(f"Approx. memory for A_data_np: {mem_gb:.2f} GB")
+            if mem_gb > 8: # Arbitrary threshold
+                 print("Warning: Dataset size is large, KMeans might be very slow / require significant RAM.")
 
-            actual_num_centroids = centroids_used_np.shape[0]
-            k_recall_adjusted = min(K_recall, actual_num_centroids)
+        except MemoryError:
+             print(f"Error: Failed to allocate memory for A_data_np (D={Dim}). Skipping this dimension.")
+             continue # Skip to the next dimension
+        except Exception as e:
+            print(f"Error generating A_data_np (D={Dim}): {e}");
+            continue # Skip to the next dimension
 
-            if k_recall_adjusted > 0:
-                # Find true nearest centroids using SQUARED L2 distance on CPU
-                true_knn_centroid_indices_np = np.argsort(all_query_centroid_dists_sq_gt, axis=1)[:, :k_recall_adjusted]
-            else:
-                true_knn_centroid_indices_np = np.empty((N_queries, 0), dtype=np.int64)
-            print(f"Ground truth calculation time: {time.time() - start_gt:.4f}s")
+        # --- Build Index ONCE (CPU KMeans) for the current dimension ---
+        print("\n" + "="*40); print(f"Building Centroids via CPU KMeans (D={Dim})..."); print("="*40)
+        initial_centroids_np = None
+        actual_k_clusters = 0
+        build_time_actual = 0
+        try:
+            build_start_actual = time.time()
+            # Call CPU KMeans
+            initial_centroids_np, _ = our_kmeans_cpu(N_data, Dim, A_data_np, num_clusters_for_kmeans, max_iters=kmeans_max_iters)
+            actual_k_clusters = initial_centroids_np.shape[0]
+            build_time_actual = time.time() - build_start_actual
+            if actual_k_clusters == 0: raise ValueError("KMeans returned 0 centroids.")
+            print(f"CPU KMeans completed. Found {actual_k_clusters} centroids.")
+            print(f"Actual Build Time (D={Dim}): {build_time_actual:.4f}s")
+        except Exception as e:
+            print(f"Error during initial KMeans build (D={Dim}): {e}");
+            traceback.print_exc();
+            continue # Skip to the next dimension
 
-            # Compare results (already NumPy arrays)
-            total_intersect_centroids = 0
-            ann_indices_np = ann_indices_centroids_np[:, :k_recall_adjusted] # Use the results directly
-            true_indices_np = true_knn_centroid_indices_np
+        # --- Generate NEW Queries (on CPU) for the current dimension ---
+        print("\n" + "="*40); print(f"Generating {N_queries} NEW Test Queries (D={Dim})..."); print("="*40)
+        try:
+            # Use NumPy directly
+            X_queries_np_new = np.random.randn(N_queries, Dim).astype(np.float32)
+            print(f"New query shape (CPU): {X_queries_np_new.shape}")
+        except Exception as e:
+            print(f"Error generating new queries (D={Dim}): {e}");
+            continue # Skip to the next dimension
 
-            for i in range(N_queries): # Loop on CPU
-                 approx_centroid_ids = set(idx for idx in ann_indices_np[i] if idx >= 0)
-                 true_centroid_ids = set(true_indices_np[i])
-                 total_intersect_centroids += len(approx_centroid_ids.intersection(true_centroid_ids))
+        # --- Run ANN Search (CPU Function) for the current dimension ---
+        print("\n" + "="*40); print(f"Testing CPU ANN Search (D={Dim})..."); print("="*40)
+        k1_run = min(K1_probe, actual_k_clusters)
+        k2_run = min(K2_final, k1_run)
+        print(f"(Using {actual_k_clusters} centroids, K1={k1_run}, K2={k2_run}, L2 Distance, CPU Search)")
+        print("="*40)
+        ann_indices_centroids_np = None
+        ann_dists_sq_centroids_np = None
+        centroids_used_np = None
+        search_t = 0
+        try:
+            # Call the CPU L2 version of the function
+            # Pass A_data_np in case the implementation needs N/D from it if centroids aren't passed
+            # (though our current one recalculates N/D from A_np if building index inside)
+            ann_indices_centroids_np, ann_dists_sq_centroids_np, centroids_used_np, build_t_ignored, search_t = our_ann_user_pseudocode_impl_l2_cpu(
+                N_A=N_data, D=Dim, A_np=A_data_np,
+                X_np=X_queries_np_new, # Use CPU queries for current Dim
+                k_clusters=actual_k_clusters, # Not used if centroids passed
+                K1=k1_run,
+                K2=k2_run,
+                centroids_np=initial_centroids_np # Pass CPU centroids for current Dim
+            )
+            print("CPU User Pseudocode ANN results shape (Centroid Indices):", ann_indices_centroids_np.shape)
+            print("CPU User Pseudocode ANN results shape (**SQUARED** L2 Distances to Centroids):", ann_dists_sq_centroids_np.shape)
+            print(f"CPU User Pseudocode ANN Search Time (D={Dim}): {search_t:.4f}s")
+            if search_t > 0: print(f"-> Throughput: {N_queries / search_t:.2f} queries/sec (CPU)")
 
-            if N_queries > 0 and k_recall_adjusted > 0:
-                avg_recall_centroids = total_intersect_centroids / (N_queries * k_recall_adjusted)
-                print(f"\nAverage Recall @ {k_recall_adjusted} (vs CPU brute-force CENTROIDS w/ L2): {avg_recall_centroids:.4f} ({avg_recall_centroids:.2%})")
-                # Commentary
-                epsilon = 1e-9
-                if abs(avg_recall_centroids - 1.0) < epsilon: print("Result: 100% recall indicates K1 was large enough...")
-                else: print(f"Result: Recall ({avg_recall_centroids:.4f}) < 100%...")
-            else: print("\nCannot calculate recall (N_queries=0 or K2=0).")
+        except Exception as e:
+            print(f"Error during ANN execution (D={Dim}): {e}");
+            traceback.print_exc();
+            # Don't continue to recall if ANN failed
+            ann_indices_centroids_np = None # Ensure recall doesn't run
 
-        except Exception as e: print(f"Error during recall calculation: {e}"); traceback.print_exc()
-    # ... (Error handling if results/centroids are None) ...
+        # --- Calculate Recall (CPU) for the current dimension ---
+        if ann_indices_centroids_np is not None and centroids_used_np is not None and centroids_used_np.shape[0] > 0:
+            print("\n" + "="*40); print(f"Calculating Recall (D={Dim}, CPU L2)..."); print("="*40)
+            K_recall = k2_run
+            try:
+                # Ground truth calculation on CPU
+                # print("Calculating ground truth (CPU Brute-force nearest centroids using SQUARED L2)...")
+                start_gt = time.time()
+                all_query_centroid_dists_sq_gt = pairwise_l2_squared_numpy(X_queries_np_new, centroids_used_np)
 
-    print("\n--- CPU ONLY EXECUTION FINISHED ---")
+                actual_num_centroids = centroids_used_np.shape[0]
+                k_recall_adjusted = min(K_recall, actual_num_centroids)
+
+                if k_recall_adjusted > 0:
+                    true_knn_centroid_indices_np = np.argsort(all_query_centroid_dists_sq_gt, axis=1)[:, :k_recall_adjusted]
+                else:
+                    true_knn_centroid_indices_np = np.empty((N_queries, 0), dtype=np.int64)
+                # print(f"Ground truth calculation time: {time.time() - start_gt:.4f}s")
+
+                # Compare results
+                total_intersect_centroids = 0
+                ann_indices_np = ann_indices_centroids_np[:, :k_recall_adjusted]
+                true_indices_np = true_knn_centroid_indices_np
+                for i in range(N_queries):
+                    approx_centroid_ids = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                    true_centroid_ids = set(true_indices_np[i])
+                    total_intersect_centroids += len(approx_centroid_ids.intersection(true_centroid_ids))
+
+                if N_queries > 0 and k_recall_adjusted > 0:
+                    avg_recall_centroids = total_intersect_centroids / (N_queries * k_recall_adjusted)
+                    print(f"\nAverage Recall @ {k_recall_adjusted} (vs CPU brute-force CENTROIDS w/ L2, D={Dim}): {avg_recall_centroids:.4f} ({avg_recall_centroids:.2%})")
+                    # Commentary
+                    epsilon = 1e-9
+                    if abs(avg_recall_centroids - 1.0) < epsilon: print("Result: 100% recall indicates K1 was large enough...")
+                    else: print(f"Result: Recall ({avg_recall_centroids:.4f}) < 100%...")
+                else: print("\nCannot calculate recall (N_queries=0 or K2=0).")
+
+            except Exception as e:
+                print(f"Error during recall calculation (D={Dim}): {e}");
+                traceback.print_exc()
+        else:
+             print("\nSkipping recall calculation as ANN results or centroids are unavailable.")
+
+        print(f"\n--- Finished Test for Dimension D = {Dim} ---")
+        # Optional: clean up large array to free memory before next iteration
+        del A_data_np, X_queries_np_new, initial_centroids_np
+        if 'centroids_used_np' in locals(): del centroids_used_np
+        if 'ann_indices_centroids_np' in locals(): del ann_indices_centroids_np
+        if 'ann_dists_sq_centroids_np' in locals(): del ann_dists_sq_centroids_np
+
+
+    print("\n--- ALL CPU DIMENSION TESTS FINISHED ---")
