@@ -803,11 +803,11 @@ if __name__ == "__main__":
         exit()
 
     N_data = 100000 # Increased size for better performance comparison
-    Dim = 128
+    Dim = 1024
     N_queries = 500
     K_val = 10
     K_clusters_ann = 200 # Number of clusters for ANN index (adjust as needed)
-    N_probe_ann = 10     # Number of clusters to probe (adjust as needed)
+    N_probe_ann = 30     # Number of clusters to probe (adjust as needed)
 
     print("="*40)
     print("Generating Test Data (CuPy)...")
