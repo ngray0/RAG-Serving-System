@@ -899,7 +899,7 @@ if __name__ == "__main__":
         print(f"Error during ANN execution: {e}")
         import traceback
         traceback.print_exc()
-    D = 128  # The dimension of vectors in your index (A_cp)
+    D = 1024  # The dimension of vectors in your index (A_cp)
     Q_new = 500 # How many new queries you want to generate
 
 # --- Generate ---
@@ -913,7 +913,7 @@ if __name__ == "__main__":
     print(f"\nSearching with {new_queries_cp.shape[0]} newly generated queries...")
 
     try:
-        D = 128
+        D = 1024
         Q_new = 500
         noise_level = 0.05 # How much noise to add (adjust magnitude)
 # Assume A_cp (the database used for indexing) is available
