@@ -183,19 +183,23 @@ def distance_dot_tiled(X, A, N_TILE=32768, prep=True): # Adjusted tile size, nee
         # torch.cuda.synchronize() # Debugging sync point
 
     return Out # Return POSITIVE dot product
+# Corrected distance_l2 function definition
 
-def distance_l2(X, A, **kwargs):
+def distance_l2(X, A): # Removed **kwargs from signature
     """
     Computes pairwise SQUARED L2 (Euclidean) distances using the tiled dot product kernel
     and PyTorch operations for norms. Returns SQUARED L2 distance.
     """
-    X_prep, A_prep = _prepare_tensors(X, A) # Ensure prepared tensors
+    # Prepare tensors internally, prep=True is default for _prepare_tensors
+    X_prep, A_prep = _prepare_tensors(X, A)
     Q, D = X_prep.shape
     N, D_A = A_prep.shape
     if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
 
     # Calculate dot products (positive values)
-    dot_products = distance_dot_tiled(X_prep, A_prep, prep=False, **kwargs) # Shape (Q, N)
+    # Call distance_dot_tiled, explicitly stating tensors are now prepared (prep=False)
+    # DO NOT pass **kwargs down, as they might contain a conflicting 'prep'
+    dot_products = distance_dot_tiled(X_prep, A_prep, prep=False) # Shape (Q, N)
 
     # Calculate squared norms
     X_norm_sq = torch.sum(X_prep**2, axis=1, keepdims=True)  # Shape (Q, 1)
@@ -204,10 +208,9 @@ def distance_l2(X, A, **kwargs):
     # ||X-A||^2 = ||X||^2 + ||A||^2 - 2*dot(X,A)
     dist_sq = X_norm_sq + A_norm_sq.T - 2 * dot_products # Shape (Q, N)
 
-    # Clamp results to ensure non-negativity due to potential floating point issues
+    # Clamp results to ensure non-negativity
     dist_sq.clamp_(min=0.0)
     return dist_sq # Return squared L2 distance
-
 # --- Triton KMeans Implementation ---
 def our_kmeans(N_A, D, A, K, max_iters=100, tol=1e-4):
     """
@@ -400,7 +403,7 @@ def our_ann_user_pseudocode_impl_l2_triton(N_A, D, A, X, k_clusters, K1, K2,
 
     # Calculate all query-centroid SQUARED L2 distances using Triton dot kernel internally
     # Pass prep=False as X_prep and centroids_used are already prepared
-    all_query_centroid_dists_sq = distance_l2(X_prep, centroids_used, prep=False) # Shape (Q, actual_k_clusters)
+    all_query_centroid_dists_sq = distance_l2(X_prep, centroids_used) # Shape (Q, actual_k_clusters)
 
     # Step 2: Find K1 nearest centroids (based on squared L2 distance)
     # Use torch.topk which is efficient on GPU and returns sorted results
@@ -559,7 +562,7 @@ if __name__ == "__main__":
                 # print("Calculating ground truth (Triton/PyTorch brute-force nearest centroids using SQUARED L2)...")
                 start_gt = time.time()
                 # Use the same queries/centroids as the search function used
-                all_query_centroid_dists_sq_gt = distance_l2(X_queries_new, centroids_used, prep=False) # Use the L2 function
+                all_query_centroid_dists_sq_gt = distance_l2(X_queries_new, centroids_used) # Use the L2 function
 
                 actual_num_centroids = centroids_used.shape[0]
                 k_recall_adjusted = min(K_recall, actual_num_centroids)
