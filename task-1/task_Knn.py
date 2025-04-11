@@ -772,10 +772,10 @@ def our_knn_stream(N, D, A, X, K):
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data = 100000
-    N_queries = 1000
+    N_data = 10000
+    N_queries = 100
     K_val = 10          # K for KNN
-    NUM_RUNS = 10       # Number of timed runs for averaging
+    NUM_RUNS = 5       # Number of timed runs for averaging
     WARMUP_RUNS = 2     # Number of warm-up runs
 
     # --- Dimensions to Test ---
