@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 import numpy as np
 import time
+import scipy.spatial.distance
 import json
 from test import testdata_kmeans, testdata_knn, testdata_ann
 import csv
@@ -639,6 +640,106 @@ def distance_manhattan(X, A, N_TILE=4096, prep=True): # Keep N_TILE argument
 
     torch.cuda.synchronize(device=target_device) # Sync after all chunks are launched
     return Out
+
+# ============================================================================
+# CPU Distance Functions (NumPy / SciPy)
+# ============================================================================
+
+def distance_dot_cpu(X_np, A_np):
+    """ CPU Pairwise Dot Product using NumPy """
+    # Ensure inputs are NumPy arrays
+    if not isinstance(X_np, np.ndarray): X_np = np.asarray(X_np, dtype=np.float32)
+    if not isinstance(A_np, np.ndarray): A_np = np.asarray(A_np, dtype=np.float32)
+    # Ensure correct dtypes (though matmul might handle some cases)
+    if X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
+    if A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
+
+    # Perform matrix multiplication: (Q, D) @ (D, N) -> (Q, N)
+    return X_np @ A_np.T
+
+def distance_l2_squared_cpu(X_np, A_np):
+    """ CPU Pairwise Squared Euclidean (L2) distance using SciPy """
+    # Ensure inputs are NumPy arrays and float32 for consistency
+    if not isinstance(X_np, np.ndarray): X_np = np.asarray(X_np, dtype=np.float32)
+    if not isinstance(A_np, np.ndarray): A_np = np.asarray(A_np, dtype=np.float32)
+    if X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
+    if A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
+
+    # 'sqeuclidean' computes squared L2 distance
+    return scipy.spatial.distance.cdist(X_np, A_np, metric='sqeuclidean')
+
+def distance_cosine_cpu(X_np, A_np):
+    """ CPU Pairwise Cosine distance using SciPy """
+    # Ensure inputs are NumPy arrays and float32 for consistency
+    if not isinstance(X_np, np.ndarray): X_np = np.asarray(X_np, dtype=np.float32)
+    if not isinstance(A_np, np.ndarray): A_np = np.asarray(A_np, dtype=np.float32)
+    if X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
+    if A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
+
+    # 'cosine' computes 1 - cosine_similarity
+    return scipy.spatial.distance.cdist(X_np, A_np, metric='cosine')
+
+def distance_manhattan_cpu(X_np, A_np):
+    """ CPU Pairwise Manhattan (L1) distance using SciPy """
+    # Ensure inputs are NumPy arrays and float32 for consistency
+    if not isinstance(X_np, np.ndarray): X_np = np.asarray(X_np, dtype=np.float32)
+    if not isinstance(A_np, np.ndarray): A_np = np.asarray(A_np, dtype=np.float32)
+    if X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
+    if A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
+
+    # 'cityblock' is the metric name for Manhattan distance in SciPy
+    return scipy.spatial.distance.cdist(X_np, A_np, metric='cityblock')
+
+# ============================================================================
+# CPU KNN Function (NumPy / SciPy)
+# ============================================================================
+
+def our_knn_cpu(N_A, D, A_np, X_np, K):
+    """
+    Finds the K nearest neighbors on the CPU using SciPy/NumPy.
+    Uses Squared L2 distance.
+
+    Args:
+        N_A (int): Number of database points (matches A_np.shape[0]).
+        D (int): Dimensionality (matches A_np.shape[1] and X_np.shape[1]).
+        A_np (np.ndarray): Database vectors (N_A, D) on CPU.
+        X_np (np.ndarray): Query vectors (Q, D) on CPU.
+        K (int): Number of neighbors to find.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]:
+            - topk_indices (np.ndarray): Indices of the K nearest neighbors (Q, K).
+            - topk_distances (np.ndarray): Squared L2 distances of the K nearest neighbors (Q, K).
+    """
+    Q = X_np.shape[0]
+    if A_np.shape[0] != N_A or A_np.shape[1] != D or X_np.shape[1] != D:
+        raise ValueError("Dimension mismatch or N_A incorrect in our_knn_cpu")
+    if K <= 0 or K > N_A:
+        raise ValueError(f"Invalid K value ({K}) for N_A={N_A}")
+
+    # 1. Calculate all pairwise squared L2 distances using SciPy's cdist
+    all_distances_sq = distance_l2_squared_cpu(X_np, A_np) # Shape (Q, N_A)
+
+    # 2. Find the top K smallest distances for each query using argpartition
+    # np.argpartition finds the indices that *would* partition the array.
+    # We want the first K indices if the array were sorted (smallest distances).
+    # kth=K-1 means elements with index < K will be <= the element at index K-1
+    k_indices_unsorted = np.argpartition(all_distances_sq, kth=K-1, axis=1)[:, :K] # Shape (Q, K)
+
+    # 3. Get the actual distances corresponding to these indices
+    topk_distances_unsorted = np.take_along_axis(all_distances_sq, k_indices_unsorted, axis=1) # Shape (Q, K)
+
+    # 4. Sort the results within the top K for each query
+    # Argsort along the K dimension of the unsorted distances
+    sorted_order_in_k = np.argsort(topk_distances_unsorted, axis=1) # Shape (Q, K)
+
+    # Apply this sort order to both the indices and the distances
+    topk_indices = np.take_along_axis(k_indices_unsorted, sorted_order_in_k, axis=1)
+    topk_distances = np.take_along_axis(topk_distances_unsorted, sorted_order_in_k, axis=1)
+
+    return topk_indices, topk_distances
+
+
 def our_knn(N_A, D, A, X, K):
     """
     Finds the K nearest neighbors in A for each query vector in X using
@@ -914,18 +1015,23 @@ if __name__ == "__main__":
     K_val = 10          # K for KNN
     NUM_RUNS = 10       # Number of timed runs for averaging
     WARMUP_RUNS = 2     # Number of warm-up runs
+    # --- CPU BENCHMARKING FLAG ---
+    BENCHMARK_CPU = True # Set to False to skip CPU tests (can be slow)
 
     # --- Dimensions to Test ---
-    # dimensions_to_test = [2] # <-- START WITH ONLY ONE SMALL DIMENSION FOR DEBUGGING
-    dimensions_to_test = [2, 4, 64, 256, 1024] # Original list
+    dimensions_to_test = [2, 4, 64, 256, 1024]
 
     # --- Tolerance for Numerical Check ---
-    rtol_check = 1e-4 # Relative tolerance
-    atol_check = 1e-5 # Absolute tolerance
+    rtol_check = 1e-4
+    atol_check = 1e-5
 
-    # --- !!! DEBUG FLAG !!! ---
-    # Set DETAILED_DEBUG = False for cleaner production runs
-    DETAILED_DEBUG = False # Set to True to print extra info during generation/warmup
+    # --- DEBUG FLAG ---
+    DETAILED_DEBUG = False # Set to True for extra info during GPU gen/warmup
+
+    print(f"--- GPU & CPU KNN/DISTANCE BENCHMARKING & VALIDATION ---") # Updated title
+    print(f"Fixed Params: N={N_data}, Q={N_queries}, K={K_val}, Warmup={WARMUP_RUNS}, Runs={NUM_RUNS}")
+    print(f"Testing Dimensions: {dimensions_to_test}")
+    print(f"Benchmark CPU: {BENCHMARK_CPU}")
 
     print(f"--- GPU KNN/DISTANCE BENCHMARKING & VALIDATION ---")
     print(f"Fixed Params: N={N_data}, Q={N_queries}, K={K_val}, Warmup={WARMUP_RUNS}, Runs={NUM_RUNS}")
@@ -952,42 +1058,51 @@ if __name__ == "__main__":
         print(f"# Starting Test for Dimension D = {Dim}")
         print("#"*70 + "\n")
 
-        results[Dim] = {} # Store results for this dimension
-        dimension_failed = False # Flag for skipping benchmarks if warm-up fails
-        A_data = A_data_cp = X_queries = X_queries_cp = None # Ensure cleanup scope
+        results[Dim] = {}
+        dimension_failed = False
+        A_data = A_data_cp = X_queries = X_queries_cp = None
+        A_data_np = X_queries_np = None # Add NumPy vars
 
-        # --- Generate Base Data (PyTorch and CuPy) ---
+        # --- Generate Base Data (GPU and transfer to CPU) ---
         print("="*40); print(f"Generating Data (D={Dim})..."); print("="*40)
         try:
+            # Generate on GPU
             A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
             X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
-            torch.cuda.synchronize(device=device) # Ensure data is ready
-            print(f"Database shape (Torch): {A_data.shape}, Strides: {A_data.stride()}")
-            print(f"Query shape (Torch): {X_queries.shape}, Strides: {X_queries.stride()}")
+            torch.cuda.synchronize(device=device)
+            print(f"Database shape (Torch): {A_data.shape}")
+            print(f"Query shape (Torch): {X_queries.shape}")
 
+            # Transfer to CPU (NumPy) - Outside benchmark timing
+            if BENCHMARK_CPU:
+                print("Transferring data to CPU (NumPy)...")
+                start_transfer = time.perf_counter()
+                A_data_np = A_data.cpu().numpy()
+                X_queries_np = X_queries.cpu().numpy()
+                end_transfer = time.perf_counter()
+                print(f"  Transfer time: {end_transfer - start_transfer:.4f} s")
+                print(f"Database shape (NumPy): {A_data_np.shape}")
+                print(f"Query shape (NumPy): {X_queries_np.shape}")
+
+            # Transfer to CuPy (if needed)
             if cupy_device_ok:
                 A_data_contig = A_data.contiguous(); X_queries_contig = X_queries.contiguous()
-                if DETAILED_DEBUG: print(f"Torch A contig? {A_data_contig.is_contiguous()}. Torch X contig? {X_queries_contig.is_contiguous()}")
                 dlpack_A = torch.to_dlpack(A_data_contig); dlpack_X = torch.to_dlpack(X_queries_contig)
                 A_data_cp = cp.from_dlpack(dlpack_A); X_queries_cp = cp.from_dlpack(dlpack_X)
-                cp.cuda.Stream.null.synchronize() # Ensure data is ready
-                print(f"Database shape (CuPy): {A_data_cp.shape}, Strides: {A_data_cp.strides}")
-                print(f"Query shape (CuPy): {X_queries_cp.shape}, Strides: {X_queries_cp.strides}")
-            else: print("CuPy data generation skipped.")
+                cp.cuda.Stream.null.synchronize()
+                print(f"Database shape (CuPy): {A_data_cp.shape}")
             print("-" * 40)
 
         except Exception as e:
-            print(f"*** CRITICAL ERROR during Data Generation (D={Dim}): {e} ***")
+            # ...(Error handling for data generation remains the same)...
+            print(f"*** CRITICAL ERROR during Data Generation/Transfer (D={Dim}): {e} ***")
             import traceback; traceback.print_exc()
-            dimension_failed = True # Mark dimension as failed
-            # Explicitly delete partially created tensors
-            if 'A_data' in locals() and A_data is not None: del A_data
-            if 'X_queries' in locals() and X_queries is not None: del X_queries
-            if cupy_device_ok and 'A_data_cp' in locals() and A_data_cp is not None: del A_data_cp
-            if cupy_device_ok and 'X_queries_cp' in locals() and X_queries_cp is not None: del X_queries_cp
-            torch.cuda.empty_cache();
-            if cupy_device_ok: cp.get_default_memory_pool().free_all_blocks()
-            continue # Skip dimension
+            dimension_failed = True
+            # Clean up CPU arrays too
+            if 'A_data_np' in locals() and A_data_np is not None: del A_data_np
+            if 'X_queries_np' in locals() and X_queries_np is not None: del X_queries_np
+            #...(rest of cleanup)...
+            continue
 
         # ===---------------------------------------------------------===
         # ===              WARM-UP RUNS (Individual Checks)         ===
@@ -1001,6 +1116,15 @@ if __name__ == "__main__":
             "distance_manhattan": lambda: distance_manhattan(X_queries, A_data), # Assumes this uses the simple kernel now
             "our_knn": lambda: our_knn(N_data, Dim, A_data, X_queries, K_val),
         }
+        warmup_functions_cpu = {} # CPU NumPy/SciPy
+        if BENCHMARK_CPU and A_data_np is not None:
+            warmup_functions_cpu = {
+                "distance_dot_cpu": lambda: distance_dot_cpu(X_queries_np, A_data_np),
+                "distance_l2_squared_cpu": lambda: distance_l2_squared_cpu(X_queries_np, A_data_np),
+                "distance_cosine_cpu": lambda: distance_cosine_cpu(X_queries_np, A_data_np),
+                "distance_manhattan_cpu": lambda: distance_manhattan_cpu(X_queries_np, A_data_np),
+                "our_knn_cpu": lambda: our_knn_cpu(N_data, Dim, A_data_np, X_queries_np, K_val),
+            }
         if cupy_device_ok and A_data_cp is not None:
              warmup_functions_cupy = {
                  "distance_dot2": lambda: distance_dot2(X_queries_cp, A_data_cp),
@@ -1041,6 +1165,28 @@ if __name__ == "__main__":
                         print(f"    *** ERROR during warm-up for {name} (D={Dim}, Run={i+1}): {e} ***")
                         import traceback; traceback.print_exc()
                         dimension_failed = True
+                 # --- Add CPU Warmup ---
+            if warmup_functions_cpu:
+                print("  Warming up CPU functions...")
+                for name, func in warmup_functions_cpu.items():
+                    if dimension_failed: break
+                    if DETAILED_DEBUG: print(f"    Attempting warm-up for: {name}")
+                    try:
+                        _ = func() # Execute CPU function
+                        if DETAILED_DEBUG: print(f"      Warm-up OK: {name}")
+                    except Exception as e:
+                        print(f"    *** ERROR during warm-up for {name} (D={Dim}): {e} ***")
+                        import traceback; traceback.print_exc()
+                    # Decide if CPU failure should stop all benchmarks for the dimension
+                    # dimension_failed = True # Optional: uncomment to stop everything on CPU failure
+                        print(f"    Skipping CPU benchmarks for dimension {Dim} due to warm-up error.")
+                        BENCHMARK_CPU_THIS_DIM = False # Flag to skip CPU benchmarks only
+                        break # Stop CPU warmup for this dimension
+                else: # Only runs if the CPU warmup loop completed without break
+                    BENCHMARK_CPU_THIS_DIM = BENCHMARK_CPU
+            else:
+                BENCHMARK_CPU_THIS_DIM = False
+
 
         # --- Post Warm-up Check ---
         if dimension_failed:
@@ -1144,6 +1290,41 @@ if __name__ == "__main__":
                     results[Dim]['dist_man_cupy'] = avg_time
                 except Exception as e: print(f"Error benchmarking distance_manhattan2: {e}")
             else: print("CuPy distance benchmarks skipped.")
+             # --- Add CPU Distance Benchmarks ---
+            print("--- CPU (NumPy/SciPy) ---")
+            if BENCHMARK_CPU_THIS_DIM and A_data_np is not None:
+                try: # Dot Product CPU
+                    start_time = time.perf_counter()
+                    for r in range(NUM_RUNS): _ = distance_dot_cpu(X_queries_np, A_data_np)
+                    end_time = time.perf_counter(); avg_time = (end_time - start_time) / NUM_RUNS
+                    print(f"CPU distance_dot_cpu Avg Time:       {avg_time:.6f} seconds")
+                    results[Dim]['dist_dot_cpu'] = avg_time
+                except Exception as e: print(f"Error benchmarking distance_dot_cpu: {e}")
+                try: # L2 Squared CPU
+                    start_time = time.perf_counter()
+                    for r in range(NUM_RUNS): _ = distance_l2_squared_cpu(X_queries_np, A_data_np)
+                    end_time = time.perf_counter(); avg_time = (end_time - start_time) / NUM_RUNS
+                    print(f"CPU distance_l2_squared_cpu Avg Time:{avg_time:.6f} seconds")
+                    results[Dim]['dist_l2_cpu'] = avg_time
+                except Exception as e: print(f"Error benchmarking distance_l2_squared_cpu: {e}")
+                try: # Cosine CPU
+                    start_time = time.perf_counter()
+                    for r in range(NUM_RUNS): _ = distance_cosine_cpu(X_queries_np, A_data_np)
+                    end_time = time.perf_counter(); avg_time = (end_time - start_time) / NUM_RUNS
+                    print(f"CPU distance_cosine_cpu Avg Time:    {avg_time:.6f} seconds")
+                    results[Dim]['dist_cos_cpu'] = avg_time
+                except Exception as e: print(f"Error benchmarking distance_cosine_cpu: {e}")
+                try: # Manhattan CPU
+                    start_time = time.perf_counter()
+                    for r in range(NUM_RUNS): _ = distance_manhattan_cpu(X_queries_np, A_data_np)
+                    end_time = time.perf_counter(); avg_time = (end_time - start_time) / NUM_RUNS
+                    print(f"CPU distance_manhattan_cpu Avg Time: {avg_time:.6f} seconds")
+                    results[Dim]['dist_man_cpu'] = avg_time
+                except Exception as e: print(f"Error benchmarking distance_manhattan_cpu: {e}")
+            else:
+                 print("  CPU distance benchmarks skipped.")
+            # --- End Distance Benchmarks ---
+
 
 
             # --- KNN Function Benchmarks ---
@@ -1197,7 +1378,25 @@ if __name__ == "__main__":
                     print(f"Error benchmarking our_knn_stream: {e}")
                     import traceback; traceback.print_exc()
             else:
-                 print("CuPy our_knn_stream benchmark skipped (CuPy unavailable or data missing).")
+                print("CuPy our_knn_stream benchmark skipped (CuPy unavailable or data missing).")
+            print("--- CPU (NumPy/SciPy) ---")
+            if BENCHMARK_CPU_THIS_DIM and A_data_np is not None:
+                knn_indices_cpu = None
+                try:
+                    start_time = time.perf_counter()
+                    for r in range(NUM_RUNS):
+                        knn_indices_cpu, _ = our_knn_cpu(N_data, Dim, A_data_np, X_queries_np, K_val)
+                    end_time = time.perf_counter(); avg_time = (end_time - start_time) / NUM_RUNS
+                    qps = N_queries / avg_time if avg_time > 0 else 0
+                    print(f"CPU our_knn_cpu Avg Time:          {avg_time:.6f} seconds ({qps:.2f} QPS)")
+                    results[Dim]['knn_cpu'] = avg_time
+                    # Optional: verify shape
+                    # if knn_indices_cpu is not None: print(f"  CPU KNN indices shape: {knn_indices_cpu.shape}")
+                except Exception as e:
+                     print(f"Error benchmarking our_knn_cpu: {e}")
+                     import traceback; traceback.print_exc()
+            else:
+                print("  CPU KNN benchmark skipped.")
             # --- END KNN Benchmarks ---
 
         # --- Cleanup for the dimension ---
@@ -1209,14 +1408,19 @@ if __name__ == "__main__":
         if cupy_device_ok and 'X_queries_cp' in locals() and X_queries_cp is not None: del X_queries_cp
         torch.cuda.empty_cache()
         if cupy_device_ok: cp.get_default_memory_pool().free_all_blocks()
+        if 'A_data_np' in locals() and A_data_np is not None: del A_data_np
+        if 'X_queries_np' in locals() and X_queries_np is not None: del X_queries_np
+        print("-" * 70)
         print("-" * 70)
 
 
-    print("\n" + "#"*70); print("# ALL DIMENSION BENCHMARKS FINISHED"); print("#"*70)
+    int("\n" + "#"*70); print("# ALL DIMENSION BENCHMARKS FINISHED"); print("#"*70)
 
     # --- Print Summary Table ---
     print("\nBenchmark Summary (Average Times in Seconds):")
-    print("-" * 150) # Adjust width maybe
+    # Adjust width and columns as needed
+    table_width = 210 # Increased width
+    print("-" * table_width)
     header = f"{'Dim':<6}"
     # Define column order dynamically based on results collected + preference
     col_order = [
@@ -1224,31 +1428,37 @@ if __name__ == "__main__":
         'dist_dot_torch_tiled', 'dist_l2_torch', 'dist_cos_torch', 'dist_man_torch',
         # CuPy Distances
         'dist_dot_cupy', 'dist_l2_cupy', 'dist_cos_cupy', 'dist_man_cupy',
-        # KNNs (Add the new CuPy key)
-        'knn_torch', 'knn_cupy_stream'
+        # CPU Distances - ADDED
+        'dist_dot_cpu', 'dist_l2_cpu', 'dist_cos_cpu', 'dist_man_cpu',
+        # KNNs (GPU and CPU) - ADDED CPU
+        'knn_torch', 'knn_cupy_stream', 'knn_cpu'
     ]
+    # ...(rest of dynamic column finding logic)...
     present_cols = set();
     for d in results: present_cols.update(results[d].keys())
-    # Ensure all expected columns are included if present, maintain preferred order
     final_cols = [col for col in col_order if col in present_cols]
-    # Add any other columns found that weren't in the preferred list
     for col in sorted(present_cols):
         if col not in final_cols: final_cols.append(col)
 
-    for col_key in final_cols: header += f"{col_key:<30}" # Wider spacing
-    print(header); print("-" * 150) # Adjust width to match header
+    col_width = 25 # Adjust spacing between columns
+    for col_key in final_cols: header += f"{col_key:<{col_width}}"
+    print(header);
+    # Recalculate width based on final columns
+    table_width = 6 + len(final_cols) * col_width
+    print("-" * table_width)
 
     for Dim in dimensions_to_test:
         row = f"{Dim:<6}"
         if Dim in results:
             r = results[Dim]
             for col_key in final_cols:
-                # Format with fixed width and precision, handle missing results
-                row += f"{r.get(col_key, float('nan')):<30.6f}"
-            # Replace NaN representation with N/A for better readability
-            print(row.replace('nan', '           N/A              ')) # Adjust spacing for N/A
+                row += f"{r.get(col_key, float('nan')):<{col_width}.6f}"
+            # Adjust N/A spacing based on col_width
+            na_spacing = ' ' * ((col_width - 3) // 2)
+            na_string = f"{na_spacing}N/A{na_spacing}"
+            if col_width % 2 == 0: na_string += " " # Add extra space if even width
+            print(row.replace(' ' * col_width + 'nan', na_string)) # More robust NaN replace
         else:
-            # Dimension was skipped entirely (e.g., data gen failed)
-            for _ in final_cols: row += f"{'Skipped':<30}"
+            for _ in final_cols: row += f"{'Skipped':<{col_width}}"
             print(row)
-    print("-" * 150) #
+    print("-" * table_width)
