@@ -30,19 +30,7 @@ def ceil_div(a, b):
 
 # --- Optimized Tiled Dot Product Kernel ---
 
-@triton.autotune(
-    configs=[
-        # Tune only BLOCK_SIZE_D
-        triton.Config({'BLOCK_SIZE_D': 32}, num_warps=2),
-        triton.Config({'BLOCK_SIZE_D': 64}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_D': 128}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_D': 256}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_D': 512}, num_warps=8),
-        # Add 1024 only if D is often large and hardware benefits
-        # triton.Config({'BLOCK_SIZE_D': 1024}, num_warps=8),
-    ],
-    key=['D'], # Tuning primarily depends on reduction dimension D
-)
+
 @triton.jit
 def dot_kernel_pairwise(
     X_ptr, A_ptr, Out_ptr,
@@ -302,11 +290,10 @@ def distance_dot(X, A):
 def distance_dot_tiled(X, A, N_TILE=4096, prep=True):
     """
     Computes pairwise dot product using the simple 'dot_kernel_pairwise'
-    kernel (autotuned on BLOCK_SIZE_D), but launched in tiles over A (N dim)
-    from Python to avoid excessively large grids. Returns POSITIVE dot product.
+    kernel with FIXED BLOCK_SIZE_D=32 and num_warps=2.
+    Launched in tiles over A (N dim). Returns POSITIVE dot product.
     """
     if prep:
-         # Ensure _prepare_tensors returns single tensor when called with one
          X_prep = _prepare_tensors(X)
          A_prep = _prepare_tensors(A)
     else: X_prep, A_prep = X, A # Assume prepared float32 contiguous
@@ -315,34 +302,37 @@ def distance_dot_tiled(X, A, N_TILE=4096, prep=True):
     N, D_A = A_prep.shape
     if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
 
-    # Output uses float32 matching kernel store type
     Out = torch.empty((Q, N), dtype=torch.float32, device=device)
 
-    # print(f"Tiling simple dot kernel calculation with N_TILE={N_TILE}")
+    # --- Define Fixed Kernel Launch Parameters ---
+    BLOCK_SIZE_D_FIXED = 32
+    NUM_WARPS_FIXED = 2
+    # -------------------------------------------
+
+    # print(f"Tiling simple dot kernel (Fixed D={BLOCK_SIZE_D_FIXED}, Warps={NUM_WARPS_FIXED}) N_TILE={N_TILE}")
     for n_start in range(0, N, N_TILE):
         n_end = min(n_start + N_TILE, N)
         N_chunk = n_end - n_start
         if N_chunk <= 0: continue
 
-        A_chunk = A_prep[n_start:n_end, :] # Shape (N_chunk, D)
-        # Create a view for the output chunk
-        Out_chunk = Out[:, n_start:n_end] # Shape (Q, N_chunk)
+        A_chunk = A_prep[n_start:n_end, :]
+        Out_chunk = Out[:, n_start:n_end]
 
-        # Grid for this chunk launch
         grid = (Q, N_chunk)
         if grid[0] == 0 or grid[1] == 0: continue
 
-        # Launch the simple kernel (autotuned on BLOCK_SIZE_D) for this chunk
-        # Pass strides explicitly as 1 for contiguous last dim
+        # Launch the kernel with fixed parameters
+        # The kernel signature still expects BLOCK_SIZE_D
         dot_kernel_pairwise[grid](
             X_prep, A_chunk, Out_chunk,
-            Q, N_chunk, D,          # Pass chunk dimension N_chunk
-            X_prep.stride(0), 1,    # Stride 1 for contiguous dim D
-            A_chunk.stride(0), 1,   # Stride 1 for contiguous dim D
-            Out_chunk.stride(0), 1, # Stride 1 for contiguous dim D
-            # BLOCK_SIZE_D determined by autotuner
+            Q, N_chunk, D,
+            X_prep.stride(0), 1, # Explicit stride 1 for contiguous last dim
+            A_chunk.stride(0), 1, # Explicit stride 1
+            Out_chunk.stride(0), 1, # Explicit stride 1
+            BLOCK_SIZE_D=BLOCK_SIZE_D_FIXED, # Pass fixed size explicitly
+            num_warps=NUM_WARPS_FIXED        # Specify num_warps in launch
         )
-        # torch.cuda.synchronize() # Optional debug sync
+        # No sync needed here unless timing this specific call
 
     return Out
 '''
@@ -851,7 +841,7 @@ def our_knn_stream(N, D, A, X, K):
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data =40000
+    N_data =4000000
     N_queries = 1
     K_val = 10          # K for KNN
     NUM_RUNS = 10       # Number of timed runs for averaging
@@ -964,7 +954,7 @@ if __name__ == "__main__":
         # ===         DISTANCE FUNCTION BENCHMARKS           ===
         # ===--------------------------------------------------===
         print("\n" + "="*40); print(f"Benchmarking Distance Functions (D={Dim})..."); print("="*40)
-        print("BEST CONFIG", dot_kernel_pairwise.best_config)
+        
 
         # --- PyTorch/Triton Dot Distance (distance_dot_tiled) --- ADDED
         try:
