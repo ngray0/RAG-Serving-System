@@ -259,7 +259,7 @@ def distance_dot(X, A):
         X_prep.stride(0), X_prep.stride(1),
         A_prep.stride(0), A_prep.stride(1),
         Out.stride(0), Out.stride(1),
-        BLOCK_SIZE_D=DEFAULT_BLOCK_D
+        BLOCK_SIZE_D=32
     )
     # Return negative dot product if used for minimization (finding 'nearest')
     # return -Out
