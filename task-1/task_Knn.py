@@ -1010,7 +1010,7 @@ def our_knn_stream(N, D, A, X, K):
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data = 4000000 # Using 4 Million points
+    N_data = 4000 # Using 4 Million points
     N_queries = 1     # Using 1 query as per your last log
     K_val = 10          # K for KNN
     NUM_RUNS = 10       # Number of timed runs for averaging
