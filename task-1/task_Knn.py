@@ -30,6 +30,19 @@ def ceil_div(a, b):
 
 # --- Optimized Tiled Dot Product Kernel ---
 
+@triton.autotune(
+    configs=[
+        # Tune only BLOCK_SIZE_D
+        triton.Config({'BLOCK_SIZE_D': 32}, num_warps=2),
+        triton.Config({'BLOCK_SIZE_D': 64}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_D': 128}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_D': 256}, num_warps=4),
+        triton.Config({'BLOCK_SIZE_D': 512}, num_warps=8),
+        # Add 1024 only if D is often large and hardware benefits
+        # triton.Config({'BLOCK_SIZE_D': 1024}, num_warps=8),
+    ],
+    key=['D'], # Tuning primarily depends on reduction dimension D
+)
 @triton.jit
 def dot_kernel_pairwise(
     X_ptr, A_ptr, Out_ptr,
@@ -37,31 +50,26 @@ def dot_kernel_pairwise(
     stride_xq, stride_xd, # stride_xd/ad will be 1 from call site
     stride_an, stride_ad,
     stride_outq, stride_outn, # stride_outn will be 1 from call site
+    # BLOCK_SIZE_D is now set by autotuner
     BLOCK_SIZE_D: tl.constexpr,
 ):
-    """Calculates pairwise dot product using float32."""
+    """Calculates pairwise dot product using float32. Autotuned on BLOCK_SIZE_D."""
     pid_q = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
-
-    # --- FIX: Use float32 for accumulation ---
-    dot_prod = tl.zeros((), dtype=tl.float32)
+    dot_prod = tl.zeros((), dtype=tl.float32) # Use float32
 
     for d_start in range(0, D, BLOCK_SIZE_D):
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
         mask_d = offs_d < D
-
         # Use original pointer logic, assuming strides passed correctly reflect layout
         x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
-        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0).to(tl.float32) # Ensure float32 load
-
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0).to(tl.float32)
         a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
-        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0).to(tl.float32) # Ensure float32 load
-
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0).to(tl.float32)
         dot_prod += tl.sum(x_vals * a_vals, axis=0) # Accumulate float32
 
     out_offset = pid_q * stride_outq + pid_n * stride_outn
-    tl.store(Out_ptr + out_offset, dot_prod) # Store float32 result
-
+    tl.store(Out_ptr + out_offset, dot_prod)
 
 @triton.jit
 def manhattan_kernel_pairwise_tiled(
@@ -273,24 +281,51 @@ def distance_dot(X, A):
     # Return POSITIVE dot product
     return Out
 def distance_dot_tiled(X, A, N_TILE=32768, prep=True):
-    # ... (definition returning positive dot product) ...
-    if prep: X_prep, A_prep = _prepare_tensors(X, A)
-    else: X_prep, A_prep = X, A
-    Q, D = X_prep.shape; N, D_A = A_prep.shape
-    if D != D_A: raise ValueError("Dimension mismatch")
+    """
+    Computes pairwise dot product using the simple 'dot_kernel_pairwise'
+    kernel (autotuned on BLOCK_SIZE_D), but launched in tiles over A (N dim)
+    from Python to avoid excessively large grids. Returns POSITIVE dot product.
+    """
+    if prep:
+         # Ensure _prepare_tensors returns single tensor when called with one
+         X_prep = _prepare_tensors(X)
+         A_prep = _prepare_tensors(A)
+    else: X_prep, A_prep = X, A # Assume prepared float32 contiguous
+
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
+    if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
+
+    # Output uses float32 matching kernel store type
     Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+
+    # print(f"Tiling simple dot kernel calculation with N_TILE={N_TILE}")
     for n_start in range(0, N, N_TILE):
-        n_end = min(n_start + N_TILE, N); N_chunk = n_end - n_start
+        n_end = min(n_start + N_TILE, N)
+        N_chunk = n_end - n_start
         if N_chunk <= 0: continue
-        A_chunk = A_prep[n_start:n_end, :]; Out_chunk = Out[:, n_start:n_end]
+
+        A_chunk = A_prep[n_start:n_end, :] # Shape (N_chunk, D)
+        # Create a view for the output chunk
+        Out_chunk = Out[:, n_start:n_end] # Shape (Q, N_chunk)
+
+        # Grid for this chunk launch
         grid = (Q, N_chunk)
         if grid[0] == 0 or grid[1] == 0: continue
-        dot_kernel_pairwise[grid](
-            X_prep, A_chunk, Out_chunk, Q, N_chunk, D,
-            X_prep.stride(0), 1, A_chunk.stride(0), 1, Out_chunk.stride(0), 1,
-            BLOCK_SIZE_D=DEFAULT_BLOCK_D)
-    return Out
 
+        # Launch the simple kernel (autotuned on BLOCK_SIZE_D) for this chunk
+        # Pass strides explicitly as 1 for contiguous last dim
+        dot_kernel_pairwise[grid](
+            X_prep, A_chunk, Out_chunk,
+            Q, N_chunk, D,          # Pass chunk dimension N_chunk
+            X_prep.stride(0), 1,    # Stride 1 for contiguous dim D
+            A_chunk.stride(0), 1,   # Stride 1 for contiguous dim D
+            Out_chunk.stride(0), 1, # Stride 1 for contiguous dim D
+            # BLOCK_SIZE_D determined by autotuner
+        )
+        # torch.cuda.synchronize() # Optional debug sync
+
+    return Out
 '''
 def distance_l2_triton2(X, A):
     X_prep, A_prep = _prepare_tensors(X, A)
