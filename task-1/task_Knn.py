@@ -95,34 +95,36 @@ def dot_kernel_pairwise_tiled(
 
 @triton.jit
 def manhattan_kernel_pairwise_tiled(
-    X_ptr, A_ptr, Out_ptr,           # Data pointers
-    Q, N, D,                         # Matrix dimensions
-    stride_xq, stride_xd,            # Strides for X (row, col)
-    stride_an, stride_ad,            # Strides for A (row, col)
-    stride_outq, stride_outn,        # Strides for Out (row, col)
-    BLOCK_Q: tl.constexpr,           # Tile size for Q dimension
-    BLOCK_N: tl.constexpr,           # Tile size for N dimension
-    BLOCK_K: tl.constexpr,           # Tile size for D dimension (often called K)
+    X_ptr, A_ptr, Out_ptr,
+    Q, N, D,
+    stride_xq, stride_xd,
+    stride_an, stride_ad,
+    stride_outq, stride_outn,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
-    """
-    Calculates pairwise Manhattan (L1) distance using tiling:
-    Out[q, n] = sum(abs(X[q, :] - A[n, :]))
-    Each program instance computes a BLOCK_Q x BLOCK_N tile of the output.
-    """
-    # 1. Program ID and Offsets
+    # 1. Program ID and Offsets (DEFINED HERE)
     pid_q_block = tl.program_id(axis=0)
     pid_n_block = tl.program_id(axis=1)
-    offs_q = pid_q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    # These define the ranges for the current block relative to the start (0)
+    offs_q = pid_q_block * BLOCK_Q + tl.arange(0, BLOCK_Q) # Shape (BLOCK_Q,)
+    offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N) # Shape (BLOCK_N,)
 
-    # 2. Initialize Accumulator Tile for L1 distances
-    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float32)
+    # --- Simplified Calculation Test ---
+    # Goal: Avoid the `x_tile[:, None, :] - a_tile[None, :, :]` broadcast.
+    # Calculate sum(|x|) + sum(|a|) instead (INCORRECT result, just for launch test).
 
-    # 3. Loop over the Dimension D (K dimension) in blocks of BLOCK_K
+    # Accumulators for sum(|x|) per q and sum(|a|) per n
+    accumulator_x = tl.zeros((BLOCK_Q, 1), dtype=tl.float32)
+    accumulator_a = tl.zeros((1, BLOCK_N), dtype=tl.float32) # Correct shape
+
+    # Loop over K dimension
     for k_start in range(0, D, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
+        offs_k = k_start + tl.arange(0, BLOCK_K) # Shape (BLOCK_K,)
 
         # --- Load X tile ---
+        # Now offs_q is defined and used correctly
         x_ptrs = X_ptr + (offs_q[:, None] * stride_xq + offs_k[None, :] * stride_xd)
         q_mask = offs_q[:, None] < Q
         k_mask_x = offs_k[None, :] < D
@@ -130,28 +132,23 @@ def manhattan_kernel_pairwise_tiled(
         x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0) # Shape (BLOCK_Q, BLOCK_K)
 
         # --- Load A tile ---
+        # Now offs_n is defined and used correctly
         a_ptrs = A_ptr + (offs_n[:, None] * stride_an + offs_k[None, :] * stride_ad)
         n_mask = offs_n[:, None] < N
         k_mask_a = offs_k[None, :] < D
         a_mask = n_mask & k_mask_a
         a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0) # Shape (BLOCK_N, BLOCK_K)
 
-        # --- Compute Absolute Differences and Sum ---
-        # Use broadcasting to calculate pairwise differences within tiles
-        # x_tile: (BLOCK_Q, BLOCK_K) -> (BLOCK_Q, 1, BLOCK_K)
-        # a_tile: (BLOCK_N, BLOCK_K) -> Transpose needed for broadcasting: (1, BLOCK_N, BLOCK_K) ?
-        # Let's load A transposed conceptually. Load a_tile as (BLOCK_K, BLOCK_N)
-        # No, the previous load loads A as (BLOCK_N, BLOCK_K). Correct.
-        # Broadcast: x_tile[:, None, :] - a_tile[None, :, :]
-        #   -> (BLOCK_Q, 1, BLOCK_K) - (1, BLOCK_N, BLOCK_K) -> (BLOCK_Q, BLOCK_N, BLOCK_K)
-        diff = x_tile[:, None, :] - a_tile[None, :, :]
-        abs_diff = tl.abs(diff)
+        # --- Simplified Calculation ---
+        # Sum absolute values over the K dimension for each row/vector loaded
+        accumulator_x += tl.sum(tl.abs(x_tile), axis=1)[:, None]   # Sum over K axis -> (BLOCK_Q, 1)
+        accumulator_a += tl.sum(tl.abs(a_tile), axis=1)[None, :]   # Sum over K axis -> (1, BLOCK_N)
 
-        # Sum absolute differences over the K dimension block (axis=2)
-        # Result shape: (BLOCK_Q, BLOCK_N)
-        accumulator += tl.sum(abs_diff, axis=2)
+    # Combine the simplified results via broadcasting sum
+    accumulator = accumulator_x + accumulator_a # Target shape (BLOCK_Q, BLOCK_N)
 
     # 4. Store the Resulting Tile
+    # Now offs_q and offs_n are defined and used correctly
     out_ptrs = Out_ptr + (offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn)
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
