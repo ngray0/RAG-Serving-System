@@ -29,78 +29,6 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 # --- Optimized Tiled Dot Product Kernel ---
-@triton.autotune(
-       configs=[
-        # Min block sizes are 16 due to tl.dot constraints
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 16, 'num_stages': 1, 'num_warps': 2}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
-
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}), # Added stage variation
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}), # Added stage variation
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}), # Added stage variation
-
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-
-        # Keep a few larger options if hardware potentially supports it
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 128, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 128, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
-    ],
-    key=['Q', 'N', 'D'],
-)
-@triton.jit
-def dot_kernel_pairwise_tiled(
-    X_ptr, A_ptr, Out_ptr,           # Data pointers
-    Q, N, D,                         # Matrix dimensions
-    stride_xq, stride_xd,            # Strides for X (row, col)
-    stride_an, stride_ad,            # Strides for A (row, col)
-    stride_outq, stride_outn,        # Strides for Out (row, col)
-    BLOCK_Q: tl.constexpr,           # Tile size for Q dimension
-    BLOCK_N: tl.constexpr,           # Tile size for N dimension
-    BLOCK_K: tl.constexpr,           # Tile size for D dimension (often called K)
-):
-    """
-    Calculates pairwise dot product using tiling: Out[q, n] = dot(X[q, :], A[n, :])
-    Equivalent to MatMul: Out = X @ A.T
-    """
-    pid_q_block = tl.program_id(axis=0)
-    pid_n_block = tl.program_id(axis=1)
-    offs_q = pid_q_block * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N)
-    accumulator = tl.zeros((BLOCK_Q, BLOCK_N), dtype=tl.float64)
-
-    for k_start in range(0, D, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K)
-        # Load X tile
-        x_ptrs = X_ptr + (offs_q[:, None] * stride_xq + offs_k[None, :] * stride_xd)
-        q_mask = offs_q[:, None] < Q
-        k_mask_x = offs_k[None, :] < D
-        x_mask = q_mask & k_mask_x
-        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0)
-        # Load A tile
-        a_ptrs = A_ptr + (offs_n[:, None] * stride_an + offs_k[None, :] * stride_ad)
-        n_mask = offs_n[:, None] < N
-        k_mask_a = offs_k[None, :] < D
-        a_mask = n_mask & k_mask_a
-        a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        # Compute dot product for tiles
-        accumulator += tl.dot(x_tile, tl.trans(a_tile))
-
-    # Store result tile
-    out_ptrs = Out_ptr + (offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn)
-    out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
-    tl.store(out_ptrs, accumulator, mask=out_mask)
-
 
 @triton.jit
 def dot_kernel_pairwise(
@@ -133,42 +61,6 @@ def dot_kernel_pairwise(
     tl.store(Out_ptr + out_offset, dot_prod)
 
 
-@triton.autotune(
-        configs=[
-        # --- Blocks including 8x? or ?x8 ---
-        triton.Config({'BLOCK_Q': 8,  'BLOCK_N': 8,  'BLOCK_K': 16, 'num_stages': 1, 'num_warps': 2}),
-        triton.Config({'BLOCK_Q': 8,  'BLOCK_N': 8,  'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 8,  'BLOCK_N': 16, 'BLOCK_K': 16, 'num_stages': 1, 'num_warps': 2}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 8,  'BLOCK_K': 16, 'num_stages': 1, 'num_warps': 2}),
-        triton.Config({'BLOCK_Q': 8,  'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 8,  'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 8,  'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 8,  'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-
-        # --- Blocks including 16x? or ?x16 ---
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 16, 'num_stages': 1, 'num_warps': 2}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 16, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 16, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 16, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-
-        # --- Blocks including 32x? or ?x32 ---
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 32, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 32, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-
-        # --- Blocks including 64x? or ?x64 (Keep a few, maybe less optimal for GTX 1060) ---
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 1, 'num_warps': 4}),
-        triton.Config({'BLOCK_Q': 64, 'BLOCK_N': 64, 'BLOCK_K': 64, 'num_stages': 2, 'num_warps': 4}),
-    ],
-    key=['Q', 'N', 'D'],
-)
 
 @triton.jit
 def manhattan_kernel_pairwise_tiled(
@@ -372,8 +264,25 @@ def distance_dot(X, A):
     # Return negative dot product if used for minimization (finding 'nearest')
     # return -Out
     # Or return raw dot product if similarity maximization is intended
-    return -Out
-
+    return Out
+def distance_dot_tiled(X, A, N_TILE=32768, prep=True):
+    # ... (definition returning positive dot product) ...
+    if prep: X_prep, A_prep = _prepare_tensors(X, A)
+    else: X_prep, A_prep = X, A
+    Q, D = X_prep.shape; N, D_A = A_prep.shape
+    if D != D_A: raise ValueError("Dimension mismatch")
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
+    for n_start in range(0, N, N_TILE):
+        n_end = min(n_start + N_TILE, N); N_chunk = n_end - n_start
+        if N_chunk <= 0: continue
+        A_chunk = A_prep[n_start:n_end, :]; Out_chunk = Out[:, n_start:n_end]
+        grid = (Q, N_chunk)
+        if grid[0] == 0 or grid[1] == 0: continue
+        dot_kernel_pairwise[grid](
+            X_prep, A_chunk, Out_chunk, Q, N_chunk, D,
+            X_prep.stride(0), 1, A_chunk.stride(0), 1, Out_chunk.stride(0), 1,
+            BLOCK_SIZE_D=DEFAULT_BLOCK_D)
+    return Out
 
 '''
 def distance_l2_triton2(X, A):
@@ -535,33 +444,7 @@ def compute_all_distances(A, X):
         "Manhattan": distance_manhattan2(A, X)
     }
 
-def distance_dot_tiled(X, A, N_TILE=32768, prep=True):
-    # ... (Keep the existing definition that returns POSITIVE dot product) ...
-    # This function does NOT take **kwargs relevant to kernel block sizes
-    if prep: X_prep, A_prep = _prepare_tensors(X, A)
-    else: X_prep, A_prep = X, A
-    Q, D = X_prep.shape; N, D_A = A_prep.shape
-    if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
-    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
-    # Use DEFAULT_BLOCK_D defined globally or pass it explicitly if needed by the kernel
-    global DEFAULT_BLOCK_D # Make sure it's accessible or pass it
-    if 'DEFAULT_BLOCK_D' not in globals(): DEFAULT_BLOCK_D = 128 # Fallback
 
-    for n_start in range(0, N, N_TILE):
-        n_end = min(n_start + N_TILE, N); N_chunk = n_end - n_start
-        if N_chunk <= 0: continue
-        A_chunk = A_prep[n_start:n_end, :]; Out_chunk = Out[:, n_start:n_end]
-        grid = (Q, N_chunk)
-        if grid[0] == 0 or grid[1] == 0: continue
-        # Assuming dot_kernel_pairwise_tiled is the AUTOTUNED one now
-        dot_kernel_pairwise_tiled[grid]( # Pass grid lambda if kernel is autotuned on Q/N blocks
-            X_prep, A_chunk, Out_chunk, Q, N_chunk, D,
-            X_prep.stride(0), 1, A_chunk.stride(0), 1, Out_chunk.stride(0), 1
-            # BLOCK_Q, BLOCK_N, BLOCK_K set by autotuner, don't pass here
-        )
-        # If dot_kernel_pairwise_tiled is NOT autotuned on Q/N, use fixed grid and pass BLOCK_K:
-        # dot_kernel_pairwise[grid](...) # Assuming dot_kernel_pairwise is the simple one
-    return Out
 
 # Corrected distance_l2 (Removes kwargs, ensures prep=False passed correctly)
 def distance_l2(X, A): # Removed **kwargs
@@ -605,32 +488,46 @@ def distance_cosine(X, A, epsilon=1e-8): # Removed **kwargs
     return cosine_distance
 
 # Corrected distance_manhattan (Removes kwargs, uses grid lambda for autotuned kernel)
-def distance_manhattan(X, A): # Removed **kwargs
-    """Computes pairwise Manhattan (L1) distance using the tiled, autotuned Triton kernel."""
-    target_device = X.device if isinstance(X, torch.Tensor) else A.device
-    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
-    Q, D = X_prep.shape; N, D_A = A_prep.shape
+def distance_manhattan(X, A):
+    """
+    Computes pairwise Manhattan (L1) distance using the tiled Triton kernel
+    with FIXED block sizes (16, 16, 32).
+    NOTE: Ensure the @triton.autotune decorator is removed/commented out
+          from the 'manhattan_kernel_pairwise_tiled' kernel definition.
+    """
+    target_device = X.device if isinstance(X, torch.Tensor) else A.device # Get device from input
+    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device) # Prepare tensors
+    Q, D = X_prep.shape
+    N, D_A = A_prep.shape
     if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
 
     Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
 
-    # Define the grid calculation based on meta information from autotuner config
-    # This grid calculates the number of program instances needed based on Q, N
-    # and the BLOCK_Q, BLOCK_N chosen by the autotuner config.
-    grid_man = lambda meta: (ceil_div(Q, meta['BLOCK_Q']), ceil_div(N, meta['BLOCK_N']))
+    # --- Define Fixed Block Sizes ---
+    BLOCK_Q_MAN = 16
+    BLOCK_N_MAN = 16
+    BLOCK_K_MAN = 32
+    # --------------------------------
 
-    # Launch the autotuned kernel, passing the grid lambda
-    # Ensure manhattan_kernel_pairwise_tiled has the @triton.autotune decorator
+    # Calculate the launch grid based on fixed block sizes
+    grid_man = (ceil_div(Q, BLOCK_Q_MAN), ceil_div(N, BLOCK_N_MAN))
+    # print(f"Launching Manhattan kernel with fixed grid={grid_man}, Blocks=({BLOCK_Q_MAN},{BLOCK_N_MAN},{BLOCK_K_MAN})") # Optional debug
+
+    # Launch the kernel, passing the grid and FIXED block sizes explicitly
+    # Ensure manhattan_kernel_pairwise_tiled NO LONGER has the @triton.autotune decorator
     manhattan_kernel_pairwise_tiled[grid_man](
         X_prep, A_prep, Out,
         Q, N, D,
-        X_prep.stride(0), 1, A_prep.stride(0), 1, Out.stride(0), 1
-        # BLOCK_Q, BLOCK_N, BLOCK_K are set by the autotuner via meta
-        # DO NOT pass **kwargs here
+        X_prep.stride(0), 1, # Assuming contiguous tensor stride for D = 1
+        A_prep.stride(0), 1, # Assuming contiguous tensor stride for D = 1
+        Out.stride(0), 1,    # Assuming contiguous tensor stride for D = 1
+        # Pass the block sizes explicitly matching the kernel signature
+        BLOCK_Q=BLOCK_Q_MAN,
+        BLOCK_N=BLOCK_N_MAN,
+        BLOCK_K=BLOCK_K_MAN
     )
-    torch.cuda.synchronize() # Sync after kernel call
+    torch.cuda.synchronize(device=target_device) # Sync after kernel call
     return Out
-
 def our_knn(N_A, D, A, X, K):
     """
     Finds the K nearest neighbors in A for each query vector in X using
@@ -794,67 +691,60 @@ def our_knn_stream(N, D, A, X, K):
 # Main Execution Block (Benchmarking KNN and Distances across Dimensions)
 # ============================================================================
 if __name__ == "__main__":
-    # --- Fixed Parameters ---
+    # --- Parameters ---
     N_data = 100000
-    N_queries = 10000
-    K_val = 10          # K for KNN
-    NUM_RUNS = 5       # Number of timed runs for averaging
-    WARMUP_RUNS = 2     # Number of warm-up runs
-
-    # --- Dimensions to Test ---
+    N_queries = 1000
+    K_val = 10
+    NUM_RUNS = 10
+    WARMUP_RUNS = 2
     dimensions_to_test = [2, 4, 64, 256, 1024]
+    # ... (Rest of parameter definitions) ...
 
     print(f"--- GPU KNN/DISTANCE BENCHMARKING ---")
-    print(f"Fixed Params: N={N_data}, Q={N_queries}, K={K_val}, Warmup={WARMUP_RUNS}, Runs={NUM_RUNS}")
-    print(f"Testing Dimensions: {dimensions_to_test}")
-
-    # --- Check Devices ---
+    # ... (Device checks) ...
     try:
-        if not torch.cuda.is_available(): raise RuntimeError("Torch CUDA not available.")
-        device = torch.device("cuda:0"); print(f"Using PyTorch device: {device}")
-    except Exception as e: print(f"PyTorch device error: {e}"); exit()
-    try:
-        cp.cuda.Device(0).use(); print(f"Using CuPy device: {cp.cuda.Device(0)}")
-        cupy_device_ok = True
-    except Exception as e: print(f"CuPy device error: {e}"); cupy_device_ok = False
+        # Attempt to initialize and use the default CuPy CUDA device
+        cp.cuda.Device(0).use()
+        print(f"Using CuPy device: {cp.cuda.Device(0)}")
+        cupy_device_ok = True # Set to True if successful
+    except Exception as e:
+        # If any error occurs (CuPy not installed, CUDA issue, etc.)
+        print(f"CuPy device error: {e}")
+        cupy_device_ok = False # Set to False if initialization fails
 
-    # --- Storage for results across dimensions ---
     results = {}
-
-    # Loop through each dimension
     for Dim in dimensions_to_test:
         print("\n" + "#"*70)
         print(f"# Starting Test for Dimension D = {Dim}")
         print("#"*70)
+        results[Dim] = {}
 
-        results[Dim] = {} # Store results for this dimension
-
-        # --- Generate Base Data (PyTorch and CuPy) ---
+        # --- Generate Base Data ---
         print("\n" + "="*40); print(f"Generating Data (D={Dim})..."); print("="*40)
-        A_data = A_data_cp = X_queries = X_queries_cp = None # Ensure cleanup if generation fails
+        A_data = A_data_cp = X_queries = X_queries_cp = None # Ensure cleanup
         try:
+            # ... (Generate A_data, X_queries on Torch device) ...
             A_data = torch.randn(N_data, Dim, dtype=torch.float32, device=device)
             X_queries = torch.randn(N_queries, Dim, dtype=torch.float32, device=device)
             torch.cuda.synchronize(device=device)
             print(f"Database shape (Torch): {A_data.shape}")
             print(f"Query shape (Torch): {X_queries.shape}")
+
             if cupy_device_ok:
-                A_data_contig = A_data.contiguous()
-                X_queries_contig = X_queries.contiguous()
+                # ... (DLPack transfer to A_data_cp, X_queries_cp) ...
+                A_data_contig = A_data.contiguous(); X_queries_contig = X_queries.contiguous()
                 dlpack_A = torch.to_dlpack(A_data_contig); dlpack_X = torch.to_dlpack(X_queries_contig)
                 A_data_cp = cp.from_dlpack(dlpack_A); X_queries_cp = cp.from_dlpack(dlpack_X)
                 cp.cuda.Stream.null.synchronize()
                 print(f"Database shape (CuPy): {A_data_cp.shape}")
                 print(f"Query shape (CuPy): {X_queries_cp.shape}")
             else: print("CuPy data generation skipped.")
-        except Exception as e:
+        except Exception as e: # Handle OOM during generation
             print(f"Error during Data Generation (D={Dim}): {e}")
             if 'A_data' in locals() and A_data is not None: del A_data
-            if 'X_queries' in locals() and X_queries is not None: del X_queries
-            if cupy_device_ok and 'A_data_cp' in locals() and A_data_cp is not None: del A_data_cp
-            if cupy_device_ok and 'X_queries_cp' in locals() and X_queries_cp is not None: del X_queries_cp
+            # ... (cleanup other vars) ...
             torch.cuda.empty_cache();
-            if cupy_device_ok: cp.get_default_memory_pool().free_all_blocks()
+            if cupy_device_ok and 'A_data_cp' in locals() and A_data_cp is not None: cp.get_default_memory_pool().free_all_blocks()
             continue # Skip dimension
 
         # ===--------------------------------------------------===
@@ -862,43 +752,84 @@ if __name__ == "__main__":
         # ===--------------------------------------------------===
         print("\n" + "="*40); print(f"Performing Warm-up Runs (D={Dim})..."); print("="*40)
         try:
+            # --- PyTorch/Triton Warm-up ---
+            print("Warming up PyTorch/Triton functions...")
+            torch_warmup_results = [] # Store results to delete later
             for _ in range(WARMUP_RUNS):
-                # --- PyTorch/Triton Warm-up ---
-                try: _ = distance_dot_tiled(X_queries, A_data) # Added dot warmup
+                try: torch_warmup_results.append(distance_l2(X_queries, A_data)); print("  Warmup distance_l2 OK");
                 except NameError: pass
-                try: _ = distance_l2(X_queries, A_data)
+                except Exception as e_inner: print(f"  Warmup distance_l2 Error: {e_inner}")
+                # ... (try/except for distance_cosine, distance_manhattan) ...
+                try: torch_warmup_results.append(distance_cosine(X_queries, A_data)); print("  Warmup distance_cosine OK");
                 except NameError: pass
-                try: _ = distance_cosine(X_queries, A_data) # Assuming exists
+                except Exception as e_inner: print(f"  Warmup distance_cosine Error: {e_inner}")
+                try: torch_warmup_results.append(distance_manhattan(X_queries, A_data)); print("  Warmup distance_manhattan OK");
                 except NameError: pass
-                try: _ = distance_manhattan(X_queries, A_data) # Assuming exists
-                except NameError: pass
-                try: _ = our_knn(N_data, Dim, A_data, X_queries, K_val)
-                except NameError: pass
+                except Exception as e_inner: print(f"  Warmup distance_manhattan Error: {e_inner}")
 
-                # --- CuPy Warm-up ---
-                if cupy_device_ok:
-                    try: _ = distance_dot2(X_queries_cp, A_data_cp) # Added dot warmup
+                # --- Warm up our_knn ---
+                try:
+                    print("  Warming up our_knn...")
+                    knn_indices_torch, knn_dists_torch = our_knn(N_data, Dim, A_data, X_queries, K_val)
+                    torch_warmup_results.append(knn_indices_torch)
+                    torch_warmup_results.append(knn_dists_torch)
+                    print("  Warmup our_knn OK")
+                except NameError: pass
+                except Exception as e_inner: print(f"  Warmup our_knn Error: {e_inner}")
+                # -----------------------
+
+            # --- Explicitly Clear PyTorch Intermediate Results ---
+            print("Clearing PyTorch warm-up results and emptying cache...")
+            del torch_warmup_results # Remove references
+            torch.cuda.synchronize() # Wait for GPU
+            torch.cuda.empty_cache() # Ask PyTorch to release unused cached memory
+            print("PyTorch Cache Cleared.")
+            # ----------------------------------------------------
+
+            # --- CuPy Warm-up ---
+            if cupy_device_ok and A_data_cp is not None:
+                print("Warming up CuPy functions...")
+                cupy_warmup_results = []
+                for _ in range(WARMUP_RUNS):
+                    try: print("  Warming up distance_dot2..."); cupy_warmup_results.append(distance_dot2(X_queries_cp, A_data_cp)); print("  Warmup distance_dot2 OK");
                     except NameError: pass
-                    try: _ = distance_l22(X_queries_cp, A_data_cp) # Uses corrected func
+                    except Exception as e_inner: print(f"  Warmup distance_dot2 Error: {e_inner}")
+                    try: print("  Warming up distance_l22..."); cupy_warmup_results.append(distance_l22(X_queries_cp, A_data_cp)); print("  Warmup distance_l22 OK");
                     except NameError: pass
-                    try: _ = distance_cosine2(X_queries_cp, A_data_cp) # Uses corrected func
+                    except Exception as e_inner: print(f"  Warmup distance_l22 Error: {e_inner}")
+                    try: print("  Warming up distance_cosine2..."); cupy_warmup_results.append(distance_cosine2(X_queries_cp, A_data_cp)); print("  Warmup distance_cosine2 OK");
                     except NameError: pass
-                    try: _ = distance_manhattan2(X_queries_cp, A_data_cp) # Uses corrected func
+                    except Exception as e_inner: print(f"  Warmup distance_cosine2 Error: {e_inner}")
+                    # Ensure the tiled Manhattan function is used here
+                    try: print("  Warming up distance_manhattan2..."); cupy_warmup_results.append(distance_manhattan2(X_queries_cp, A_data_cp)); print("  Warmup distance_manhattan2 OK");
                     except NameError: pass
-                    try: _ = our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val) # Assuming exists
+                    except Exception as e_inner: print(f"  Warmup distance_manhattan2 Error: {e_inner}")
+                    try: print("  Warming up our_knn_stream..."); cupy_warmup_results.append(our_knn_stream(N_data, Dim, A_data_cp, X_queries_cp, K_val)); print("  Warmup our_knn_stream OK");
                     except NameError: pass
-                    try: _ = our_knn_hierachy(N_data, Dim, A_data_cp, X_queries_cp[0], K_val) # Assuming exists
+                    except Exception as e_inner: print(f"  Warmup our_knn_stream Error: {e_inner}")
+                    try: print("  Warming up our_knn_hierachy (1 query)..."); cupy_warmup_results.append(our_knn_hierachy(N_data, Dim, A_data_cp, X_queries_cp[0], K_val)); print("  Warmup our_knn_hierachy OK");
                     except NameError: pass
+                    except Exception as e_inner: print(f"  Warmup our_knn_hierachy Error: {e_inner}")
+
+                # --- Explicitly Clear CuPy Intermediate Results ---
+                print("Clearing CuPy warm-up results and emptying pool...")
+                del cupy_warmup_results
+                cp.cuda.Stream.null.synchronize()
+                cp.get_default_memory_pool().free_all_blocks()
+                print("CuPy Pool Cleared.")
+                # --------------------------------------------------
 
             torch.cuda.synchronize()
             if cupy_device_ok: cp.cuda.Stream.null.synchronize()
             print("Warm-up complete.")
-        except Exception as e:
-            print(f"Error during warm-up (D={Dim}): {e}")
+
+        except Exception as e: # Catch errors happening during warmup sequence
+            print(f"Error during warm-up phase (D={Dim}): {e}") # Print the specific error caught
             print("Skipping benchmarks for this dimension.")
             del A_data, X_queries; torch.cuda.empty_cache()
             if cupy_device_ok: del A_data_cp, X_queries_cp; cp.get_default_memory_pool().free_all_blocks()
             continue
+
 
         # ===--------------------------------------------------===
         # ===         DISTANCE FUNCTION BENCHMARKS           ===
@@ -1078,6 +1009,12 @@ if __name__ == "__main__":
         if cupy_device_ok: del A_data_cp, X_queries_cp
         torch.cuda.empty_cache()
         if cupy_device_ok: cp.get_default_memory_pool().free_all_blocks()
+
+
+    print("\n" + "#"*70); print("# ALL DIMENSION BENCHMARKS FINISHED"); print("#"*70)
+
+    # --- Print Summary Table ---
+    # ... (Summary table printing logic as before) ...
 
     print("\n" + "#"*70); print("# ALL DIMENSION BENCHMARKS FINISHED"); print("#"*70)
 
