@@ -302,7 +302,7 @@ def distance_dot(X, A):
     return Out
 # Assume ceil_div, _prepare_tensors are defined correctly
 # Assume dot_kernel_pairwise kernel is defined correctly (float32, NO autotune)
-'''
+
 def distance_dot_tiled(X, A, N_TILE=4096, prep=True):
     """
     Computes pairwise dot product using the simple 'dot_kernel_pairwise'
@@ -355,59 +355,8 @@ def distance_dot_tiled(X, A, N_TILE=4096, prep=True):
         # -------------------------------------------------------
 
     return Out
-'''
-def distance_dot_tiled(X, A, N_TILE=4096, prep=True):
-    """
-    Computes pairwise dot product using the 'dot_kernel_pairwise_tiled' (tl.dot based)
-    kernel with FIXED block sizes (e.g., 32x32x32).
-    Launched in tiles over A (N dim) from Python. Returns POSITIVE dot product.
-    NOTE: Ensure @triton.autotune is removed from dot_kernel_pairwise_tiled kernel.
-    """
-    if prep:
-         X_prep = _prepare_tensors(X)
-         A_prep = _prepare_tensors(A)
-    else: X_prep, A_prep = X, A
 
-    Q, D = X_prep.shape
-    N, D_A = A_prep.shape
-    if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
 
-    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
-
-    # --- Define Fixed Block Sizes for the tiled kernel ---
-    BLOCK_Q_FIXED = 32
-    BLOCK_N_FIXED = 32
-    BLOCK_K_FIXED = 32 # Reduction dim block size
-    # ----------------------------------------------------
-
-    # print(f"Tiling dot_kernel_pairwise_tiled (Fixed Blocks) N_TILE={N_TILE}")
-    for n_start in range(0, N, N_TILE):
-        n_end = min(n_start + N_TILE, N)
-        N_chunk = n_end - n_start
-        if N_chunk <= 0: continue
-
-        A_chunk = A_prep[n_start:n_end, :]
-        Out_chunk = Out[:, n_start:n_end]
-
-        # Calculate grid based on FIXED block sizes for the chunk
-        grid = (ceil_div(Q, BLOCK_Q_FIXED), ceil_div(N_chunk, BLOCK_N_FIXED))
-        if grid[0] == 0 or grid[1] == 0: continue
-
-        # Launch the kernel with fixed parameters
-        dot_kernel_pairwise_tiled[grid](
-            X_prep, A_chunk, Out_chunk,
-            Q, N_chunk, D,
-            X_prep.stride(0), 1,    # Stride 1 for contiguous last dim
-            A_chunk.stride(0), 1,   # Stride 1 for contiguous last dim
-            Out_chunk.stride(0), 1, # Assume stride 1 for contiguous last dim of Out view
-            BLOCK_Q=BLOCK_Q_FIXED,  # Pass fixed size
-            BLOCK_N=BLOCK_N_FIXED,  # Pass fixed size
-            BLOCK_K=BLOCK_K_FIXED   # Pass fixed size
-            # No num_warps needed here unless kernel uses it explicitly
-        )
-        # torch.cuda.synchronize() # Optional debug sync
-
-    return Out
 '''
 def distance_l2_triton2(X, A):
     X_prep, A_prep = _prepare_tensors(X, A)
