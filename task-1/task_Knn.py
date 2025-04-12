@@ -95,63 +95,39 @@ def dot_kernel_pairwise_tiled(
 
 @triton.jit
 def manhattan_kernel_pairwise_tiled(
-    X_ptr, A_ptr, Out_ptr,
+    X_ptr, A_ptr, Out_ptr, # Parameters are received but mostly ignored
     Q, N, D,
     stride_xq, stride_xd,
     stride_an, stride_ad,
     stride_outq, stride_outn,
     BLOCK_Q: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
+    BLOCK_K: tl.constexpr, # BLOCK_K is ignored here
 ):
-    # 1. Program ID and Offsets (DEFINED HERE)
+    # 1. Get program IDs for the output block
     pid_q_block = tl.program_id(axis=0)
     pid_n_block = tl.program_id(axis=1)
-    # These define the ranges for the current block relative to the start (0)
-    offs_q = pid_q_block * BLOCK_Q + tl.arange(0, BLOCK_Q) # Shape (BLOCK_Q,)
-    offs_n = pid_n_block * BLOCK_N + tl.arange(0, BLOCK_N) # Shape (BLOCK_N,)
 
-    # --- Simplified Calculation Test ---
-    # Goal: Avoid the `x_tile[:, None, :] - a_tile[None, :, :]` broadcast.
-    # Calculate sum(|x|) + sum(|a|) instead (INCORRECT result, just for launch test).
+    # 2. Calculate offsets for the *start* of the output block this thread block handles
+    q_start = pid_q_block * BLOCK_Q
+    n_start = pid_n_block * BLOCK_N
 
-    # Accumulators for sum(|x|) per q and sum(|a|) per n
-    accumulator_x = tl.zeros((BLOCK_Q, 1), dtype=tl.float32)
-    accumulator_a = tl.zeros((1, BLOCK_N), dtype=tl.float32) # Correct shape
+    # 3. Calculate pointer to the top-left element of the output block
+    #    Use tl.arange to create offsets relative to the start for the whole block
+    offs_q = q_start + tl.arange(0, BLOCK_Q)
+    offs_n = n_start + tl.arange(0, BLOCK_N)
+    out_ptrs = Out_ptr + offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn
 
-    # Loop over K dimension
-    for k_start in range(0, D, BLOCK_K):
-        offs_k = k_start + tl.arange(0, BLOCK_K) # Shape (BLOCK_K,)
-
-        # --- Load X tile ---
-        # Now offs_q is defined and used correctly
-        x_ptrs = X_ptr + (offs_q[:, None] * stride_xq + offs_k[None, :] * stride_xd)
-        q_mask = offs_q[:, None] < Q
-        k_mask_x = offs_k[None, :] < D
-        x_mask = q_mask & k_mask_x
-        x_tile = tl.load(x_ptrs, mask=x_mask, other=0.0) # Shape (BLOCK_Q, BLOCK_K)
-
-        # --- Load A tile ---
-        # Now offs_n is defined and used correctly
-        a_ptrs = A_ptr + (offs_n[:, None] * stride_an + offs_k[None, :] * stride_ad)
-        n_mask = offs_n[:, None] < N
-        k_mask_a = offs_k[None, :] < D
-        a_mask = n_mask & k_mask_a
-        a_tile = tl.load(a_ptrs, mask=a_mask, other=0.0) # Shape (BLOCK_N, BLOCK_K)
-
-        # --- Simplified Calculation ---
-        # Sum absolute values over the K dimension for each row/vector loaded
-        accumulator_x += tl.sum(tl.abs(x_tile), axis=1)[:, None]   # Sum over K axis -> (BLOCK_Q, 1)
-        accumulator_a += tl.sum(tl.abs(a_tile), axis=1)[None, :]   # Sum over K axis -> (1, BLOCK_N)
-
-    # Combine the simplified results via broadcasting sum
-    accumulator = accumulator_x + accumulator_a # Target shape (BLOCK_Q, BLOCK_N)
-
-    # 4. Store the Resulting Tile
-    # Now offs_q and offs_n are defined and used correctly
-    out_ptrs = Out_ptr + (offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn)
+    # 4. Create a mask for valid output elements
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
-    tl.store(out_ptrs, accumulator, mask=out_mask)
+
+    # 5. Create a dummy value to write (e.g., constant or based on pids)
+    #    Ensure it matches the accumulator shape (BLOCK_Q, BLOCK_N)
+    dummy_value = (pid_q_block + pid_n_block) * 1.0 # Example value
+    dummy_accumulator = tl.full((BLOCK_Q, BLOCK_N), dummy_value, dtype=tl.float32)
+
+    # 6. Perform ONLY the store operation
+    tl.store(out_ptrs, dummy_accumulator, mask=out_mask)
 
 @triton.jit
 def l2_dist_kernel_pairwise(
@@ -646,8 +622,8 @@ def distance_manhattan(X, A):
     Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
 
     # --- Define Fixed Block Sizes ---
-    BLOCK_Q_MAN = 16
-    BLOCK_N_MAN = 16
+    BLOCK_Q_MAN = 32
+    BLOCK_N_MAN = 32
     BLOCK_K_MAN = 32
     # --------------------------------
 
