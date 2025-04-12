@@ -571,19 +571,106 @@ def our_knn(N_A, D, A, X, K):
     return topk_indices, topk_distances
 
 CURRENT_DISTANCE = "Dot"
-def our_knn_hierachy(N, D, A, X, K):
+def compute_all_distances_single_query(A_cp, X_query_cp):
     """
-    KNN using hierarchical memory: Pinned memory enables fast CPU–GPU transfers.
+    Computes distances between all rows of database A_cp and a single query vector X_query_cp.
+    Returns a dictionary of distance vectors (shape N,).
     """
-    if not isinstance(A, cp.ndarray):
-        A = cp.asarray(A)
-    if not isinstance(X, cp.ndarray):
-        X = cp.asarray(X)
-    
-    distances = compute_all_distances(A, X)[CURRENT_DISTANCE]
-    k_indices = cp.argpartition(distances, K)[:K]
-    k_indices = k_indices[cp.argsort(distances[k_indices])]
-    return k_indices
+    if not isinstance(A_cp, cp.ndarray): A_cp = cp.asarray(A_cp, dtype=cp.float32)
+    if not isinstance(X_query_cp, cp.ndarray): X_query_cp = cp.asarray(X_query_cp, dtype=cp.float32)
+
+    if X_query_cp.ndim == 1:
+        X_query_2d = X_query_cp[None, :] # Reshape query to (1, D) for pairwise functions
+    elif X_query_cp.shape[0] == 1 and X_query_cp.ndim == 2:
+        X_query_2d = X_query_cp # Already (1, D)
+    else:
+        raise ValueError(f"X_query_cp must be a 1D vector or a (1, D) tensor, got shape {X_query_cp.shape}")
+
+    if A_cp.shape[1] != X_query_2d.shape[1]:
+        raise ValueError(f"Dimension mismatch between A ({A_cp.shape[1]}) and X ({X_query_2d.shape[1]})")
+
+    N = A_cp.shape[0]
+    dist_dict = {}
+
+    # Call the PAIRWISE distance functions. Output shape will be (1, N).
+    # Extract the first (and only) row to get the distance vector of shape (N,).
+    try: dist_dict["Dot"] = distance_dot2(X_query_2d, A_cp)[0]
+    except NameError: print("Warning: distance_dot2 not defined.")
+    except Exception as e: print(f"Error in distance_dot2: {e}")
+
+    try: dist_dict["L2"] = distance_l22(X_query_2d, A_cp)[0] # Assuming l22 returns squared L2
+    except NameError: print("Warning: distance_l22 not defined.")
+    except Exception as e: print(f"Error in distance_l22: {e}")
+
+    try: dist_dict["Cosine"] = distance_cosine2(X_query_2d, A_cp)[0]
+    except NameError: print("Warning: distance_cosine2 not defined.")
+    except Exception as e: print(f"Error in distance_cosine2: {e}")
+
+    try: dist_dict["Manhattan"] = distance_manhattan2(X_query_2d, A_cp)[0]
+    except NameError: print("Warning: distance_manhattan2 not defined.")
+    except Exception as e: print(f"Error in distance_manhattan2: {e}")
+
+    return dist_dict
+
+# Corrected KNN Hierarchy function
+CURRENT_DISTANCE = "L2" # Default to L2, but can be changed globally if needed
+def our_knn_hierachy(N, D, A, X_query, K): # X_query is a single query vector (D,)
+    """
+    KNN for a single query vector X_query against database A using CuPy.
+    Computes distance between X_query and all vectors in A.
+    """
+    # Ensure CuPy arrays
+    A_cp = cp.asarray(A)
+    X_query_cp = cp.asarray(X_query)
+    if X_query_cp.shape != (D,):
+         # If called with (1,D) query, reshape to (D,)
+         if X_query_cp.shape == (1,D):
+             X_query_cp = X_query_cp[0]
+         else:
+             raise ValueError(f"our_knn_hierachy expects query of shape ({D},) or (1,{D}), got {X_query_cp.shape}")
+
+
+    # Calculate distances from the single query to all points in A
+    # using the corrected helper function
+    all_distances = compute_all_distances_single_query(A_cp, X_query_cp) # Returns dict
+
+    distances_1d = all_distances.get(CURRENT_DISTANCE) # Get distances for the chosen metric, shape (N,)
+
+    if distances_1d is None:
+        raise ValueError(f"CURRENT_DISTANCE='{CURRENT_DISTANCE}' not found or failed in compute_all_distances_single_query.")
+    if distances_1d.shape[0] != N:
+        raise ValueError(f"Distance calculation returned unexpected shape {distances_1d.shape}, expected ({N},)")
+
+
+    actual_k = min(K, N)
+    if actual_k <= 0: return cp.array([], dtype=cp.int64)
+
+    # Find K smallest/largest depending on distance/similarity metric
+    if CURRENT_DISTANCE == "Dot": # Higher score is better (similarity)
+         # Find K largest scores
+         k_partition = max(0, N - actual_k)
+         if N == actual_k: k_indices_unsorted = cp.arange(N)
+         else: k_indices_unsorted = cp.argpartition(distances_1d, kth=k_partition)[k_partition:]
+         # Sort the top K descending by score
+         k_indices = k_indices_unsorted[cp.argsort(-distances_1d[k_indices_unsorted])]
+    else: # Assume lower score is better (L2, Cosine Dist, Manhattan)
+         # Find K smallest distances
+         k_partition = min(actual_k, N) # kth for np/cp argpartition is 0-based index
+         if actual_k >= N: # If K >= N, just sort all
+             k_indices = cp.argsort(distances_1d)
+         else:
+             # argpartition needs kth < N-1, but we want indices up to K. Let's use topk logic
+             # k_indices_unsorted = cp.argpartition(distances_1d, kth=k_partition-1)[:actual_k] # Find K smallest indices (unsorted)
+             # k_indices = k_indices_unsorted[cp.argsort(distances_1d[k_indices_unsorted])] # Sort the K smallest
+
+             # Alternative using topk logic (often simpler than handling argpartition edge cases)
+             # Find the K smallest distances and their indices directly
+             # Note: CuPy currently lacks a direct equivalent of torch.topk
+             # We have to sort all N distances, which is less efficient than partition for large N
+             k_indices = cp.argsort(distances_1d)[:actual_k]
+
+
+    return k_indices.astype(cp.int64) # Ensure int64 indices
 
 def our_knn_stream2(N, D, A, X, K):
     """
