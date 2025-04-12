@@ -287,21 +287,25 @@ def distance_dot(X, A):
     )
     # Return POSITIVE dot product
     return Out
-def distance_dot_tiled(X, A, N_TILE=5, prep=True):
+# Assume ceil_div, _prepare_tensors are defined correctly
+# Assume dot_kernel_pairwise kernel is defined correctly (float32, NO autotune)
+
+def distance_dot_simple_kernel_tiled(X, A, N_TILE=4096, prep=True):
     """
     Computes pairwise dot product using the simple 'dot_kernel_pairwise'
     kernel with FIXED BLOCK_SIZE_D=32 and num_warps=2.
-    Launched in tiles over A (N dim). Returns POSITIVE dot product.
+    Launched in tiles over A (N dim). Passes actual output strides.
     """
     if prep:
          X_prep = _prepare_tensors(X)
          A_prep = _prepare_tensors(A)
-    else: X_prep, A_prep = X, A # Assume prepared float32 contiguous
+    else: X_prep, A_prep = X, A
 
     Q, D = X_prep.shape
     N, D_A = A_prep.shape
     if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
 
+    # Ensure Output tensor matches kernel expectation (float32)
     Out = torch.empty((Q, N), dtype=torch.float32, device=device)
 
     # --- Define Fixed Kernel Launch Parameters ---
@@ -315,24 +319,27 @@ def distance_dot_tiled(X, A, N_TILE=5, prep=True):
         N_chunk = n_end - n_start
         if N_chunk <= 0: continue
 
+        # It's crucial these slices are contiguous if stride=1 is assumed by kernel,
+        # but _prepare_tensors ensures original tensors are contiguous.
+        # Slicing along the first dim (A_chunk) preserves contiguity usually.
+        # Slicing the output view might not.
         A_chunk = A_prep[n_start:n_end, :]
         Out_chunk = Out[:, n_start:n_end]
 
         grid = (Q, N_chunk)
         if grid[0] == 0 or grid[1] == 0: continue
 
-        # Launch the kernel with fixed parameters
-        # The kernel signature still expects BLOCK_SIZE_D
+        # --- Launch Kernel with ACTUAL strides for Out_chunk ---
         dot_kernel_pairwise[grid](
             X_prep, A_chunk, Out_chunk,
             Q, N_chunk, D,
-            X_prep.stride(0), 1, # Explicit stride 1 for contiguous last dim
-            A_chunk.stride(0), 1, # Explicit stride 1
-            Out_chunk.stride(0), 1, # Explicit stride 1
-            BLOCK_SIZE_D=BLOCK_SIZE_D_FIXED, # Pass fixed size explicitly
-            num_warps=NUM_WARPS_FIXED        # Specify num_warps in launch
+            X_prep.stride(0), 1,              # Stride for X (stride_xq, stride_xd=1)
+            A_chunk.stride(0), 1,             # Stride for A_chunk (stride_an, stride_ad=1)
+            Out_chunk.stride(0), Out_chunk.stride(1), # Stride for Out_chunk (stride_outq, stride_outn)
+            BLOCK_SIZE_D=BLOCK_SIZE_D_FIXED,
+            num_warps=NUM_WARPS_FIXED
         )
-        # No sync needed here unless timing this specific call
+        # -------------------------------------------------------
 
     return Out
 '''
