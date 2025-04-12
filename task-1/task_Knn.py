@@ -43,7 +43,7 @@ def dot_kernel_pairwise(
     pid_q = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
-    dot_prod = tl.zeros((), dtype=tl.float64)
+    dot_prod = tl.zeros((), dtype=tl.float32)
     for d_start in range(0, D, BLOCK_SIZE_D):
         d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
         offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
@@ -251,7 +251,7 @@ def distance_dot(X, A):
     N, D_A = A_prep.shape
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
 
-    Out = torch.empty((Q, N), dtype=torch.float64, device=device)
+    Out = torch.empty((Q, N), dtype=torch.float32, device=device)
     grid = (Q, N)
     dot_kernel_pairwise[grid](
         X_prep, A_prep, Out,
