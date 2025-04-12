@@ -464,8 +464,8 @@ def distance_l2(X, A): # Removed **kwargs
 
     # Call distance_dot_tiled, tensors are prepared so prep=False
     # Do NOT pass **kwargs
-    #dot_products = distance_dot_tiled(X_prep, A_prep, prep=False) # Shape (Q, N)
-    dot_products = distance_dot(X_prep, A_prep)
+    dot_products = distance_dot_tiled(X_prep, A_prep, prep=False) # Shape (Q, N)
+    #dot_products = distance_dot(X_prep, A_prep)
 
     X_norm_sq = torch.sum(X_prep**2, axis=1, keepdims=True)  # Shape (Q, 1)
     A_norm_sq = torch.sum(A_prep**2, axis=1, keepdims=True)  # Shape (N, 1)
@@ -485,8 +485,8 @@ def distance_cosine(X, A, epsilon=1e-8): # Removed **kwargs
 
     # Call distance_dot_tiled, tensors are prepared so prep=False
     # Do NOT pass **kwargs
-    #dot_products = distance_dot_tiled(X_prep, A_prep, prep=False) # (Q, N), POSITIVE dot
-    dot_products = distance_dot(X_prep, A_prep)
+    dot_products = distance_dot_tiled(X_prep, A_prep, prep=False) # (Q, N), POSITIVE dot
+    #dot_products = distance_dot(X_prep, A_prep)
     X_norm = torch.linalg.norm(X_prep, axis=1, keepdims=True) # (Q, 1)
     A_norm = torch.linalg.norm(A_prep, axis=1, keepdims=True) # (N, 1)
     norm_product = (X_norm + epsilon) * (A_norm.T + epsilon) # Add epsilon before multiplication
@@ -567,8 +567,8 @@ def our_knn(N_A, D, A, X, K):
 
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
-    #all_distances = distance_dot_tiled(X_prep, A_prep, prep = False) # Shape (Q, N_A)
-    all_distances = distance_dot(X_prep, A_prep)
+    all_distances = distance_dot_tiled(X_prep, A_prep, prep = False) # Shape (Q, N_A)
+    #all_distances = distance_dot(X_prep, A_prep)
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
     topk_distances, topk_indices = torch.topk(all_distances, k=K, dim=1, largest=False)
@@ -869,7 +869,7 @@ if __name__ == "__main__":
                 # --- PyTorch/Triton Warm-up ---
                 print("  Warming up PyTorch/Triton functions...")
                 # Call functions directly, assume they exist or NameError will be caught by outer block
-                temp_results.append(distance_dot(X_queries, A_data))
+                temp_results.append(distance_dot_tiled(X_queries, A_data))
                 temp_results.append(distance_l2(X_queries, A_data))
                 temp_results.append(distance_cosine(X_queries, A_data))
                 temp_results.append(distance_manhattan(X_queries, A_data))
@@ -915,7 +915,7 @@ if __name__ == "__main__":
         try:
             start_event = torch.cuda.Event(enable_timing=True); end_event = torch.cuda.Event(enable_timing=True)
             torch.cuda.synchronize(); start_event.record()
-            for r in range(NUM_RUNS): _ = distance_dot(X_queries, A_data)
+            for r in range(NUM_RUNS): _ = distance_dot_tiled(X_queries, A_data)
             end_event.record(); torch.cuda.synchronize()
             avg_time = (start_event.elapsed_time(end_event) / 1000.0) / NUM_RUNS
             print(f"PyTorch/Triton distance_dot Avg Time: {avg_time:.6f} seconds")
