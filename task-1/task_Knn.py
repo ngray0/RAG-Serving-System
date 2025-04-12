@@ -634,12 +634,11 @@ def distance_cosine(X, A, epsilon=1e-8): # Removed **kwargs
     return cosine_distance
 
 # Corrected distance_manhattan (Removes kwargs, uses grid lambda for autotuned kernel)
+
 def distance_manhattan(X, A):
     """
     Computes pairwise Manhattan (L1) distance using the tiled Triton kernel
     with FIXED block sizes (16, 16, 32).
-    NOTE: Ensure the @triton.autotune decorator is removed/commented out
-          from the 'manhattan_kernel_pairwise_tiled' kernel definition.
     """
     target_device = X.device if isinstance(X, torch.Tensor) else A.device # Get device from input
     X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device) # Prepare tensors
@@ -657,21 +656,29 @@ def distance_manhattan(X, A):
 
     # Calculate the launch grid based on fixed block sizes
     grid_man = (ceil_div(Q, BLOCK_Q_MAN), ceil_div(N, BLOCK_N_MAN))
-    # print(f"Launching Manhattan kernel with fixed grid={grid_man}, Blocks=({BLOCK_Q_MAN},{BLOCK_N_MAN},{BLOCK_K_MAN})") # Optional debug
+
+    # --- Optional: Add Debug Print BEFORE the launch ---
+    # print(f"  DEBUG distance_manhattan (D={D}): Launching kernel...")
+    # print(f"    Grid={grid_man}, Q={Q}, N={N}, D={D}, Blocks=({BLOCK_Q_MAN},{BLOCK_N_MAN},{BLOCK_K_MAN})")
+    # print(f"    X strides={X_prep.stride()}, A strides={A_prep.stride()}, Out strides={Out.stride()}")
+    # print(f"    Passing Strides: xq={X_prep.stride(0)}, xd={X_prep.stride(1)}, an={A_prep.stride(0)}, ad={A_prep.stride(1)}, outq={Out.stride(0)}, outn={Out.stride(1)}")
+    # --- End Debug Print ---
 
     # Launch the kernel, passing the grid and FIXED block sizes explicitly
-    # Ensure manhattan_kernel_pairwise_tiled NO LONGER has the @triton.autotune decorator
+    # --- MODIFICATION HERE: Pass actual strides for last dimension ---
     manhattan_kernel_pairwise_tiled[grid_man](
         X_prep, A_prep, Out,
         Q, N, D,
-        X_prep.stride(0), 1, # Assuming contiguous tensor stride for D = 1
-        A_prep.stride(0), 1, # Assuming contiguous tensor stride for D = 1
-        Out.stride(0), 1,    # Assuming contiguous tensor stride for D = 1
+        X_prep.stride(0), X_prep.stride(1),  # Use X_prep.stride(1) instead of 1
+        A_prep.stride(0), A_prep.stride(1),  # Use A_prep.stride(1) instead of 1
+        Out.stride(0),    Out.stride(1),     # Use Out.stride(1) instead of 1
         # Pass the block sizes explicitly matching the kernel signature
         BLOCK_Q=BLOCK_Q_MAN,
         BLOCK_N=BLOCK_N_MAN,
         BLOCK_K=BLOCK_K_MAN
     )
+    # --- END MODIFICATION ---
+
     torch.cuda.synchronize(device=target_device) # Sync after kernel call
     return Out
 def our_knn(N_A, D, A, X, K):
