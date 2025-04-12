@@ -235,18 +235,37 @@ def l2_dist_kernel_1_vs_M2(
 # ============================================================================
 # Helper Functions
 # ============================================================================
-def _prepare_tensors(*tensors, target_device =device):
-    """Ensure tensors are float32, contiguous, and on the correct device."""
+# ============================================================================
+# Helper Functions
+# ============================================================================
+def _prepare_tensors(*tensors, target_device=device):
+    """
+    Ensure tensors are float32, contiguous, and on the correct device.
+    Returns single tensor if 1 input, list otherwise.
+    """
     prepared = []
     for t in tensors:
+        # --- Preparation logic ---
         if not isinstance(t, torch.Tensor):
-            t = torch.tensor(t, dtype=torch.float32, device=target_device)
+            try:
+                t = torch.tensor(t, dtype=torch.float32, device=target_device)
+            except Exception as e:
+                raise TypeError(f"Failed to convert input of type {type(t)} to torch.Tensor: {e}")
         if t.device != target_device:
             t = t.to(target_device)
         if t.dtype != torch.float32:
             t = t.to(dtype=torch.float32)
-        prepared.append(t.contiguous())
-    return prepared
+        if not t.is_contiguous():
+            t = t.contiguous()
+        # --- End preparation logic ---
+        prepared.append(t) # Append the prepared tensor
+
+    # --- Corrected Return Logic ---
+    if len(prepared) == 1:
+        return prepared[0] # Return single tensor directly
+    else:
+        return prepared    # Return list for multiple tensors
+    # --- End Corrected Return Logic ---
 
 # ============================================================================
 # Python Distance Function Wrappers using Triton / PyTorch
