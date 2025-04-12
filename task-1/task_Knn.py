@@ -290,7 +290,7 @@ def distance_dot(X, A):
 # Assume ceil_div, _prepare_tensors are defined correctly
 # Assume dot_kernel_pairwise kernel is defined correctly (float32, NO autotune)
 
-def distance_dot_simple_kernel_tiled(X, A, N_TILE=4096, prep=True):
+def distance_dot_tiled(X, A, N_TILE=4096, prep=True):
     """
     Computes pairwise dot product using the simple 'dot_kernel_pairwise'
     kernel with FIXED BLOCK_SIZE_D=32 and num_warps=2.
