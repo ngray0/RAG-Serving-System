@@ -299,7 +299,7 @@ def distance_dot(X, A):
     )
     # Return POSITIVE dot product
     return Out
-def distance_dot_tiled(X, A, N_TILE=32768, prep=True):
+def distance_dot_tiled(X, A, N_TILE=4096, prep=True):
     """
     Computes pairwise dot product using the simple 'dot_kernel_pairwise'
     kernel (autotuned on BLOCK_SIZE_D), but launched in tiles over A (N dim)
