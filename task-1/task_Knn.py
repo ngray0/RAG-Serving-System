@@ -851,7 +851,7 @@ def our_knn_stream(N, D, A, X, K):
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data =4000000
+    N_data =40000
     N_queries = 1
     K_val = 10          # K for KNN
     NUM_RUNS = 10       # Number of timed runs for averaging
@@ -964,6 +964,7 @@ if __name__ == "__main__":
         # ===         DISTANCE FUNCTION BENCHMARKS           ===
         # ===--------------------------------------------------===
         print("\n" + "="*40); print(f"Benchmarking Distance Functions (D={Dim})..."); print("="*40)
+        print("BEST CONFIG", dot_kernel_pairwise.best_config)
 
         # --- PyTorch/Triton Dot Distance (distance_dot_tiled) --- ADDED
         try:
