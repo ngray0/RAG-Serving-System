@@ -34,32 +34,33 @@ def ceil_div(a, b):
 def dot_kernel_pairwise(
     X_ptr, A_ptr, Out_ptr,
     Q, N, D,
-    stride_xq, stride_xd,
+    stride_xq, stride_xd, # stride_xd/ad will be 1 from call site
     stride_an, stride_ad,
-    stride_outq, stride_outn,
+    stride_outq, stride_outn, # stride_outn will be 1 from call site
     BLOCK_SIZE_D: tl.constexpr,
 ):
-    """Calculates pairwise dot product: dot(X[q], A[n])"""
+    """Calculates pairwise dot product using float32."""
     pid_q = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
 
+    # --- FIX: Use float32 for accumulation ---
     dot_prod = tl.zeros((), dtype=tl.float32)
-    for d_start in range(0, D, BLOCK_SIZE_D):
-        d_end = tl.minimum(d_start + BLOCK_SIZE_D, D)
-        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
-        mask_d = offs_d < d_end
 
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < D
+
+        # Use original pointer logic, assuming strides passed correctly reflect layout
         x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
-        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0).to(tl.float32) # Ensure float32 load
 
         a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
-        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0).to(tl.float32) # Ensure float32 load
 
-        dot_prod += tl.sum(x_vals * a_vals, axis=0)
+        dot_prod += tl.sum(x_vals * a_vals, axis=0) # Accumulate float32
 
     out_offset = pid_q * stride_outq + pid_n * stride_outn
-    tl.store(Out_ptr + out_offset, dot_prod)
-
+    tl.store(Out_ptr + out_offset, dot_prod) # Store float32 result
 
 
 @triton.jit
@@ -245,25 +246,31 @@ def _prepare_tensors(*tensors, target_device =device):
 
 
 def distance_dot(X, A):
-    """Computes pairwise dot product using Triton kernel."""
+    """Computes pairwise dot product using non-tiled Triton kernel (dot_kernel_pairwise)."""
+    # _prepare_tensors ensures float32, contiguous inputs
     X_prep, A_prep = _prepare_tensors(X, A)
     Q, D = X_prep.shape
     N, D_A = A_prep.shape
     assert D == D_A, f"Dimension mismatch: X({D}) vs A({D_A})"
 
+    # --- FIX 1: Change output dtype to float32 ---
     Out = torch.empty((Q, N), dtype=torch.float32, device=device)
     grid = (Q, N)
+
+    # Ensure DEFAULT_BLOCK_D is defined (e.g., 128)
+    global DEFAULT_BLOCK_D
+    if 'DEFAULT_BLOCK_D' not in globals(): DEFAULT_BLOCK_D = 128 # Define if needed
+
+    # Call the kernel (now expects float32 output pointer)
     dot_kernel_pairwise[grid](
         X_prep, A_prep, Out,
         Q, N, D,
-        X_prep.stride(0), X_prep.stride(1),
-        A_prep.stride(0), A_prep.stride(1),
-        Out.stride(0), Out.stride(1),
-        BLOCK_SIZE_D=32
+        X_prep.stride(0), 1, # --- FIX 2: Use stride 1 for contiguous last dim ---
+        A_prep.stride(0), 1, # --- FIX 2: Use stride 1 for contiguous last dim ---
+        Out.stride(0),    1, # --- FIX 2: Use stride 1 for contiguous last dim ---
+        BLOCK_SIZE_D=DEFAULT_BLOCK_D
     )
-    # Return negative dot product if used for minimization (finding 'nearest')
-    # return -Out
-    # Or return raw dot product if similarity maximization is intended
+    # Return POSITIVE dot product
     return Out
 def distance_dot_tiled(X, A, N_TILE=32768, prep=True):
     # ... (definition returning positive dot product) ...
