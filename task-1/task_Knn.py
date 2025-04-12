@@ -1010,16 +1010,16 @@ def our_knn_stream(N, D, A, X, K):
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data = 4000 # Using 4 Million points
+    N_data = 4000000 # Using 4 Million points
     N_queries = 1     # Using 1 query as per your last log
     K_val = 10          # K for KNN
-    NUM_RUNS = 10       # Number of timed runs for averaging
-    WARMUP_RUNS = 2     # Number of warm-up runs
+    NUM_RUNS = 2       # Number of timed runs for averaging
+    WARMUP_RUNS = 1     # Number of warm-up runs
     # --- CPU BENCHMARKING FLAG ---
     BENCHMARK_CPU = True # Set to False to skip CPU tests (can be slow)
 
     # --- Dimensions to Test ---
-    dimensions_to_test = [2, 4, 64, 256, 1024]
+    dimensions_to_test = [1024]
 
     # --- Tolerance for Numerical Check ---
     rtol_check = 1e-4
@@ -1166,25 +1166,41 @@ if __name__ == "__main__":
                         import traceback; traceback.print_exc()
                         dimension_failed = True
                  # --- Add CPU Warmup ---
+            # --- Add CPU Warmup ---
             if warmup_functions_cpu:
                 print("  Warming up CPU functions...")
+                BENCHMARK_CPU_THIS_DIM = BENCHMARK_CPU # Assume true initially if flag is set
+                cpu_warmup_ok = True
                 for name, func in warmup_functions_cpu.items():
-                    if dimension_failed: break
-                    if DETAILED_DEBUG: print(f"    Attempting warm-up for: {name}")
+                    if dimension_failed:
+                        cpu_warmup_ok = False
+                        break
+                    print(f"    Attempting warm-up for CPU function: {name} ...", end='', flush=True) # Print before, no newline
+                    start_cpu_warmup_call = time.perf_counter()
                     try:
                         _ = func() # Execute CPU function
-                        if DETAILED_DEBUG: print(f"      Warm-up OK: {name}")
-                    except Exception as e:
-                        print(f"    *** ERROR during warm-up for {name} (D={Dim}): {e} ***")
+                        end_cpu_warmup_call = time.perf_counter()
+                        print(f" done. (took {end_cpu_warmup_call - start_cpu_warmup_call:.4f} s)") # Print after + time
+                    except MemoryError as e:
+                        print(f"\n    *** MEMORY ERROR during warm-up for {name} (D={Dim}): {e} ***")
                         import traceback; traceback.print_exc()
-                    # Decide if CPU failure should stop all benchmarks for the dimension
-                    # dimension_failed = True # Optional: uncomment to stop everything on CPU failure
-                        print(f"    Skipping CPU benchmarks for dimension {Dim} due to warm-up error.")
-                        BENCHMARK_CPU_THIS_DIM = False # Flag to skip CPU benchmarks only
-                        break # Stop CPU warmup for this dimension
-                else: # Only runs if the CPU warmup loop completed without break
-                    BENCHMARK_CPU_THIS_DIM = BENCHMARK_CPU
-            else:
+                        print(f"    Likely insufficient RAM for this operation on CPU at N={N_data}, D={Dim}.")
+                        print(f"    Skipping CPU benchmarks for dimension {Dim}.")
+                        cpu_warmup_ok = False
+                        break # Stop CPU warmup
+                    except Exception as e:
+                        print(f"\n    *** ERROR during warm-up for {name} (D={Dim}): {e} ***")
+                        import traceback; traceback.print_exc()
+                        print(f"    Skipping CPU benchmarks for dimension {Dim}.")
+                        cpu_warmup_ok = False
+                        break # Stop CPU warmup
+
+        # Set the flag based on whether warmup completed ok
+                BENCHMARK_CPU_THIS_DIM = cpu_warmup_ok and BENCHMARK_CPU
+                if not BENCHMARK_CPU_THIS_DIM:
+                    print("    CPU warmup aborted or skipped.")
+
+            else: # No CPU functions defined or flag is false
                 BENCHMARK_CPU_THIS_DIM = False
 
 
