@@ -92,42 +92,48 @@ def dot_kernel_pairwise_tiled(
     out_ptrs = Out_ptr + (offs_q[:, None] * stride_outq + offs_n[None, :] * 1) # Assume stride_outn=1
     out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
     tl.store(out_ptrs, accumulator, mask=out_mask)
-
 @triton.jit
-def manhattan_kernel_pairwise_tiled(
-    X_ptr, A_ptr, Out_ptr, # Parameters are received but mostly ignored
+def manhattan_kernel_pairwise_simple(
+    X_ptr,      # Pointer to Query vectors (Q, D)
+    A_ptr,      # Pointer to Database vectors (N, D)
+    Out_ptr,    # Pointer to output distances (Q, N)
+    # --- Dimensions ---
     Q, N, D,
+    # --- Strides ---
     stride_xq, stride_xd,
     stride_an, stride_ad,
     stride_outq, stride_outn,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr, # BLOCK_K is ignored here
+    # --- Block Size for Looping over D ---
+    BLOCK_SIZE_D: tl.constexpr, # Loop step size for the D dimension
 ):
-    # 1. Get program IDs for the output block
-    pid_q_block = tl.program_id(axis=0)
-    pid_n_block = tl.program_id(axis=1)
+    """
+    Calculates pairwise Manhattan distance: dist(X[q], A[n]) = sum(abs(X[q,d] - A[n,d]))
+    Each program instance computes ONE output element Out[q, n].
+    Uses a simple loop over the D dimension.
+    """
+    pid_q = tl.program_id(axis=0) # Represents the query index q
+    pid_n = tl.program_id(axis=1) # Represents the database index n (relative to the current chunk)
 
-    # 2. Calculate offsets for the *start* of the output block this thread block handles
-    q_start = pid_q_block * BLOCK_Q
-    n_start = pid_n_block * BLOCK_N
+    l1_dist = tl.zeros((), dtype=tl.float32)
 
-    # 3. Calculate pointer to the top-left element of the output block
-    #    Use tl.arange to create offsets relative to the start for the whole block
-    offs_q = q_start + tl.arange(0, BLOCK_Q)
-    offs_n = n_start + tl.arange(0, BLOCK_N)
-    out_ptrs = Out_ptr + offs_q[:, None] * stride_outq + offs_n[None, :] * stride_outn
+    for d_start in range(0, D, BLOCK_SIZE_D):
+        offs_d = d_start + tl.arange(0, BLOCK_SIZE_D)
+        mask_d = offs_d < D
 
-    # 4. Create a mask for valid output elements
-    out_mask = (offs_q[:, None] < Q) & (offs_n[None, :] < N)
+        x_ptrs = X_ptr + pid_q * stride_xq + offs_d * stride_xd
+        x_vals = tl.load(x_ptrs, mask=mask_d, other=0.0)
 
-    # 5. Create a dummy value to write (e.g., constant or based on pids)
-    #    Ensure it matches the accumulator shape (BLOCK_Q, BLOCK_N)
-    dummy_value = (pid_q_block + pid_n_block) * 1.0 # Example value
-    dummy_accumulator = tl.full((BLOCK_Q, BLOCK_N), dummy_value, dtype=tl.float32)
+        # A_ptr points to the START of the current A_chunk
+        # pid_n is the index WITHIN the chunk (0 to N_chunk-1)
+        a_ptrs = A_ptr + pid_n * stride_an + offs_d * stride_ad
+        a_vals = tl.load(a_ptrs, mask=mask_d, other=0.0)
 
-    # 6. Perform ONLY the store operation
-    tl.store(out_ptrs, dummy_accumulator, mask=out_mask)
+        diff = x_vals - a_vals
+        l1_dist += tl.sum(tl.abs(diff), axis=0)
+
+    # Out_ptr points to the START of the current Out_chunk
+    out_offset = pid_q * stride_outq + pid_n * stride_outn
+    tl.store(Out_ptr + out_offset, l1_dist)
 
 @triton.jit
 def l2_dist_kernel_pairwise(
@@ -608,51 +614,81 @@ def distance_cosine(X, A, epsilon=1e-8): # Removed **kwargs
 
 # Corrected distance_manhattan (Removes kwargs, uses grid lambda for autotuned kernel)
 
-def distance_manhattan(X, A):
+def distance_manhattan(X, A, N_TILE=4096, prep=True): # Keep N_TILE argument
     """
-    Computes pairwise Manhattan (L1) distance using the tiled Triton kernel
-    with FIXED block sizes (16, 16, 32).
+    Computes pairwise Manhattan (L1) distance using the simple
+    'manhattan_kernel_pairwise_simple' kernel, launched from Python
+    in tiles over the N dimension of A. Mimics the structure of distance_dot_tiled.
     """
-    target_device = X.device if isinstance(X, torch.Tensor) else A.device # Get device from input
-    X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device) # Prepare tensors
+    target_device = X.device if isinstance(X, torch.Tensor) else A.device
+
+    # Prepare tensors if requested
+    if prep:
+        # Ensure float32, correct device, and contiguous inputs
+        X_prep, A_prep = _prepare_tensors(X, A, target_device=target_device)
+    else:
+        # If prep=False, assume user has prepared tensors correctly
+        # Add basic checks for safety
+        if not isinstance(X, torch.Tensor) or not isinstance(A, torch.Tensor):
+             raise TypeError("Inputs must be torch tensors if prep=False")
+        if X.device != target_device or A.device != target_device:
+             raise ValueError(f"Inputs must be on the target device ({target_device}) if prep=False")
+        if X.dtype != torch.float32 or A.dtype != torch.float32:
+             raise TypeError("Inputs must be float32 if prep=False")
+        # Note: Contiguity isn't strictly required if passing actual strides,
+        # but slicing is generally more efficient on contiguous tensors.
+        X_prep, A_prep = X, A
+
     Q, D = X_prep.shape
     N, D_A = A_prep.shape
     if D != D_A: raise ValueError(f"Dimension mismatch: X({D}) vs A({D_A})")
 
+    # Create the full output tensor (ensure it's on the correct device)
     Out = torch.empty((Q, N), dtype=torch.float32, device=target_device)
 
-    # --- Define Fixed Block Sizes ---
-    BLOCK_Q_MAN = 32
-    BLOCK_N_MAN = 32
-    BLOCK_K_MAN = 32
-    # --------------------------------
+    # Define block size for the D-loop inside the simple kernel (tune if needed)
+    BLOCK_D_PARAM = 128
 
-    # Calculate the launch grid based on fixed block sizes
-    grid_man = (ceil_div(Q, BLOCK_Q_MAN), ceil_div(N, BLOCK_N_MAN))
+    # print(f"Running distance_manhattan (simple kernel, N_TILE={N_TILE})") # Optional debug
 
-    # --- Optional: Add Debug Print BEFORE the launch ---
-    # print(f"  DEBUG distance_manhattan (D={D}): Launching kernel...")
-    # print(f"    Grid={grid_man}, Q={Q}, N={N}, D={D}, Blocks=({BLOCK_Q_MAN},{BLOCK_N_MAN},{BLOCK_K_MAN})")
-    # print(f"    X strides={X_prep.stride()}, A strides={A_prep.stride()}, Out strides={Out.stride()}")
-    # print(f"    Passing Strides: xq={X_prep.stride(0)}, xd={X_prep.stride(1)}, an={A_prep.stride(0)}, ad={A_prep.stride(1)}, outq={Out.stride(0)}, outn={Out.stride(1)}")
-    # --- End Debug Print ---
+    # Loop over A (database) in chunks of N_TILE
+    for n_start in range(0, N, N_TILE):
+        n_end = min(n_start + N_TILE, N)
+        N_chunk = n_end - n_start
+        if N_chunk <= 0: continue # Skip empty chunks
 
-    # Launch the kernel, passing the grid and FIXED block sizes explicitly
-    # --- MODIFICATION HERE: Pass actual strides for last dimension ---
-    manhattan_kernel_pairwise_tiled[grid_man](
-        X_prep, A_prep, Out,
-        Q, N, D,
-        X_prep.stride(0), X_prep.stride(1),  # Use X_prep.stride(1) instead of 1
-        A_prep.stride(0), A_prep.stride(1),  # Use A_prep.stride(1) instead of 1
-        Out.stride(0),    Out.stride(1),     # Use Out.stride(1) instead of 1
-        # Pass the block sizes explicitly matching the kernel signature
-        BLOCK_Q=BLOCK_Q_MAN,
-        BLOCK_N=BLOCK_N_MAN,
-        BLOCK_K=BLOCK_K_MAN
-    )
-    # --- END MODIFICATION ---
+        # Get the current chunk of A. Slicing preserves device.
+        A_chunk = A_prep[n_start:n_end, :]
+        # Get the corresponding slice of the output tensor view. Slicing preserves device.
+        Out_chunk = Out[:, n_start:n_end]
 
-    torch.cuda.synchronize(device=target_device) # Sync after kernel call
+        # Grid for this chunk launch is (Q, N_chunk)
+        grid = (Q, N_chunk)
+        if grid[0] == 0 or grid[1] == 0: continue
+
+        # --- Optional Debug Print for Chunk ---
+        # print(f"  Processing chunk N=[{n_start}:{n_end}] (Size={N_chunk})")
+        # print(f"    Kernel: manhattan_kernel_pairwise_simple")
+        # print(f"    Grid={grid}, Q={Q}, N_chunk={N_chunk}, D={D}, BLOCK_SIZE_D={BLOCK_D_PARAM}")
+        # print(f"    A_chunk strides={A_chunk.stride()}, Out_chunk strides={Out_chunk.stride()}")
+        # print(f"    Launching kernel...")
+        # --- End Debug Print ---
+
+        # Launch the simple kernel for THIS CHUNK
+        # Pass pointers to the START of X_prep, A_chunk, and Out_chunk
+        # Pass Q, N_chunk (size of this chunk), and D
+        # Pass strides for X_prep, A_chunk, and Out_chunk
+        manhattan_kernel_pairwise_simple[grid](
+            X_prep, A_chunk, Out_chunk,
+            Q, N_chunk, D,
+            X_prep.stride(0), X_prep.stride(1),     # Strides for X
+            A_chunk.stride(0), A_chunk.stride(1),   # Strides for A_chunk
+            Out_chunk.stride(0), Out_chunk.stride(1), # Strides for Out_chunk view
+            BLOCK_SIZE_D=BLOCK_D_PARAM
+        )
+        # torch.cuda.synchronize() # Optional: sync after each chunk if debugging OOM or specific chunk errors
+
+    torch.cuda.synchronize(device=target_device) # Sync after all chunks are launched
     return Out
 def our_knn(N_A, D, A, X, K):
     """
