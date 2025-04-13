@@ -490,7 +490,7 @@ def distance_manhattan_cpu(X_np, A_np):
 if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 100000 # Using 4 Million points
-    N_queries = 10000     # Using 1 query
+    N_queries = 1     # Using 1 query
     # K_val removed as KNN code is gone
     NUM_RUNS = 4      # Number of timed runs for averaging
     WARMUP_RUNS = 1   # Number of warm-up runs
