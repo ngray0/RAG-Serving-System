@@ -757,200 +757,221 @@ def cupy_knn_bruteforce(N_A, D, A_cp, X_cp, K, batch_size_q=256): # Add batch_si
     return all_topk_indices_cp.astype(cp.int64), all_topk_distances_sq_cp.astype(cp.float32)
 
 if __name__ == "__main__":
-    if not cupy_device_ok:
-        print("CuPy device not available. Exiting.")
-        exit()
+    if not 'cupy_device_ok' in globals() or not cupy_device_ok:
+        try:
+            cp.cuda.Device(0).use()
+            print(f"CuPy using GPU: {cp.cuda.Device(0)} ({cp.cuda.runtime.getDeviceProperties(0)['name']})")
+            cupy_device_ok = True
+        except cp.cuda.runtime.CUDARuntimeError as e:
+            print(f"CuPy CUDA Error: {e}")
+            print("Cannot run CuPy operations without CUDA. Exiting.")
+            exit()
+        except NameError: # If cupy_device_ok wasn't defined at all
+             print("CuPy device status unknown and check failed. Exiting.")
+             exit()
 
-    # --- Parameters ---
-    N_data = 1000000    # Number of database points
-    Dim = 128           # Dimension
-    N_queries = 10000      # Number of query points
-    K_final_neighbors = 10 # Final number of neighbors to find (Output K)
 
-    # ANN Parameters based on new pseudocode interpretation
+    # --- Fixed Parameters ---
+    N_data = 1000000    # Database size
+    # Dim will be set in the loop
+    N_queries = 10000      # Queries
+    K_final_neighbors = 10 # Final K for output
+
+    # ANN Parameters
     num_clusters_kmeans = 1000  # K for KMeans (Step 1)
-    num_clusters_probe = 300    # K1 for finding probe clusters (Step 2)
-                               # K2 from pseudocode is ignored based on interpretation
-
+    num_clusters_probe = 300    # K1 (nprobe) for cluster probing (Step 2)
     kmeans_max_iters = 50      # Max iterations for KMeans
 
     # Recall threshold
     RECALL_THRESHOLD = 0.70
 
-    print("="*50)
-    print("Generating Test Data (CuPy)...")
-    print(f"N={N_data}, D={Dim}, Q={N_queries}, K_final={K_final_neighbors}")
+    # Dimensions to test
+    dimensions_to_test = [2, 4, 64, 256, 1024]
+
+    # Get CuPy memory pool
+    mempool = cp.get_default_memory_pool()
+    pinned_mempool = cp.get_default_pinned_memory_pool()
+
+    print("\n" + "="*60)
+    print("--- CuPy ANN Full Test ---")
+    print("="*60)
+    print(f"Fixed Params: N={N_data}, Q={N_queries}, K_final={K_final_neighbors}")
     print(f"ANN Params: num_clusters={num_clusters_kmeans}, nprobe={num_clusters_probe}")
-    print("="*50)
-    A_data_cp = None # Define outside try block
-    X_queries_cp = None
+    print(f"Testing Dimensions: {dimensions_to_test}")
+
+    # --- Warmup Phase ---
+    print("\n" + "="*60)
+    print("--- Warmup Run (Compiling Kernels...) ---")
+    print("="*60)
     try:
-        # Generate data directly on GPU
-        print("Allocating memory for A_data_cp...")
-        A_data_cp = cp.random.random((N_data, Dim), dtype=cp.float32)
-        print("Allocating memory for X_queries_cp...")
-        X_queries_cp = cp.random.random((N_queries, Dim), dtype=cp.float32)
+        WARMUP_N = 10000
+        WARMUP_Q = 100
+        WARMUP_DIM = 32
+        WARMUP_K_CLUSTERS = 50
+        WARMUP_NPROBE = 5
+        WARMUP_KFINAL = 5
 
-        # Optional: Normalize data? Often helps distance-based methods.
-        # print("Normalizing data...")
-        # A_data_cp /= cp.linalg.norm(A_data_cp, axis=1, keepdims=True) + 1e-9
-        # X_queries_cp /= cp.linalg.norm(X_queries_cp, axis=1, keepdims=True) + 1e-9
+        print(f"Warmup Params: N={WARMUP_N}, D={WARMUP_DIM}, Q={WARMUP_Q}, K={WARMUP_KFINAL}, Clusters={WARMUP_K_CLUSTERS}, NProbe={WARMUP_NPROBE}")
 
-        cp.cuda.Stream.null.synchronize() # Wait for operations
-        print("Data generated successfully on GPU.")
-        # Check memory usage (example)
-        pool = cp.get_default_memory_pool()
-        print(f"CuPy Memory Usage: {pool.used_bytes() / (1024**3):.2f} GB used / {pool.total_bytes() / (1024**3):.2f} GB total")
+        # Generate small warmup data
+        A_warmup_cp = cp.random.random((WARMUP_N, WARMUP_DIM), dtype=cp.float32)
+        X_warmup_cp = cp.random.random((WARMUP_Q, WARMUP_DIM), dtype=cp.float32)
+        cp.cuda.Stream.null.synchronize()
 
-    except cp.cuda.memory.OutOfMemoryError as e:
-        print(f"\nError: Out of GPU memory during data generation: {e}")
-        print("Try reducing N_data or Dim.")
-        # Clean up memory if possible
-        del A_data_cp
-        del X_queries_cp
-        cp.get_default_memory_pool().free_all_blocks()
-        exit()
-    except Exception as e:
-        print(f"\nError generating data: {e}")
-        exit()
-
-    # --- Run ANN (User Pseudocode - IVF-like) ---
-    print("\n" + "="*50)
-    print(f"Testing ANN (User Pseudocode - IVF-like)...")
-    print("="*50)
-    ann_indices = None # Define outside try block
-    ann_dists_sq = None
-    build_t = 0
-    search_t = 0
-    try:
-        ann_indices, ann_dists_sq, build_t, search_t = ann_user_pseudocode_ivf_like(
-            N_A=N_data, D=Dim, A_cp=A_data_cp, X_cp=X_queries_cp,
-            K_final=K_final_neighbors,
-            num_clusters=num_clusters_kmeans,
-            num_clusters_to_probe=num_clusters_probe,
-            max_kmeans_iters=kmeans_max_iters
-            # Example of using precomputed:
-            # precomputed_centroids=centroids_from_earlier,
-            # precomputed_assignments=assignments_from_earlier
+        # Run ANN function (includes KMeans)
+        print("Warmup: Running ANN (includes KMeans)...")
+        _, _, _, _ = ann_user_pseudocode_ivf_like(
+            N_A=WARMUP_N, D=WARMUP_DIM, A_cp=A_warmup_cp, X_cp=X_warmup_cp,
+            K_final=WARMUP_KFINAL,
+            num_clusters=WARMUP_K_CLUSTERS,
+            num_clusters_to_probe=WARMUP_NPROBE,
+            max_kmeans_iters=5 # Fewer iters for warmup
         )
-        print("\nANN Results:")
-        if ann_indices is not None:
-            print(f"  Indices shape: {ann_indices.shape}") # Should be (N_queries, K_final_neighbors)
-        if ann_dists_sq is not None:
-            print(f"  Sq Distances shape: {ann_dists_sq.shape}")
-        print(f"  Build Time: {build_t:.4f}s")
-        print(f"  Search Time: {search_t:.4f}s")
+        print("Warmup: Running Brute Force KNN...")
+        # Run Brute Force function
+        _, _ = cupy_knn_bruteforce(
+            N_A=WARMUP_N, D=WARMUP_DIM, A_cp=A_warmup_cp, X_cp=X_warmup_cp, K=WARMUP_KFINAL, batch_size_q=64
+        )
+        cp.cuda.Stream.null.synchronize()
+        print("Warmup complete.")
 
     except cp.cuda.memory.OutOfMemoryError as e:
-        print(f"\nError: Out of GPU memory during ANN execution: {e}")
-        print("Consider reducing N_data, num_clusters, or num_clusters_to_probe.")
-        ann_indices = None # Prevent recall calculation
+         print(f"OOM Error during warmup: {e}. Trying to continue...")
     except Exception as e:
-        print(f"\nError during ANN execution: {e}")
-        import traceback
-        traceback.print_exc()
-        ann_indices = None # Prevent recall calculation
+        print(f"An error occurred during warmup: {e}")
+        print("Continuing without warmup...")
     finally:
-         # Intermediate cleanup if needed, although full cleanup happens later
-         pass
+        # Cleanup warmup data
+        if 'A_warmup_cp' in locals(): del A_warmup_cp
+        if 'X_warmup_cp' in locals(): del X_warmup_cp
+        mempool.free_all_blocks()
+        pinned_mempool.free_all_blocks()
+        print(f"Warmup Cleanup. CuPy Mem Free: {mempool.free_bytes() / (1024**3):.2f} GB")
 
 
-    # --- Run Brute-Force KNN for Ground Truth ---
-    true_knn_indices = None # Define outside try/except
-    if ann_indices is not None: # Only run if ANN succeeded and needed for recall
-        print("\n" + "="*50)
-        print(f"Calculating Ground Truth (Brute-Force k-NN)...")
-        print("="*50)
+    # --- Main Loop Over Dimensions ---
+    print("\n" + "="*60)
+    print("--- Starting Dimension Tests ---")
+    print("="*60)
+
+    for Dim in dimensions_to_test:
+        print("\n" + "#"*70)
+        print(f"# Testing Dimension D = {Dim}")
+        print("#"*70)
+
+        # --- Per-Dimension Variables ---
+        A_data_cp = None
+        X_queries_cp = None
+        ann_indices = None
+        ann_dists_sq = None
+        true_knn_indices = None
+        build_t = 0
+        search_t = 0
+
         try:
-            true_knn_indices, true_knn_dists_sq = cupy_knn_bruteforce(
-                N_A=N_data, D=Dim, A_cp=A_data_cp, X_cp=X_queries_cp, K=K_final_neighbors
-            )
-            print("\nGround Truth Results:")
-            if true_knn_indices is not None:
-                print(f"  Indices shape: {true_knn_indices.shape}")
-            if true_knn_dists_sq is not None:
-                print(f"  Sq Distances shape: {true_knn_dists_sq.shape}")
+            # --- Generate Data for Current Dimension ---
+            print(f"\n[D={Dim}] Generating Test Data (CuPy)...")
+            try:
+                A_data_cp = cp.random.random((N_data, Dim), dtype=cp.float32)
+                X_queries_cp = cp.random.random((N_queries, Dim), dtype=cp.float32)
+                cp.cuda.Stream.null.synchronize()
+                print(f"[D={Dim}] Data generated. CuPy Mem Used: {mempool.used_bytes()/(1024**3):.2f} GB / Total: {mempool.total_bytes()/(1024**3):.2f} GB")
+            except cp.cuda.memory.OutOfMemoryError as e:
+                print(f"\n[D={Dim}] ERROR: OOM during data generation: {e}")
+                mempool.free_all_blocks(); pinned_mempool.free_all_blocks()
+                continue # Skip to next dimension
+            except Exception as e:
+                print(f"\n[D={Dim}] ERROR generating data: {e}")
+                continue # Skip to next dimension
 
-        except cp.cuda.memory.OutOfMemoryError as e:
-            print(f"\nError: Out of GPU memory during Brute Force k-NN: {e}")
-            print("Try reducing N_data or N_queries.")
-            true_knn_indices = None # Prevent recall calculation
-        except Exception as e:
-            print(f"\nError during Brute Force k-NN execution: {e}")
-            import traceback
-            traceback.print_exc()
-            true_knn_indices = None # Prevent recall calculation
+            # --- Run ANN for Current Dimension ---
+            print(f"\n[D={Dim}] Testing ANN (CuPy IVF-like)...")
+            try:
+                ann_indices, ann_dists_sq, build_t, search_t = ann_user_pseudocode_ivf_like(
+                    N_A=N_data, D=Dim, A_cp=A_data_cp, X_cp=X_queries_cp, # Use current Dim data
+                    K_final=K_final_neighbors,
+                    num_clusters=num_clusters_kmeans,
+                    num_clusters_to_probe=num_clusters_probe,
+                    max_kmeans_iters=kmeans_max_iters
+                )
+                print(f"\n[D={Dim}] ANN Results:")
+                if ann_indices is not None: print(f"  Indices shape: {ann_indices.shape}")
+                if ann_dists_sq is not None: print(f"  Sq Distances shape: {ann_dists_sq.shape}")
+                print(f"  Build Time: {build_t:.4f}s")
+                print(f"  Search Time: {search_t:.4f}s")
+            except cp.cuda.memory.OutOfMemoryError as e:
+                print(f"\n[D={Dim}] ERROR: OOM during ANN execution: {e}")
+                ann_indices = None; mempool.free_all_blocks(); pinned_mempool.free_all_blocks() # Prevent recall
+            except Exception as e:
+                print(f"\n[D={Dim}] ERROR during ANN execution: {e}")
+                traceback.print_exc(); ann_indices = None # Prevent recall
+
+            # --- Run Brute-Force KNN for Current Dimension ---
+            if ann_indices is not None: # Only run if ANN succeeded
+                print(f"\n[D={Dim}] Calculating Ground Truth (CuPy k-NN)...")
+                try:
+                    # Using the batched version of cupy_knn_bruteforce
+                    true_knn_indices, true_knn_dists_sq = cupy_knn_bruteforce(
+                        N_A=N_data, D=Dim, A_cp=A_data_cp, X_cp=X_queries_cp, K=K_final_neighbors, batch_size_q=256 # Adjust batch size if needed
+                    )
+                    print(f"\n[D={Dim}] Ground Truth Results:")
+                    if true_knn_indices is not None: print(f"  Indices shape: {true_knn_indices.shape}")
+                except cp.cuda.memory.OutOfMemoryError as e:
+                    print(f"\n[D={Dim}] ERROR: OOM during Brute Force k-NN: {e}")
+                    true_knn_indices = None; mempool.free_all_blocks(); pinned_mempool.free_all_blocks() # Prevent recall
+                except Exception as e:
+                    print(f"\n[D={Dim}] ERROR during Brute Force k-NN execution: {e}")
+                    traceback.print_exc(); true_knn_indices = None # Prevent recall
+                finally:
+                     if 'true_knn_dists_sq' in locals(): del true_knn_dists_sq
+
+            # --- Calculate Recall for Current Dimension ---
+            if ann_indices is not None and true_knn_indices is not None:
+                print(f"\n[D={Dim}] Calculating Recall@{K_final_neighbors}...")
+                try:
+                    # print(f"[D={Dim}] Transferring indices to CPU...")
+                    start_recall_calc = time.time()
+                    # Transfer to NumPy for comparison
+                    ann_indices_np = cp.asnumpy(ann_indices)
+                    true_indices_np = cp.asnumpy(true_knn_indices)
+                    # print(f" Transfer time: {time.time() - start_recall_calc:.4f}s")
+                    total_intersect = 0
+                    expected_neighbors_per_query = min(K_final_neighbors, N_data)
+                    if N_queries > 0 and expected_neighbors_per_query > 0:
+                        for i in range(N_queries):
+                            ann_set = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                            true_set = set(idx for idx in true_indices_np[i] if idx >= 0)
+                            total_intersect += len(ann_set.intersection(true_set))
+                        denominator = N_queries * expected_neighbors_per_query
+                        avg_recall = total_intersect / denominator if denominator > 0 else 1.0
+                        print(f"\n[D={Dim}] Average Recall @ {K_final_neighbors}: {avg_recall:.4f} ({avg_recall:.2%})")
+                        if avg_recall >= RECALL_THRESHOLD: print(f"[D={Dim}] Recall meets threshold ({RECALL_THRESHOLD:.2%}). CORRECT.")
+                        else: print(f"[D={Dim}] Recall BELOW threshold ({RECALL_THRESHOLD:.2%}). INCORRECT.")
+                    else: print(f"\n[D={Dim}] Cannot calculate recall.")
+                except Exception as e: print(f"\n[D={Dim}] ERROR during Recall calculation: {e}"); traceback.print_exc()
+            elif ann_indices is None: print(f"\n[D={Dim}] Skipping Recall: ANN failed.")
+            elif true_knn_indices is None: print(f"\n[D={Dim}] Skipping Recall: Brute Force failed.")
+
         finally:
-             # Intermediate cleanup if needed
-             if 'true_knn_dists_sq' in locals(): del true_knn_dists_sq
+            # --- Cleanup for Current Dimension ---
+            print(f"\n[D={Dim}] Cleaning up CuPy arrays...")
+            del A_data_cp
+            del X_queries_cp
+            del ann_indices
+            del ann_dists_sq
+            del true_knn_indices
+            # Conditional delete for variables created inside try blocks
+            if 'ann_indices_np' in locals(): del ann_indices_np
+            if 'true_indices_np' in locals(): del true_indices_np
+            # Force garbage collection and free CuPy memory
+            import gc
+            gc.collect()
+            mempool.free_all_blocks()
+            pinned_mempool.free_all_blocks()
+            print(f"[D={Dim}] Cleanup complete. CuPy Mem Free: {mempool.free_bytes()/(1024**3):.2f} GB")
 
-    # --- Calculate Recall ---
-    if ann_indices is not None and true_knn_indices is not None:
-        print("\n" + "="*50)
-        print(f"Calculating Recall@{K_final_neighbors}...")
-        print("="*50)
+        print(f"\n--- Finished Test for Dimension D = {Dim} ---")
 
-        try:
-            # Comparison can be done on GPU for speed if needed, but CPU is simpler here
-            print("Transferring indices to CPU for comparison...")
-            start_recall_calc = time.time()
-            # Ensure arrays are not None before transfer
-            ann_indices_np = cp.asnumpy(ann_indices) if ann_indices is not None else None
-            true_indices_np = cp.asnumpy(true_knn_indices) if true_knn_indices is not None else None
-            print(f"Transfer time: {time.time() - start_recall_calc:.4f}s")
-
-            if ann_indices_np is None or true_indices_np is None:
-                 raise ValueError("Cannot compare recall, indices arrays are None.")
-
-            total_intersect = 0
-            if N_queries > 0 and K_final_neighbors > 0: # Proceed only if comparison is meaningful
-                for i in range(N_queries):
-                    # Ignore potential -1 placeholders in ANN results if K > num_candidates found
-                    ann_set = set(idx for idx in ann_indices_np[i] if idx >= 0)
-                    # True KNN results might have -1 if K > N_A was handled by padding
-                    true_set = set(idx for idx in true_indices_np[i] if idx >= 0)
-
-                    # Correct handling if true_set is empty (e.g. K>N_A and padding was the only result)
-                    if not true_set:
-                        # If true neighbors set is empty, intersection is 0 unless ann_set is also empty
-                        if not ann_set:
-                             total_intersect += 0 # Or handle differently if empty match matters
-                        else:
-                             total_intersect += 0
-                    else:
-                        total_intersect += len(ann_set.intersection(true_set))
-
-                # Recall = (Total Intersecting Neighbors) / (Total True Neighbors Expected)
-                # Total expected = N_queries * actual number of true neighbors requested (min(K, N_A))
-                expected_neighbors_per_query = min(K_final_neighbors, N_data)
-                if expected_neighbors_per_query == 0:
-                     avg_recall = 1.0 if total_intersect == 0 else 0.0 # Define recall=1 if K=0? Or avoid division.
-                     print("\nRecall @ 0: Undefined or 100% by convention.")
-                else:
-                     denominator = N_queries * expected_neighbors_per_query
-                     avg_recall = total_intersect / denominator if denominator > 0 else 1.0 # Avoid division by zero if N_queries=0
-
-                     print(f"\nAverage Recall @ {K_final_neighbors} (vs {expected_neighbors_per_query} possible): {avg_recall:.4f} ({avg_recall:.2%})")
-
-                     if avg_recall >= RECALL_THRESHOLD:
-                         print(f"Recall meets the threshold ({RECALL_THRESHOLD:.2%}). Result CORRECT.")
-                     else:
-                         print(f"Recall is BELOW the threshold ({RECALL_THRESHOLD:.2%}). Result INCORRECT.")
-                         print("Suggestions to improve recall:")
-                         print(f" - Increase `num_clusters_to_probe` (currently {num_clusters_probe}). More probes = higher chance of finding true neighbors, but slower search.")
-                         print(f" - Increase `num_clusters_kmeans` (currently {num_clusters_kmeans}). Finer clustering might isolate neighbors better.")
-                         print(" - Ensure data preprocessing (e.g., normalization) is appropriate.")
-            else:
-                print("\nCannot calculate recall (N_queries=0 or K_final_neighbors=0).")
-
-        except Exception as e:
-            print(f"\nError during Recall calculation: {e}")
-            import traceback
-            traceback.print_exc()
-
-    elif ann_indices is None:
-         print("\nSkipping Recall calculation because ANN execution failed or produced None.")
-    elif true_knn_indices is None:
-         print("\nSkipping Recall calculation because Brute Force k-NN failed or produced None.")
-
-    print("\n--- Execution Finished ---")
+    print("\n" + "="*60)
+    print("--- ALL CuPy DIMENSION TESTS FINISHED ---")
+    print("="*60)

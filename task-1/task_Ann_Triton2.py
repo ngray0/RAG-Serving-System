@@ -568,104 +568,198 @@ def pytorch_knn_bruteforce(N_A, D, A, X, K, batch_size_q=256):
 # Example Usage & Recall Calculation (UPDATED Main Block)
 # ============================================================================
 
+# ============================================================================
+# Main Execution Block (Triton/PyTorch - Warmup & Dimension Loop)
+# ============================================================================
 if __name__ == "__main__":
-    # --- Parameters (Same as before) ---
-    N_data = 1000000
-    Dim = 128
-    N_queries = 10000
-    K_final_neighbors = 10
-    num_clusters_kmeans = 1000
-    num_clusters_probe = 300 # Increased probe for potentially better recall
-    kmeans_max_iters = 50
+    # --- Fixed Parameters ---
+    N_data = 1000000    # Database size
+    # Dim will be set in the loop # Dim = 128
+    N_queries = 10000      # Queries
+    K_final_neighbors = 10 # Final K for output
+
+    # ANN Parameters
+    num_clusters_kmeans = 1000  # K for KMeans (Step 1)
+    num_clusters_probe = 100    # K1 (nprobe) for cluster probing (Step 2)
+    kmeans_max_iters = 50      # Max iterations for KMeans
+
+    # Recall threshold
     RECALL_THRESHOLD = 0.70
 
-    print("\n" + "="*60)
-    print("--- Triton/PyTorch ANN Example (Optimized KMeans) ---")
-    print("="*60)
-    # --- Data Generation (Same as before) ---
-    print("Generating Test Data (PyTorch)...")
-    print(f"N={N_data}, D={Dim}, Q={N_queries}, K_final={K_final_neighbors}")
-    print(f"ANN Params: num_clusters={num_clusters_kmeans}, nprobe={num_clusters_probe}")
-    print("="*60)
-    A_data = None; X_queries = None
-    try:
-        A_data = torch.randn((N_data, Dim), dtype=torch.float32, device=device)
-        X_queries = torch.randn((N_queries, Dim), dtype=torch.float32, device=device)
-        torch.cuda.synchronize(device=device)
-        print("Data generated successfully on GPU.")
-        print(f"PyTorch Memory Allocated: {torch.cuda.memory_allocated(device) / (1024**3):.2f} GB")
-    except RuntimeError as e: print(f"\nError: OOM during data generation: {e}"); torch.cuda.empty_cache(); exit()
-    except Exception as e: print(f"\nError generating data: {e}"); exit()
+    # Dimensions to test
+    dimensions_to_test = [2, 4, 64, 256, 1024]
 
-    # --- Run ANN (Uses Optimized KMeans Internally) ---
     print("\n" + "="*60)
-    print(f"Testing ANN (Triton/PyTorch IVF-like w/ Optimized KMeans)...")
+    print("--- Triton/PyTorch ANN Full Test ---")
     print("="*60)
-    ann_indices = None; ann_dists_sq = None; build_t = 0; search_t = 0
+    print(f"Fixed Params: N={N_data}, Q={N_queries}, K_final={K_final_neighbors}")
+    print(f"ANN Params: num_clusters={num_clusters_kmeans}, nprobe={num_clusters_probe}")
+    print(f"Testing Dimensions: {dimensions_to_test}")
+
+    # --- Warmup Phase ---
+    print("\n" + "="*60)
+    print("--- Warmup Run (Compiling Kernels...) ---")
+    print("="*60)
     try:
-        # This function now calls our_kmeans_triton_prenorm internally
-        ann_indices, ann_dists_sq, build_t, search_t = ann_user_pseudocode_ivf_like_triton(
-            N_A=N_data, D=Dim, A=A_data, X=X_queries,
-            K_final=K_final_neighbors,
-            num_clusters=num_clusters_kmeans,
-            num_clusters_to_probe=num_clusters_probe,
-            max_kmeans_iters=kmeans_max_iters,
+        WARMUP_N = 10000  # Smaller N for warmup
+        WARMUP_Q = 100   # Smaller Q for warmup
+        WARMUP_DIM = 32  # Representative dimension
+        WARMUP_K_CLUSTERS = 50 # Fewer clusters
+        WARMUP_NPROBE = 5
+        WARMUP_KFINAL = 5
+
+        print(f"Warmup Params: N={WARMUP_N}, D={WARMUP_DIM}, Q={WARMUP_Q}, K={WARMUP_KFINAL}, Clusters={WARMUP_K_CLUSTERS}, NProbe={WARMUP_NPROBE}")
+
+        # Generate small warmup data
+        A_warmup = torch.randn((WARMUP_N, WARMUP_DIM), dtype=torch.float32, device=device)
+        X_warmup = torch.randn((WARMUP_Q, WARMUP_DIM), dtype=torch.float32, device=device)
+        torch.cuda.synchronize(device=device)
+
+        # Run ANN function (which includes KMeans)
+        print("Warmup: Running ANN (includes KMeans)...")
+        _, _, _, _ = ann_user_pseudocode_ivf_like_triton(
+            N_A=WARMUP_N, D=WARMUP_DIM, A=A_warmup, X=X_warmup,
+            K_final=WARMUP_KFINAL,
+            num_clusters=WARMUP_K_CLUSTERS,
+            num_clusters_to_probe=WARMUP_NPROBE,
+            max_kmeans_iters=5, # Fewer iters for warmup
             verbose_kmeans=False
         )
-        print("\nANN Results:")
-        if ann_indices is not None: print(f"  Indices shape: {ann_indices.shape}")
-        if ann_dists_sq is not None: print(f"  Sq Distances shape: {ann_dists_sq.shape}")
-        print(f"  Build Time: {build_t:.4f}s")
-        print(f"  Search Time: {search_t:.4f}s")
-    except RuntimeError as e: print(f"\nError: OOM during ANN execution: {e}"); ann_indices = None; torch.cuda.empty_cache()
-    except Exception as e: print(f"\nError during ANN execution: {e}"); traceback.print_exc(); ann_indices = None
+        print("Warmup: Running Brute Force KNN...")
+        # Run Brute Force function
+        _, _ = pytorch_knn_bruteforce(
+            N_A=WARMUP_N, D=WARMUP_DIM, A=A_warmup, X=X_warmup, K=WARMUP_KFINAL, batch_size_q=64
+        )
+        torch.cuda.synchronize(device=device)
+        print("Warmup complete.")
 
-    # --- Run Brute-Force KNN (Same as before) ---
-    true_knn_indices = None
-    if ann_indices is not None:
-        print("\n" + "="*60)
-        print(f"Calculating Ground Truth (PyTorch/Triton k-NN)...")
-        print("="*60)
+    except Exception as e:
+        print(f"An error occurred during warmup: {e}")
+        print("Continuing without warmup...")
+    finally:
+        # Cleanup warmup data
+        if 'A_warmup' in locals(): del A_warmup
+        if 'X_warmup' in locals(): del X_warmup
+        torch.cuda.empty_cache()
+
+    # --- Main Loop Over Dimensions ---
+    print("\n" + "="*60)
+    print("--- Starting Dimension Tests ---")
+    print("="*60)
+
+    for Dim in dimensions_to_test:
+        print("\n" + "#"*70)
+        print(f"# Testing Dimension D = {Dim}")
+        print("#"*70)
+
+        # --- Per-Dimension Variables ---
+        A_data = None
+        X_queries = None
+        ann_indices = None
+        ann_dists_sq = None
+        true_knn_indices = None
+        build_t = 0
+        search_t = 0
+
         try:
-            true_knn_indices, true_knn_dists_sq = pytorch_knn_bruteforce(
-                N_A=N_data, D=Dim, A=A_data, X=X_queries, K=K_final_neighbors
-            )
-            print("\nGround Truth Results:")
-            if true_knn_indices is not None: print(f"  Indices shape: {true_knn_indices.shape}")
-        except RuntimeError as e: print(f"\nError: OOM during Brute Force k-NN: {e}"); true_knn_indices = None; torch.cuda.empty_cache()
-        except Exception as e: print(f"\nError during Brute Force k-NN execution: {e}"); traceback.print_exc(); true_knn_indices = None
+            # --- Generate Data for Current Dimension ---
+            print(f"\n[D={Dim}] Generating Test Data (PyTorch)...")
+            try:
+                A_data = torch.randn((N_data, Dim), dtype=torch.float32, device=device)
+                X_queries = torch.randn((N_queries, Dim), dtype=torch.float32, device=device)
+                torch.cuda.synchronize(device=device)
+                print(f"[D={Dim}] Data generated. Mem Allocated: {torch.cuda.memory_allocated(device)/(1024**3):.2f} GB")
+            except RuntimeError as e:
+                print(f"\n[D={Dim}] ERROR: OOM during data generation: {e}")
+                torch.cuda.empty_cache();
+                continue # Skip to next dimension
+            except Exception as e:
+                print(f"\n[D={Dim}] ERROR generating data: {e}")
+                continue # Skip to next dimension
+
+            # --- Run ANN for Current Dimension ---
+            print(f"\n[D={Dim}] Testing ANN (Triton/PyTorch IVF-like)...")
+            try:
+                ann_indices, ann_dists_sq, build_t, search_t = ann_user_pseudocode_ivf_like_triton(
+                    N_A=N_data, D=Dim, A=A_data, X=X_queries, # Use current Dim data
+                    K_final=K_final_neighbors,
+                    num_clusters=num_clusters_kmeans,
+                    num_clusters_to_probe=num_clusters_probe,
+                    max_kmeans_iters=kmeans_max_iters,
+                    verbose_kmeans=False
+                )
+                print(f"\n[D={Dim}] ANN Results:")
+                if ann_indices is not None: print(f"  Indices shape: {ann_indices.shape}")
+                if ann_dists_sq is not None: print(f"  Sq Distances shape: {ann_dists_sq.shape}")
+                print(f"  Build Time: {build_t:.4f}s")
+                print(f"  Search Time: {search_t:.4f}s")
+            except RuntimeError as e:
+                print(f"\n[D={Dim}] ERROR: OOM during ANN execution: {e}")
+                ann_indices = None; torch.cuda.empty_cache() # Prevent recall
+            except Exception as e:
+                print(f"\n[D={Dim}] ERROR during ANN execution: {e}")
+                traceback.print_exc(); ann_indices = None # Prevent recall
+
+            # --- Run Brute-Force KNN for Current Dimension ---
+            if ann_indices is not None: # Only run if ANN succeeded
+                print(f"\n[D={Dim}] Calculating Ground Truth (PyTorch/Triton k-NN)...")
+                try:
+                    true_knn_indices, true_knn_dists_sq = pytorch_knn_bruteforce(
+                        N_A=N_data, D=Dim, A=A_data, X=X_queries, K=K_final_neighbors # Use current Dim data
+                    )
+                    print(f"\n[D={Dim}] Ground Truth Results:")
+                    if true_knn_indices is not None: print(f"  Indices shape: {true_knn_indices.shape}")
+                except RuntimeError as e:
+                    print(f"\n[D={Dim}] ERROR: OOM during Brute Force k-NN: {e}")
+                    true_knn_indices = None; torch.cuda.empty_cache() # Prevent recall
+                except Exception as e:
+                    print(f"\n[D={Dim}] ERROR during Brute Force k-NN execution: {e}")
+                    traceback.print_exc(); true_knn_indices = None # Prevent recall
+                finally:
+                     if 'true_knn_dists_sq' in locals(): del true_knn_dists_sq
+
+            # --- Calculate Recall for Current Dimension ---
+            if ann_indices is not None and true_knn_indices is not None:
+                print(f"\n[D={Dim}] Calculating Recall@{K_final_neighbors}...")
+                try:
+                    # print(f"[D={Dim}] Transferring indices to CPU...")
+                    start_recall_calc = time.time()
+                    ann_indices_np = ann_indices.cpu().numpy()
+                    true_indices_np = true_knn_indices.cpu().numpy()
+                    # print(f" Transfer time: {time.time() - start_recall_calc:.4f}s")
+                    total_intersect = 0
+                    expected_neighbors_per_query = min(K_final_neighbors, N_data)
+                    if N_queries > 0 and expected_neighbors_per_query > 0:
+                        for i in range(N_queries):
+                            ann_set = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                            true_set = set(idx for idx in true_indices_np[i] if idx >= 0)
+                            total_intersect += len(ann_set.intersection(true_set))
+                        denominator = N_queries * expected_neighbors_per_query
+                        avg_recall = total_intersect / denominator if denominator > 0 else 1.0
+                        print(f"\n[D={Dim}] Average Recall @ {K_final_neighbors}: {avg_recall:.4f} ({avg_recall:.2%})")
+                        if avg_recall >= RECALL_THRESHOLD: print(f"[D={Dim}] Recall meets threshold ({RECALL_THRESHOLD:.2%}). CORRECT.")
+                        else: print(f"[D={Dim}] Recall BELOW threshold ({RECALL_THRESHOLD:.2%}). INCORRECT.")
+                    else: print(f"\n[D={Dim}] Cannot calculate recall.")
+                except Exception as e: print(f"\n[D={Dim}] ERROR during Recall calculation: {e}"); traceback.print_exc()
+            elif ann_indices is None: print(f"\n[D={Dim}] Skipping Recall: ANN failed.")
+            elif true_knn_indices is None: print(f"\n[D={Dim}] Skipping Recall: Brute Force failed.")
+
         finally:
-             if 'true_knn_dists_sq' in locals(): del true_knn_dists_sq
+            # --- Cleanup for Current Dimension ---
+            print(f"\n[D={Dim}] Cleaning up tensors...")
+            del A_data
+            del X_queries
+            del ann_indices
+            del ann_dists_sq
+            del true_knn_indices
+            # Conditional delete for variables created inside try blocks
+            if 'ann_indices_np' in locals(): del ann_indices_np
+            if 'true_indices_np' in locals(): del true_indices_np
+            torch.cuda.empty_cache()
+            print(f"[D={Dim}] Cleanup complete. Mem Allocated: {torch.cuda.memory_allocated(device)/(1024**3):.2f} GB")
 
-    # --- Calculate Recall (Same as before) ---
-    if ann_indices is not None and true_knn_indices is not None:
-        print("\n" + "="*60)
-        print(f"Calculating Recall@{K_final_neighbors}...")
-        print("="*60)
-        try:
-            print("Transferring indices to CPU for comparison...")
-            start_recall_calc = time.time()
-            ann_indices_np = ann_indices.cpu().numpy()
-            true_indices_np = true_knn_indices.cpu().numpy()
-            print(f"Transfer time: {time.time() - start_recall_calc:.4f}s")
-            total_intersect = 0
-            expected_neighbors_per_query = min(K_final_neighbors, N_data)
-            if N_queries > 0 and expected_neighbors_per_query > 0:
-                for i in range(N_queries):
-                    ann_set = set(idx for idx in ann_indices_np[i] if idx >= 0)
-                    true_set = set(idx for idx in true_indices_np[i] if idx >= 0)
-                    total_intersect += len(ann_set.intersection(true_set))
-                denominator = N_queries * expected_neighbors_per_query
-                avg_recall = total_intersect / denominator if denominator > 0 else 1.0
-                print(f"\nAverage Recall @ {K_final_neighbors} (vs {expected_neighbors_per_query} possible): {avg_recall:.4f} ({avg_recall:.2%})")
-                if avg_recall >= RECALL_THRESHOLD: print(f"Recall meets the threshold ({RECALL_THRESHOLD:.2%}). Result CORRECT.")
-                else: print(f"Recall is BELOW the threshold ({RECALL_THRESHOLD:.2%}). Result INCORRECT."); print("Suggestions: Increase nprobe, increase num_clusters, check normalization.")
-            else: print("\nCannot calculate recall (N_queries=0 or K_final=0 or N_A=0).")
-        except Exception as e: print(f"\nError during Recall calculation: {e}"); traceback.print_exc()
-    elif ann_indices is None: print("\nSkipping Recall: ANN execution failed or produced None.")
-    elif true_knn_indices is None: print("\nSkipping Recall: Brute Force k-NN failed or produced None.")
+        print(f"\n--- Finished Test for Dimension D = {Dim} ---")
 
-    print("\n--- Triton/PyTorch Execution Finished ---")
-    print("Cleaning up GPU memory...")
-    del A_data; del X_queries; del ann_indices; del ann_dists_sq; del true_knn_indices
-    torch.cuda.empty_cache(); print("PyTorch CUDA cache cleared.")
+    print("\n" + "="*60)
+    print("--- ALL DIMENSION TESTS FINISHED ---")
+    print("="*60)

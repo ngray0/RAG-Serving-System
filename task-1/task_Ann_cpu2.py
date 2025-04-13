@@ -633,156 +633,150 @@ def numpy_knn_bruteforce(N_A, D, A_np, X_np, K, batch_size_q=1024): # Add batch_
 # Main Execution Block (CPU ONLY - IVF-like ANN + Recall vs True k-NN)
 # ============================================================================
 if __name__ == "__main__":
-
-    # Assume necessary imports (numpy as np, time, traceback) and function definitions
-    # (pairwise_l2_squared_numpy, our_kmeans_cpu, ann_ivf_like_cpu, numpy_knn_bruteforce)
-    # are present above this block.
-
-    # --- Parameters ---
-    N_data = 1000000       # Smaller N for faster CPU testing
-    Dim = 64              # Smaller Dim for faster CPU testing
-    N_queries = 10000       # Fewer queries for faster CPU testing
-    K_final_neighbors = 10  # Final number of neighbors to find
+    # --- Fixed Parameters ---
+    # Reduced N/Q for potentially faster CPU runs across multiple dimensions
+    # Adjust these based on your CPU/RAM capabilities
+    N_data = 1000000
+    N_queries = 10000
+    K_final_neighbors = 10 # Final K for output
 
     # ANN Parameters
-    num_clusters_kmeans = 500  # K for KMeans
-    num_clusters_probe = 300    # K1 (nprobe)
-    kmeans_max_iters = 50      # Max iterations for KMeans
+    num_clusters_kmeans = 1000   # K for KMeans (Step 1)
+    num_clusters_probe = 100     # K1 (nprobe) for cluster probing (Step 2)
+    kmeans_max_iters = 50       # Max iterations for KMeans
 
     # Recall threshold
     RECALL_THRESHOLD = 0.70
 
+    # Dimensions to test
+    dimensions_to_test = [2, 4, 64, 256, 1024]
+
     print("\n" + "="*60)
-    print("--- NumPy CPU ANN Example with Recall vs True k-NN ---")
+    print("--- NumPy CPU ANN Dimension Test ---")
     print("="*60)
-    print("Generating Test Data (NumPy CPU)...")
-    print(f"N={N_data}, D={Dim}, Q={N_queries}, K_final={K_final_neighbors}")
+    print(f"Fixed Params: N={N_data}, Q={N_queries}, K_final={K_final_neighbors}")
     print(f"ANN Params: num_clusters={num_clusters_kmeans}, nprobe={num_clusters_probe}")
-    print("="*60)
-    A_data_np = None # Define outside try
-    X_queries_np = None
-    try:
-        # Generate data directly on CPU
-        A_data_np = np.random.randn(N_data, Dim).astype(np.float32)
-        X_queries_np = np.random.randn(N_queries, Dim).astype(np.float32)
-        print("Data generated successfully on CPU.")
-        mem_gb_a = A_data_np.nbytes / (1024**3)
-        mem_gb_x = X_queries_np.nbytes / (1024**3)
-        print(f"Approx memory: A={mem_gb_a:.3f} GB, X={mem_gb_x:.3f} GB")
+    print(f"Testing Dimensions: {dimensions_to_test}")
+    # --- NO WARMUP PHASE as requested ---
 
-    except MemoryError as e:
-        print(f"\nMemoryError during data generation: {e}")
-        print("Try reducing N_data or Dim.")
-        exit()
-    except Exception as e:
-        print(f"\nError generating data: {e}")
-        exit()
-
-    # --- Run ANN (CPU IVF-like) ---
+    # --- Main Loop Over Dimensions ---
     print("\n" + "="*60)
-    print(f"Testing ANN (NumPy CPU IVF-like)...")
+    print("--- Starting Dimension Tests ---")
     print("="*60)
-    ann_indices_np = None # Define outside try
-    ann_dists_sq_np = None
-    build_t = 0
-    search_t = 0
-    try:
-        # Call the new CPU IVF-like function
-        ann_indices_np, ann_dists_sq_np, build_t, search_t = ann_ivf_like_cpu(
-            N_A=N_data, D=Dim, A_np=A_data_np, X_np=X_queries_np,
-            K_final=K_final_neighbors,
-            num_clusters=num_clusters_kmeans,
-            num_clusters_to_probe=num_clusters_probe,
-            max_kmeans_iters=kmeans_max_iters
-        )
-        print("\nANN Results:")
-        if ann_indices_np is not None: print(f"  Indices shape: {ann_indices_np.shape}")
-        if ann_dists_sq_np is not None: print(f"  Sq Distances shape: {ann_dists_sq_np.shape}")
-        print(f"  Build Time: {build_t:.4f}s")
-        print(f"  Search Time: {search_t:.4f}s")
 
-    except MemoryError as e:
-        print(f"\nMemoryError during CPU ANN execution: {e}")
-        ann_indices_np = None # Prevent recall
-    except Exception as e:
-        print(f"\nError during CPU ANN execution: {e}")
-        traceback.print_exc()
-        ann_indices_np = None # Prevent recall
+    for Dim in dimensions_to_test:
+        print("\n" + "#"*70)
+        print(f"# Testing Dimension D = {Dim}")
+        print("#"*70)
 
-    # --- Run Brute-Force KNN (CPU, Batched) for Ground Truth ---
-    true_knn_indices_np = None # Define outside try
-    if ann_indices_np is not None: # Only run if ANN succeeded
-        print("\n" + "="*60)
-        print(f"Calculating Ground Truth (NumPy CPU k-NN)...")
-        print("="*60)
+        # --- Per-Dimension Variables ---
+        A_data_np = None
+        X_queries_np = None
+        ann_indices_np = None
+        ann_dists_sq_np = None
+        true_knn_indices_np = None
+        build_t = 0
+        search_t = 0
+
         try:
-            # Call the batched CPU brute-force function
-            true_knn_indices_np, true_knn_dists_sq_np = numpy_knn_bruteforce(
-                N_A=N_data, D=Dim, A_np=A_data_np, X_np=X_queries_np, K=K_final_neighbors, batch_size_q=1024 # Adjust batch size if needed
-            )
-            print("\nGround Truth Results:")
-            if true_knn_indices_np is not None: print(f"  Indices shape: {true_knn_indices_np.shape}")
-            # if true_knn_dists_sq_np is not None: print(f"  Sq Distances shape: {true_knn_dists_sq_np.shape}")
+            # --- Generate Data for Current Dimension ---
+            print(f"\n[D={Dim}] Generating Test Data (NumPy CPU)...")
+            try:
+                A_data_np = np.random.randn(N_data, Dim).astype(np.float32)
+                X_queries_np = np.random.randn(N_queries, Dim).astype(np.float32)
+                print(f"[D={Dim}] Data generated.")
+                mem_gb_a = A_data_np.nbytes / (1024**3)
+                mem_gb_x = X_queries_np.nbytes / (1024**3)
+                print(f"[D={Dim}] Approx memory: A={mem_gb_a:.3f} GB, X={mem_gb_x:.3f} GB")
+            except MemoryError as e:
+                print(f"\n[D={Dim}] ERROR: MemoryError during data generation: {e}")
+                print("Skipping this dimension.")
+                continue # Skip to next dimension
+            except Exception as e:
+                print(f"\n[D={Dim}] ERROR generating data: {e}")
+                continue # Skip to next dimension
 
-        except MemoryError as e:
-            print(f"\nMemoryError during CPU Brute Force k-NN: {e}")
-            true_knn_indices_np = None # Prevent recall
-        except Exception as e:
-            print(f"\nError during CPU Brute Force k-NN execution: {e}")
-            traceback.print_exc()
-            true_knn_indices_np = None # Prevent recall
+            # --- Run ANN for Current Dimension ---
+            print(f"\n[D={Dim}] Testing ANN (NumPy CPU IVF-like)...")
+            try:
+                # Call the CPU IVF-like function
+                ann_indices_np, ann_dists_sq_np, build_t, search_t = ann_ivf_like_cpu(
+                    N_A=N_data, D=Dim, A_np=A_data_np, X_np=X_queries_np, # Use current Dim data
+                    K_final=K_final_neighbors,
+                    num_clusters=num_clusters_kmeans,
+                    num_clusters_to_probe=num_clusters_probe,
+                    max_kmeans_iters=kmeans_max_iters
+                )
+                print(f"\n[D={Dim}] ANN Results:")
+                if ann_indices_np is not None: print(f"  Indices shape: {ann_indices_np.shape}")
+                if ann_dists_sq_np is not None: print(f"  Sq Distances shape: {ann_dists_sq_np.shape}")
+                print(f"  Build Time: {build_t:.4f}s")
+                print(f"  Search Time: {search_t:.4f}s")
+                if search_t > 0: print(f"  -> Throughput: {N_queries / search_t:.2f} queries/sec")
+
+            except MemoryError as e:
+                print(f"\n[D={Dim}] ERROR: MemoryError during CPU ANN execution: {e}")
+                ann_indices_np = None # Prevent recall
+            except Exception as e:
+                print(f"\n[D={Dim}] ERROR during CPU ANN execution: {e}")
+                traceback.print_exc(); ann_indices_np = None # Prevent recall
+
+            # --- Run Brute-Force KNN for Current Dimension ---
+            if ann_indices_np is not None: # Only run if ANN succeeded
+                print(f"\n[D={Dim}] Calculating Ground Truth (NumPy CPU k-NN)...")
+                try:
+                    # Call the batched CPU brute-force function
+                    true_knn_indices_np, true_knn_dists_sq_np = numpy_knn_bruteforce(
+                        N_A=N_data, D=Dim, A_np=A_data_np, X_np=X_queries_np, K=K_final_neighbors, batch_size_q=1024 # Adjust batch size if needed
+                    )
+                    print(f"\n[D={Dim}] Ground Truth Results:")
+                    if true_knn_indices_np is not None: print(f"  Indices shape: {true_knn_indices_np.shape}")
+                except MemoryError as e:
+                    print(f"\n[D={Dim}] ERROR: MemoryError during CPU Brute Force k-NN: {e}")
+                    true_knn_indices_np = None # Prevent recall
+                except Exception as e:
+                    print(f"\n[D={Dim}] ERROR during CPU Brute Force k-NN execution: {e}")
+                    traceback.print_exc(); true_knn_indices_np = None # Prevent recall
+                finally:
+                     if 'true_knn_dists_sq_np' in locals(): del true_knn_dists_sq_np
+
+            # --- Calculate Recall for Current Dimension ---
+            if ann_indices_np is not None and true_knn_indices_np is not None:
+                print(f"\n[D={Dim}] Calculating Recall@{K_final_neighbors}...")
+                try:
+                    total_intersect = 0
+                    expected_neighbors_per_query = min(K_final_neighbors, N_data)
+
+                    if N_queries > 0 and expected_neighbors_per_query > 0:
+                        for i in range(N_queries):
+                            ann_set = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                            true_set = set(idx for idx in true_knn_indices_np[i] if idx >= 0)
+                            total_intersect += len(ann_set.intersection(true_set))
+
+                        denominator = N_queries * expected_neighbors_per_query
+                        avg_recall = total_intersect / denominator if denominator > 0 else 1.0
+
+                        print(f"\n[D={Dim}] Average Recall @ {K_final_neighbors}: {avg_recall:.4f} ({avg_recall:.2%})")
+                        if avg_recall >= RECALL_THRESHOLD: print(f"[D={Dim}] Recall meets threshold ({RECALL_THRESHOLD:.2%}). CORRECT.")
+                        else: print(f"[D={Dim}] Recall BELOW threshold ({RECALL_THRESHOLD:.2%}). INCORRECT.")
+                    else: print(f"\n[D={Dim}] Cannot calculate recall.")
+                except Exception as e: print(f"\n[D={Dim}] ERROR during Recall calculation: {e}"); traceback.print_exc()
+            elif ann_indices_np is None: print(f"\n[D={Dim}] Skipping Recall: ANN failed.")
+            elif true_knn_indices_np is None: print(f"\n[D={Dim}] Skipping Recall: Brute Force failed.")
+
         finally:
-             if 'true_knn_dists_sq_np' in locals(): del true_knn_dists_sq_np # Clear dists
+            # --- Cleanup for Current Dimension ---
+            print(f"\n[D={Dim}] Cleaning up NumPy arrays...")
+            del A_data_np
+            del X_queries_np
+            if 'ann_indices_np' in locals(): del ann_indices_np
+            if 'ann_dists_sq_np' in locals(): del ann_dists_sq_np
+            if 'true_knn_indices_np' in locals(): del true_knn_indices_np
+            gc.collect() # Suggest garbage collection
+            print(f"[D={Dim}] Cleanup complete.")
 
-    # --- Calculate Recall ---
-    if ann_indices_np is not None and true_knn_indices_np is not None:
-        print("\n" + "="*60)
-        print(f"Calculating Recall@{K_final_neighbors}...")
-        print("="*60)
+        print(f"\n--- Finished Test for Dimension D = {Dim} ---")
 
-        try:
-            total_intersect = 0
-            # Calculate expected neighbors, accounting for N_A
-            expected_neighbors_per_query = min(K_final_neighbors, N_data)
-
-            if N_queries > 0 and expected_neighbors_per_query > 0:
-                for i in range(N_queries):
-                    # Filter out potential -1 padding
-                    ann_set = set(idx for idx in ann_indices_np[i] if idx >= 0)
-                    true_set = set(idx for idx in true_knn_indices_np[i] if idx >= 0)
-                    total_intersect += len(ann_set.intersection(true_set))
-
-                denominator = N_queries * expected_neighbors_per_query
-                avg_recall = total_intersect / denominator if denominator > 0 else 1.0
-
-                print(f"\nAverage Recall @ {K_final_neighbors} (vs {expected_neighbors_per_query} possible): {avg_recall:.4f} ({avg_recall:.2%})")
-
-                if avg_recall >= RECALL_THRESHOLD:
-                    print(f"Recall meets the threshold ({RECALL_THRESHOLD:.2%}). Result CORRECT.")
-                else:
-                    print(f"Recall is BELOW the threshold ({RECALL_THRESHOLD:.2%}). Result INCORRECT.")
-                    # Suggestions specific to IVF-like ANN
-                    print("Suggestions to improve recall:")
-                    print(f" - Increase `num_clusters_to_probe` (currently {num_clusters_probe}).")
-                    print(f" - Increase `num_clusters_kmeans` (currently {num_clusters_kmeans}).")
-            else:
-                print("\nCannot calculate recall (N_queries=0 or K_final=0 or N_A=0).")
-
-        except Exception as e:
-            print(f"\nError during Recall calculation: {e}")
-            traceback.print_exc()
-
-    elif ann_indices_np is None:
-         print("\nSkipping Recall: ANN execution failed or produced None.")
-    elif true_knn_indices_np is None:
-         print("\nSkipping Recall: CPU Brute Force k-NN failed or produced None.")
-
-    print("\n--- CPU Execution Finished ---")
-
-    # Clean up large arrays
-    del A_data_np
-    del X_queries_np
-    if 'ann_indices_np' in locals(): del ann_indices_np
-    if 'ann_dists_sq_np' in locals(): del ann_dists_sq_np
-    if 'true_knn_indices_np' in locals(): del true_knn_indices_np
-    print("Cleaned up NumPy arrays.")
+    print("\n" + "="*60)
+    print("--- ALL CPU DIMENSION TESTS FINISHED ---")
+    print("="*60)
