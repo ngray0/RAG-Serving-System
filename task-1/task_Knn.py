@@ -400,21 +400,49 @@ def distance_dot3(X, Y):
     return X_cp @ Y_cp.T
 
 def pairwise_l2_squared_cupy(X_cp, C_cp):
-    """ Computes pairwise SQUARED L2 distances using CuPy. """
+    """
+    Computes pairwise **squared** L2 distances using CuPy.
+    X_cp: (N, D) data points OR (Q, D) query points
+    C_cp: (K, D) centroids OR (N, D) database points
+    Returns: (N|Q, K|N) tensor of SQUARED distances.
+    """
+    # Ensure inputs are CuPy arrays and float32
     if not isinstance(X_cp, cp.ndarray): X_cp = cp.asarray(X_cp, dtype=cp.float32)
     elif X_cp.dtype != cp.float32: X_cp = X_cp.astype(cp.float32)
     if not isinstance(C_cp, cp.ndarray): C_cp = cp.asarray(C_cp, dtype=cp.float32)
     elif C_cp.dtype != cp.float32: C_cp = C_cp.astype(cp.float32)
-    if X_cp.ndim == 1: X_cp = X_cp[None, :]
-    if C_cp.ndim == 1: C_cp = C_cp[None, :]
-    if X_cp.shape[1] != C_cp.shape[1]: raise ValueError("Dimension mismatch")
 
-    X_norm_sq = cp.einsum('ij,ij->i', X_cp, X_cp)[:, cp.newaxis]
-    C_norm_sq = cp.einsum('ij,ij->i', C_cp, C_cp)[cp.newaxis, :]
-    # Use matmul for dot product: (Q, D) @ (D, N) -> (Q, N)
-    dot_products = cp.matmul(X_cp, C_cp.T)
-    dist_sq = X_norm_sq - 2 * dot_products + C_norm_sq
-    return cp.maximum(0.0, dist_sq)
+    if X_cp.ndim == 1: X_cp = X_cp[cp.newaxis, :] # Ensure X is 2D
+    if C_cp.ndim == 1: C_cp = C_cp[cp.newaxis, :] # Ensure C is 2D
+
+    # Handle empty inputs gracefully
+    if X_cp.shape[0] == 0 or C_cp.shape[0] == 0:
+        return cp.empty((X_cp.shape[0], C_cp.shape[0]), dtype=cp.float32)
+
+    # Check dimension compatibility AFTER ensuring 2D and non-empty
+    if X_cp.shape[1] != C_cp.shape[1]:
+        raise ValueError(f"Dimension mismatch: X_cp has D={X_cp.shape[1]}, C_cp has D={C_cp.shape[1]}")
+
+    # ||x - c||^2 = ||x||^2 - 2<x, c> + ||c||^2 (optimized calculation)
+    try:
+        X_norm_sq = cp.einsum('ij,ij->i', X_cp, X_cp)[:, cp.newaxis] # Shape (N|Q, 1)
+        C_norm_sq = cp.einsum('ij,ij->i', C_cp, C_cp)[cp.newaxis, :] # Shape (1, K|N)
+        # Use gemm for dot product (generally fastest) via matmul
+        dot_products = cp.matmul(X_cp, C_cp.T) # Shape (N|Q, K|N)
+
+        # Broadcasting: (N|Q, 1) - 2*(N|Q, K|N) + (1, K|N) -> (N|Q, K|N)
+        dist_sq = X_norm_sq - 2 * dot_products + C_norm_sq
+        return cp.maximum(0.0, dist_sq) # Clamp numerical negatives
+
+    except cp.cuda.memory.OutOfMemoryError as e:
+        print(f"OOM Error in pairwise_l2_squared_cupy: Shapes X={X_cp.shape}, C={C_cp.shape}")
+        # Estimate memory needed for intermediate products if helpful
+        dot_prod_mem = X_cp.shape[0] * C_cp.shape[0] * 4 / (1024**3) # GB
+        print(f"Estimated memory for dot product matrix: {dot_prod_mem:.2f} GB")
+        raise e # Re-raise the exception
+    except Exception as e:
+        print(f"Error in pairwise_l2_squared_cupy: {e}")
+        raise e
 
 def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
     """ Calculates pairwise dot products between rows of X and rows of Y using CuPy matmul. """
@@ -1107,112 +1135,143 @@ def our_knn_stream2(N, D, A, X, K):
     return results if B > 1 else results[0]
 
 
-def our_knn_stream(N, D, A, X, K):
+def our_knn_stream(N_A, D, A_cp, X_cp, K, batch_size_q=256): # Add batch_size_q parameter
     """
-    Performs KNN search using CuPy CUDA Streams.
-    Each stream processes one query, calculating all distances to the database A
-    at once and then finding the top K.
-
-    Args:
-        N (int): Number of database points (A.shape[0]).
-        D (int): Dimensionality (A.shape[1]).
-        A (cp.ndarray): Database vectors (N, D) on GPU, float32.
-        X (cp.ndarray): Query vectors (Q, D) or (D,) on GPU, float32.
-        K (int): Number of neighbors to find.
-
-    Returns:
-        list[cp.ndarray] or cp.ndarray:
-            List containing the indices (int64) of the K nearest neighbors
-            for each query, or a single array if Q=1. Each array shape is (K,).
-            Returns indices sorted by distance (ascending for L2/Cosine/Manhattan).
+    Finds the K nearest neighbors using brute-force pairwise SQUARED L2 distance (CuPy).
+    Uses query batching to handle large Q * N distance matrices.
+    Returns original indices (int64) and SQUARED L2 distances (float32).
+    Handles K > N_A by padding results.
     """
-    # --- Input Validation & Preparation ---
-    if not isinstance(A, cp.ndarray): A = cp.asarray(A, dtype=cp.float32)
-    elif A.dtype != cp.float32: A = A.astype(cp.float32)
-    if not isinstance(X, cp.ndarray): X = cp.asarray(X, dtype=cp.float32)
-    elif X.dtype != cp.float32: X = X.astype(cp.float32)
+    if not cupy_device_ok: raise RuntimeError("CuPy device not available.")
+    # --- Input Validation ---
+    if not isinstance(A_cp, cp.ndarray): A_cp = cp.asarray(A_cp, dtype=cp.float32)
+    elif A_cp.dtype != cp.float32: A_cp = A_cp.astype(cp.float32)
+    if not isinstance(X_cp, cp.ndarray): X_cp = cp.asarray(X_cp, dtype=cp.float32)
+    elif X_cp.dtype != cp.float32: X_cp = X_cp.astype(cp.float32)
 
-    if A.shape[0] != N or A.shape[1] != D:
-        print(f"Warning: Database A shape {A.shape} does not match N={N}, D={D}. Using A.shape.")
-        N, D = A.shape
-    if X.ndim == 0 or X.shape[-1] != D:
-        raise ValueError(f"Query X feature dimension {X.shape[-1]} does not match D={D}")
+    if A_cp.ndim != 2: raise ValueError(f"Database A_cp must be 2D (N, D), got shape {A_cp.shape}")
+    if X_cp.ndim != 2: raise ValueError(f"Queries X_cp must be 2D (Q, D), got shape {X_cp.shape}")
 
-    Q = X.shape[0] if X.ndim == 2 else 1
-    if Q == 0: return []
+    actual_N_A, actual_D = A_cp.shape
+    Q, query_D = X_cp.shape
 
-    print(f"Running Optimized KNN Stream: Q={Q}, N={N}, D={D}, K={K} (Using L2 distance)") # Specify distance
+    if query_D != actual_D: raise ValueError(f"Dimension mismatch: A_cp D={actual_D}, X_cp D={query_D}")
 
-    streams = [cp.cuda.Stream() for _ in range(Q)]
-    results_indices = [None] * Q  # To store final indices
-    results_distances = [None] * Q # Optionally store distances too
+    # Use actual N_A
+    N_A = actual_N_A
 
-    actual_k = min(K, N)
-    if actual_k <= 0:
-        empty_result = cp.array([], dtype=cp.int64)
-        return [empty_result] * Q if Q > 1 else empty_result
+    # Handle empty database or query set
+    if N_A == 0:
+         print("Warning: Brute force called with empty database A_cp.")
+         return cp.full((Q, K), -1, dtype=cp.int64), cp.full((Q, K), cp.inf, dtype=cp.float32)
+    if Q == 0:
+         print("Warning: Brute force called with empty query set X_cp.")
+         return cp.empty((0, K), dtype=cp.int64), cp.empty((0, K), dtype=cp.float32)
 
-    # --- Process each query in its own stream ---
-    for i in range(Q):
-        with streams[i]:
-            # Get query, ensure it's 2D (1, D) for pairwise distance functions
-            query = X[i] if X.ndim == 2 else X
-            query_2d = query.reshape(1, D)
+    if not K > 0: raise ValueError("K must be positive")
 
-            # 1. Calculate ALL distances for this query against the entire database A
-            #    Assuming distance_l22 returns SQUARED L2 distances
-            #    Output shape: (1, N) -> Squeeze to (N,)
-            try:
-                # Using distance_l22 as the original code did for the tile
-                all_dists_sq = distance_l22(query_2d, A)[0] # Shape (N,)
-            except Exception as e:
-                 print(f"Error calculating distances in stream {i}: {e}")
-                 # Handle error appropriately, maybe store None or raise
-                 all_dists_sq = None # Mark as failed
+    # Adjust K if it's larger than the number of data points
+    effective_K = min(K, N_A)
+    if effective_K != K:
+         print(f"Note: Brute force K={K} requested > N_A={N_A}. Using K={effective_K}.")
 
-            if all_dists_sq is not None and all_dists_sq.size == N: # Check if distance calc succeeded
-                # 2. Find the indices of the K smallest distances
-                if actual_k == N:
-                    # If K >= N, we need all indices, just sort them
-                    k_indices_unsorted = cp.arange(N, dtype=cp.int64)
-                elif actual_k > 0 :
-                    # Use argpartition for efficiency when K < N
-                    # kth is 0-based, so find up to index K-1
-                    kth = actual_k - 1
-                    k_indices_unsorted = cp.argpartition(all_dists_sq, kth=kth)[:actual_k]
-                else: # actual_k is 0
-                    k_indices_unsorted = cp.array([], dtype=cp.int64)
+    if effective_K == 0: # Handle K=0 or effective_K=0 case
+         return cp.empty((Q, 0), dtype=cp.int64), cp.empty((Q, 0), dtype=cp.float32)
+
+    print(f"Running k-NN Brute Force (CuPy, Batched): Q={Q}, N={N_A}, D={actual_D}, K={effective_K}, BatchSize={batch_size_q}")
+    start_time = time.time()
+
+    # Pre-allocate result arrays
+    all_topk_indices_cp = cp.full((Q, effective_K), -1, dtype=cp.int64)
+    all_topk_distances_sq_cp = cp.full((Q, effective_K), cp.inf, dtype=cp.float32)
+
+    # --- Batch Processing Loop ---
+    for q_start in range(0, Q, batch_size_q):
+        q_end = min(q_start + batch_size_q, Q)
+        batch_q_indices = slice(q_start, q_end) # Slice for indexing results
+        X_batch_cp = X_cp[batch_q_indices]     # Current batch of queries
+        current_batch_size = X_batch_cp.shape[0]
+        if current_batch_size == 0: continue
+
+        # print(f"  Processing query batch {q_start}-{q_end-1}...") # Optional progress
+
+        # Calculate SQUARED L2 distances for the current batch
+        try:
+            batch_distances_sq = pairwise_l2_squared_cupy(X_batch_cp, A_cp) # Shape (current_batch_size, N_A)
+        except cp.cuda.memory.OutOfMemoryError as e:
+            batch_mem_gb = current_batch_size * N_A * 4 / (1024**3)
+            print(f"OOM Error during Brute Force batch distance calculation:")
+            print(f"  Batch Q={current_batch_size}, N={N_A}. Estimated matrix memory: {batch_mem_gb:.2f} GB")
+            print(f"  Try reducing batch_size_q (current={batch_size_q}).")
+            raise e # Re-raise
+        except Exception as e:
+            print(f"Error during Brute Force batch distance calculation: {e}")
+            raise e
 
 
-                # 3. Sort the results *within* the top K found by argpartition
-                if k_indices_unsorted.size > 0:
-                    # Get the distances corresponding to the unsorted top-K indices
-                    topk_dists_unsorted = all_dists_sq[k_indices_unsorted]
-                    # Find the sort order based on these distances
-                    sort_order_in_k = cp.argsort(topk_dists_unsorted)
-                    # Apply the sort order to the indices and distances
-                    final_indices = k_indices_unsorted[sort_order_in_k]
-                    final_distances = topk_dists_unsorted[sort_order_in_k] # Store sorted distances
-                else:
-                    final_indices = cp.array([], dtype=cp.int64)
-                    final_distances = cp.array([], dtype=cp.float32)
+        # Find top K for the current batch
+        # Need k < N for argpartition
+        k_partition = min(effective_K, N_A - 1) if N_A > 0 else 0
+        if k_partition < 0: k_partition = 0
 
-                results_indices[i] = final_indices.astype(cp.int64) # Ensure int64
-                results_distances[i] = final_distances # Store the distances
+        batch_topk_indices = None
+        batch_topk_distances_sq = None
+
+        try:
+            if effective_K >= N_A: # If K includes all points, just sort all
+                batch_topk_indices = cp.argsort(batch_distances_sq, axis=1)[:, :effective_K]
             else:
-                # Handle distance calculation failure for this query
-                 results_indices[i] = cp.array([-1]*actual_k, dtype=cp.int64) # Or some other indicator
-                 results_distances[i] = cp.array([cp.inf]*actual_k, dtype=cp.float32)
+                 # Ensure N_A > 0 before calling argpartition
+                 if N_A > 0:
+                      topk_indices_unstructured = cp.argpartition(batch_distances_sq, k_partition, axis=1)[:, :effective_K]
+                      topk_distances_sq_unstructured = cp.take_along_axis(batch_distances_sq, topk_indices_unstructured, axis=1)
+                      sorted_order_in_k = cp.argsort(topk_distances_sq_unstructured, axis=1)
+                      batch_topk_indices = cp.take_along_axis(topk_indices_unstructured, sorted_order_in_k, axis=1)
+                 else: # Should not happen if N_A=0 check passed
+                      batch_topk_indices = cp.empty((current_batch_size, 0), dtype=cp.int64)
+
+            # Retrieve the final sorted distances
+            if batch_topk_indices is not None and batch_topk_indices.size > 0:
+                 batch_topk_distances_sq = cp.take_along_axis(batch_distances_sq, batch_topk_indices, axis=1)
+            elif effective_K == 0:
+                 batch_topk_distances_sq = cp.empty((current_batch_size, 0), dtype=cp.float32)
+            else: # Handle unexpected empty indices
+                 print(f"Warning: batch_topk_indices empty/None in batch {q_start}-{q_end-1}")
+                 batch_topk_distances_sq = cp.full((current_batch_size, effective_K), cp.inf, dtype=cp.float32)
+                 if batch_topk_indices is None: batch_topk_indices = cp.full((current_batch_size, effective_K), -1, dtype=cp.int64)
+
+            # Store batch results in the main arrays
+            all_topk_indices_cp[batch_q_indices] = batch_topk_indices
+            all_topk_distances_sq_cp[batch_q_indices] = batch_topk_distances_sq
+
+            # Optional: Clear intermediate batch results to free memory sooner
+            del batch_distances_sq, batch_topk_indices, batch_topk_distances_sq
+            if 'topk_indices_unstructured' in locals(): del topk_indices_unstructured
+            if 'topk_distances_sq_unstructured' in locals(): del topk_distances_sq_unstructured
+            if 'sorted_order_in_k' in locals(): del sorted_order_in_k
+            # cp.get_default_memory_pool().free_all_blocks() # Use cautiously, can impact performance
 
 
-    # --- Wait for all streams to complete ---
-    for s in streams:
-        s.synchronize()
+        except Exception as e:
+            print(f"Error during Brute Force batch top-K ({q_start}-{q_end-1}): {e}")
+            # Decide how to handle: continue with potentially missing batch results or raise error?
+            # For recall, probably better to raise the error
+            raise e
+    # --- End Batch Loop ---
 
-    # --- Return results ---
-    # Decide if you need indices, distances, or both
-    # Returning only indices for compatibility with original function signature
-    return results_indices if Q > 1 else results_indices[0]
+    cp.cuda.Stream.null.synchronize()
+    end_time = time.time()
+    print(f"k-NN Brute Force (CuPy, Batched) total computation time: {end_time - start_time:.4f} seconds")
+
+    # Pad results if original K > effective_K (i.e., K > N_A)
+    if K > effective_K:
+        pad_width = K - effective_K
+        indices_pad = cp.full((Q, pad_width), -1, dtype=cp.int64)
+        dists_pad = cp.full((Q, pad_width), cp.inf, dtype=cp.float32)
+        all_topk_indices_cp = cp.hstack((all_topk_indices_cp, indices_pad))
+        all_topk_distances_sq_cp = cp.hstack((all_topk_distances_sq_cp, dists_pad))
+
+    return all_topk_indices_cp.astype(cp.int64), all_topk_distances_sq_cp.astype(cp.float32)
 
     # Or retu
 
