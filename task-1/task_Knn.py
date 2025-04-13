@@ -494,22 +494,76 @@ def distance_l22(X, Y, Q_TILE=1024, N_TILE=1024): # Tile sizes, tune as needed
     return l2_dist_sq
 
 
-def distance_cosine2(X, Y, epsilon=1e-8): # Corrected: Pairwise Cosine Distance
-    """ Calculates pairwise cosine distance (1 - similarity) using CuPy. """
-    X_cp = cp.asarray(X, dtype=np.float32)
-    Y_cp = cp.asarray(Y, dtype=np.float32)
+def distance_cosine2(X, Y, Q_TILE=1024, N_TILE=1024, epsilon=1e-8): # Add tile sizes
+    """ Calculates pairwise cosine distance (1 - similarity) using CuPy with tiling. """
+    X_cp = cp.asarray(X, dtype=cp.float32)
+    Y_cp = cp.asarray(Y, dtype=cp.float32)
     if X_cp.ndim == 1: X_cp = X_cp[None, :]
     if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
-    if X_cp.shape[1] != Y_cp.shape[1]: raise ValueError("Dimension mismatch")
 
-    dot_products = distance_dot2(X_cp, Y_cp) # Pairwise dot (Q, N)
-    norm_X = cp.linalg.norm(X_cp, axis=1, keepdims=True) # (Q, 1)
-    norm_Y = cp.linalg.norm(Y_cp, axis=1, keepdims=True) # (N, 1)
-    norm_product = (norm_X + epsilon) @ (norm_Y.T + epsilon) # (Q, N)
-    cosine_similarity = dot_products / norm_product
-    cosine_similarity = cp.clip(cosine_similarity, -1.0, 1.0)
-    distance = cp.maximum(0.0, 1.0 - cosine_similarity)
-    return distance
+    Q, D = X_cp.shape
+    N = Y_cp.shape[0]
+    if D != Y_cp.shape[1]: raise ValueError(f"Dimension mismatch: X({D}) vs Y({N},{Y_cp.shape[1]})")
+    if Q == 0 or N == 0: return cp.empty((Q,N), dtype=cp.float32)
+
+    # print(f"CuPy Pairwise Cosine (Tiled): Shapes {X_cp.shape}, {Y_cp.shape}")
+    cosine_dist = cp.empty((Q, N), dtype=cp.float32)
+
+    # Precompute Y norms (can do this once)
+    # Add epsilon here to avoid dividing by zero later if norm is exactly 0
+    norm_Y_full = cp.linalg.norm(Y_cp, axis=1) + epsilon # Shape (N,)
+
+    for q_start in range(0, Q, Q_TILE):
+        q_end = min(q_start + Q_TILE, Q)
+        X_chunk_q = X_cp[q_start:q_end] # Shape (curr_Q, D)
+        curr_Q = X_chunk_q.shape[0]
+        if curr_Q == 0: continue
+
+        # Precompute X norms for the current chunk
+        norm_X_chunk = cp.linalg.norm(X_chunk_q, axis=1) + epsilon # Shape (curr_Q,)
+
+        for n_start in range(0, N, N_TILE):
+            n_end = min(n_start + N_TILE, N)
+            Y_chunk_n = Y_cp[n_start:n_end] # Shape (curr_N, D)
+            norm_Y_chunk = norm_Y_full[n_start:n_end] # Shape (curr_N,)
+            curr_N = Y_chunk_n.shape[0]
+            if curr_N == 0: continue
+
+            # Calculate dot products for the tile: (curr_Q, D) @ (D, curr_N) -> (curr_Q, curr_N)
+            try:
+                dot_products_tile = cp.matmul(X_chunk_q, Y_chunk_n.T)
+
+                # Calculate norm product for the tile using broadcasting: (curr_Q, 1) * (1, curr_N) -> (curr_Q, curr_N)
+                norm_product_tile = cp.outer(norm_X_chunk, norm_Y_chunk) # Equivalent to norm_X_chunk[:, None] * norm_Y_chunk[None, :]
+
+                # Calculate cosine similarity for the tile
+                cosine_similarity_tile = dot_products_tile / norm_product_tile
+                cosine_similarity_tile = cp.clip(cosine_similarity_tile, -1.0, 1.0) # Clip before subtraction
+
+                # Calculate cosine distance for the tile
+                dist_tile = cp.maximum(0.0, 1.0 - cosine_similarity_tile) # Ensure non-negative
+
+                # Store result in the output matrix slice
+                cosine_dist[q_start:q_end, n_start:n_end] = dist_tile
+
+                # Optional: Clean up intermediate tile explicitly
+                del dot_products_tile, norm_product_tile, cosine_similarity_tile, dist_tile
+
+            except cp.cuda.memory.OutOfMemoryError:
+                print(f"\n--- OOM Error even within Cosine tile (D={D}, Tile={curr_Q}x{curr_N}) ---")
+                print(f"--- Try reducing Q_TILE/N_TILE in distance_cosine2 definition ---")
+                cosine_dist[q_start:q_end, n_start:n_end] = cp.inf # Assign placeholder
+                cp.get_default_memory_pool().free_all_blocks() # Attempt cleanup
+                continue
+
+            # Optional: Free memory more aggressively if needed
+            # cp.get_default_memory_pool().free_all_blocks()
+
+    # Clean up precomputed norms
+    del norm_Y_full, norm_X_chunk # Ensure cleanup happens outside inner loops where possible
+    # cp.get_default_memory_pool().free_all_blocks() # Final cleanup
+
+    return cosine_dist
 
 # Replace the old distance_manhattan2 function with this one:
 
