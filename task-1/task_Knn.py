@@ -426,7 +426,7 @@ def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
     # print(f"CuPy Pairwise Dot: {X_cp.shape} @ {Y_cp.T.shape}")
     return cp.matmul(X_cp, Y_cp.T) # (Q, D) @ (D, N) -> (Q, N)
 
-def distance_l2(X, Y):
+def distance_l22(X, Y):
     """
     Computes pairwise SQUARED L2 distances using CuPy, optimized for speed
     assuming the intermediate (Q, N) matrices fit in GPU memory.
