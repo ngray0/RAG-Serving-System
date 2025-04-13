@@ -426,7 +426,7 @@ def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
     # print(f"CuPy Pairwise Dot: {X_cp.shape} @ {Y_cp.T.shape}")
     return cp.matmul(X_cp, Y_cp.T) # (Q, D) @ (D, N) -> (Q, N)
 
-def distance_l22(X, Y, Q_TILE=1024, N_TILE=1024): # Tile sizes, tune as needed
+def distance_l22(X, Y, Q_TILE=512, N_TILE=512): # Tile sizes, tune as needed
     """ Calculates pairwise SQUARED L2 distance using CuPy with tiling. """
     X_cp = cp.asarray(X, dtype=cp.float32)
     Y_cp = cp.asarray(Y, dtype=cp.float32)
@@ -570,22 +570,37 @@ def distance_cosine2(X, Y, Q_TILE=1024, N_TILE=1024, epsilon=1e-8): # Add tile s
 def distance_manhattan2(X, Y, Q_TILE=256, N_TILE=256): # Tile sizes, can be tuned
     """
     Calculates pairwise Manhattan (L1) distance using CuPy with tiling
-    to manage memory usage.
+    to manage memory usage, suitable for large inputs where broadcasting
+    the full intermediate (Q, N, D) tensor would cause OutOfMemory errors.
+
+    Args:
+        X (cp.ndarray or array-like): Query vectors, shape (Q, D).
+        Y (cp.ndarray or array-like): Database vectors, shape (N, D).
+        Q_TILE (int): Tile size for the query dimension (Q).
+        N_TILE (int): Tile size for the database dimension (N).
+        epsilon (float): Small value for numerical stability (not typically needed for L1).
+
+    Returns:
+        cp.ndarray: Pairwise Manhattan distances, shape (Q, N).
     """
+    # --- Input Handling ---
     X_cp = cp.asarray(X, dtype=cp.float32)
     Y_cp = cp.asarray(Y, dtype=cp.float32)
-    if X_cp.ndim == 1: X_cp = X_cp[None, :]
-    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
+    if X_cp.ndim == 1: X_cp = X_cp[None, :] # Reshape (D,) to (1, D)
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :] # Reshape (D,) to (1, D)
 
     Q, D = X_cp.shape
-    N = Y_cp.shape[0]
-    if D != Y_cp.shape[1]: raise ValueError(f"Dimension mismatch: X({D}) vs Y({N},{Y_cp.shape[1]})")
-    if Q == 0 or N == 0: return cp.empty((Q,N), dtype=cp.float32) # Handle empty inputs
+    N, D_Y = Y_cp.shape
+    if D != D_Y:
+        raise ValueError(f"Dimension mismatch: X({D}) vs Y({D_Y})")
+    if Q == 0 or N == 0:
+        return cp.empty((Q, N), dtype=cp.float32) # Handle empty inputs
 
-    # print(f"CuPy Pairwise Manhattan (Tiled): Shapes {X_cp.shape}, {Y_cp.shape}")
+    # --- Initialization ---
+    # print(f"CuPy Pairwise Manhattan (Tiled): Shapes {X_cp.shape}, {Y_cp.shape}, Tile={Q_TILE}x{N_TILE}")
     l1_distance = cp.empty((Q, N), dtype=cp.float32)
 
-    # Iterate through tiles of queries (Q) and database points (N)
+    # --- Tiled Computation ---
     for q_start in range(0, Q, Q_TILE):
         q_end = min(q_start + Q_TILE, Q)
         X_chunk_q = X_cp[q_start:q_end] # Shape (curr_Q, D)
@@ -598,26 +613,32 @@ def distance_manhattan2(X, Y, Q_TILE=256, N_TILE=256): # Tile sizes, can be tune
             curr_N = Y_chunk_n.shape[0]
             if curr_N == 0: continue
 
-            # Broadcast within the smaller tile: (curr_Q, 1, D) vs (1, curr_N, D)
+            # Compute pairwise distances within the tile using broadcasting
             # Intermediate shape: (curr_Q, curr_N, D)
-            # Peak memory reduced significantly, e.g. 256*256*D*4 bytes per tile
+            # Peak memory reduced significantly, e.g. Q_TILE * N_TILE * D * 4 bytes per tile
             try:
+                # Broadcasting: X(curr_Q, 1, D) - Y(1, curr_N, D) -> diff(curr_Q, curr_N, D)
                 abs_diff_tile = cp.abs(X_chunk_q[:, None, :] - Y_chunk_n[None, :, :])
+                # Sum over the feature dimension D
                 l1_distance_tile = cp.sum(abs_diff_tile, axis=2) # Shape (curr_Q, curr_N)
+
+                # Store result in the output matrix slice
+                l1_distance[q_start:q_end, n_start:n_end] = l1_distance_tile
+
+                # Optional: Clean up intermediate tile explicitly if memory is extremely tight
+                del abs_diff_tile, l1_distance_tile
+
             except cp.cuda.memory.OutOfMemoryError:
-                 print(f"\n--- OOM Error even within Manhattan tile (D={D}, Tile={curr_Q}x{curr_N}) ---")
-                 print(f"--- Try reducing Q_TILE/N_TILE in distance_manhattan2 definition ---")
-                 # Fill problematic tile with Inf and continue if possible, or re-raise
-                 l1_distance[q_start:q_end, n_start:n_end] = cp.inf
-                 cp.get_default_memory_pool().free_all_blocks() # Attempt cleanup
-                 continue # Skip this tile, maybe others work
+                # Handle OOM error even within a tile
+                print(f"\n--- OOM Error within Manhattan tile (D={D}, Tile={curr_Q}x{curr_N}) ---")
+                print(f"--- Try reducing Q_TILE/N_TILE in distance_manhattan2 definition ---")
+                # Fill problematic tile with Inf and continue, or re-raise
+                l1_distance[q_start:q_end, n_start:n_end] = cp.inf
+                cp.get_default_memory_pool().free_all_blocks() # Attempt cleanup
+                continue # Skip to the next tile
 
-            # Store result in the output matrix slice
-            l1_distance[q_start:q_end, n_start:n_end] = l1_distance_tile
-
-            # Clean up intermediate tile explicitly (optional, helps memory management)
-            del abs_diff_tile, l1_distance_tile
-            # cp.get_default_memory_pool().free_all_blocks() # Can slow things down if called too often
+            # Optional: More aggressive memory freeing (can impact performance)
+            # cp.get_default_memory_pool().free_all_blocks()
 
     return l1_distance
 
@@ -1128,7 +1149,7 @@ def our_knn_stream(N, D, A, X, K):
 if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 1000000 # Using 4 Million points
-    N_queries = 1000     # Using 1 query as per your last log
+    N_queries = 10000     # Using 1 query as per your last log
     K_val = 10          # K for KNN
     NUM_RUNS = 2       # Number of timed runs for averaging
     WARMUP_RUNS = 1     # Number of warm-up runs
