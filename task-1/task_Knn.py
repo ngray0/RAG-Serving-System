@@ -444,7 +444,7 @@ def distance_l223(X, Y):
     dist_sq += Y_norm_sq[None, :]                           # Shape: (Q, N)
     return cp.maximum(0.0, dist_sq)
 
-def distance_l22(X, Y, Q_TILE=1024, N_TILE=4096): # Tile sizes, can be tuned
+def distance_l22(X, Y, Q_TILE=36000, N_TILE=36000): # Tile sizes, can be tuned
     """
     Calculates pairwise SQUARED L2 distance using CuPy with tiling
     to manage memory for large inputs.
