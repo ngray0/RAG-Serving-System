@@ -444,97 +444,119 @@ def distance_l223(X, Y):
     dist_sq += Y_norm_sq[None, :]                           # Shape: (Q, N)
     return cp.maximum(0.0, dist_sq)
 
-def distance_l22(X, Y, Q_TILE=36000, N_TILE=36000): # Tile sizes, can be tuned
+# Add a new parameter for tiling the norm calculation
+def distance_l22(X, Y, Q_TILE=30000, N_TILE=30000, N_NORM_TILE=100000): # Smaller tile for norm calc
     """
     Calculates pairwise SQUARED L2 distance using CuPy with tiling
-    to manage memory for large inputs.
-
-    Args:
-        X (cp.ndarray or array-like): Query vectors, shape (Q, D).
-        Y (cp.ndarray or array-like): Database vectors, shape (N, D).
-        Q_TILE (int): Tile size for the query dimension (Q).
-        N_TILE (int): Tile size for the database dimension (N).
-
-    Returns:
-        cp.ndarray: Pairwise squared L2 distances, shape (Q, N).
+    to manage memory for large inputs, INCLUDING tiled norm calculation.
+    # ... (rest of docstring) ...
     """
     # --- Input Handling ---
     X_cp = cp.asarray(X, dtype=cp.float32)
     Y_cp = cp.asarray(Y, dtype=cp.float32)
-    if X_cp.ndim == 1: X_cp = X_cp[None, :] # Reshape (D,) to (1, D)
-    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :] # Reshape (D,) to (1, D)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :]
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
 
     Q, D = X_cp.shape
     N, D_Y = Y_cp.shape
     if D != D_Y:
         raise ValueError(f"Dimension mismatch: X({D}) vs Y({D_Y})")
     if Q == 0 or N == 0:
-        return cp.empty((Q, N), dtype=cp.float32) # Handle empty inputs
+        return cp.empty((Q, N), dtype=cp.float32)
 
     # --- Initialization ---
-    # print(f"CuPy Pairwise L2 Squared (Tiled): Shapes {X_cp.shape}, {Y_cp.shape}, Tile={Q_TILE}x{N_TILE}") # Optional debug print
     dist_sq_total = cp.empty((Q, N), dtype=cp.float32) # Output matrix
 
-    # --- Precompute Norms ---
-    # Precompute ||Y||^2 once for the entire database
-    # Shape: (N,) - Keep it 1D for easier slicing later
-    norm_Y_sq_full = cp.sum(cp.square(Y_cp), axis=1)
+    # --- Precompute Norms (TILED) ---
+    # Allocate space for the full norms, but compute them in chunks
+    norm_Y_sq_full = cp.empty((N,), dtype=cp.float32)
+    print(f"  Calculating Y norms tiled (N_NORM_TILE={N_NORM_TILE})...", flush=True)
+    try:
+        for n_norm_start in range(0, N, N_NORM_TILE):
+            n_norm_end = min(n_norm_start + N_NORM_TILE, N)
+            if n_norm_start == n_norm_end: continue
 
-    # --- Tiled Computation ---
+            # Process only a chunk of Y for norm calculation
+            Y_chunk_norm = Y_cp[n_norm_start:n_norm_end]
+
+            # This is now the peak memory usage inside the norm loop
+            squared_chunk = cp.square(Y_chunk_norm)
+            norm_Y_sq_chunk = cp.sum(squared_chunk, axis=1)
+
+            # Store the result for this chunk
+            norm_Y_sq_full[n_norm_start:n_norm_end] = norm_Y_sq_chunk
+
+            # Optional: Clean up chunk memory explicitly if needed
+            del Y_chunk_norm, squared_chunk, norm_Y_sq_chunk
+            # cp.get_default_memory_pool().free_all_blocks() # Use if still getting OOM
+
+        cp.cuda.Stream.null.synchronize() # Ensure calculation is done before proceeding
+        print("  Y norms calculation complete.", flush=True)
+
+    except cp.cuda.memory.OutOfMemoryError as e:
+        print(f"\n--- OOM Error during TILED NORM calculation ---")
+        print(f"--- GPU likely lacks memory even for norm tile size {N_NORM_TILE}x{D}")
+        print(f"--- Consider reducing N_NORM_TILE further or using a GPU with more memory.")
+        print(f"--- Error: {e}")
+        raise # Re-raise the error to stop the benchmark for this dimension
+
+    # --- Tiled Computation (Main part - mostly unchanged) ---
+    print(f"  Starting main tiled distance calculation (Q_TILE={Q_TILE}, N_TILE={N_TILE})...", flush=True)
     for q_start in range(0, Q, Q_TILE):
         q_end = min(q_start + Q_TILE, Q)
-        X_chunk_q = X_cp[q_start:q_end] # Shape (curr_Q, D)
+        X_chunk_q = X_cp[q_start:q_end]
         curr_Q = X_chunk_q.shape[0]
         if curr_Q == 0: continue
 
-        # Precompute ||X||^2 for the current query chunk
-        # Shape: (curr_Q, 1) - Keep dimension for broadcasting
-        norm_X_sq_chunk = cp.sum(cp.square(X_chunk_q), axis=1, keepdims=True)
+        # Calculate X norm chunk (usually small unless Q_TILE is huge)
+        try:
+             norm_X_sq_chunk = cp.sum(cp.square(X_chunk_q), axis=1, keepdims=True)
+        except cp.cuda.memory.OutOfMemoryError as e:
+            print(f"\n--- OOM Error during X NORM calculation ---")
+            print(f"--- Tile size Q_TILE={Q_TILE} might be too large for D={D}")
+            print(f"--- Error: {e}")
+            # Clean up Y norms before raising
+            del norm_Y_sq_full
+            cp.get_default_memory_pool().free_all_blocks()
+            raise
 
         for n_start in range(0, N, N_TILE):
             n_end = min(n_start + N_TILE, N)
-            Y_chunk_n = Y_cp[n_start:n_end]             # Shape (curr_N, D)
-            # Slice the precomputed ||Y||^2 norms for the current database chunk
+            Y_chunk_n = Y_cp[n_start:n_end]
+            # Slice the *precomputed* Y norms
             norm_Y_sq_chunk = norm_Y_sq_full[n_start:n_end] # Shape (curr_N,)
             curr_N = Y_chunk_n.shape[0]
             if curr_N == 0: continue
 
-            # Compute dot products for the tile: (curr_Q, D) @ (D, curr_N) -> (curr_Q, curr_N)
             try:
-                # This matmul is the largest allocation within the tile loop
+                # Compute dot products for the tile
                 dot_products_tile = cp.matmul(X_chunk_q, Y_chunk_n.T)
 
-                # Calculate squared L2 distance: ||X||^2 + ||Y||^2 - 2*X.Y
-                # Use broadcasting: (curr_Q, 1) + (1, curr_N) - 2 * (curr_Q, curr_N)
+                # Calculate squared L2 distance using precomputed norms
                 dist_sq_tile = norm_X_sq_chunk - 2 * dot_products_tile
                 dist_sq_tile += norm_Y_sq_chunk[None, :] # Broadcast add ||Y||^2
 
-                # Ensure non-negative results (due to potential floating point inaccuracies)
                 dist_sq_tile = cp.maximum(0.0, dist_sq_tile)
-
-                # Store result in the appropriate slice of the output matrix
                 dist_sq_total[q_start:q_end, n_start:n_end] = dist_sq_tile
 
-                # Optional: Clean up intermediate tile results explicitly if memory is extremely tight
-                del dot_products_tile, dist_sq_tile
+                del dot_products_tile, dist_sq_tile, Y_chunk_n, norm_Y_sq_chunk # Cleanup tile data
 
             except cp.cuda.memory.OutOfMemoryError:
-                # Handle OOM error even within a tile (might happen for very high D or large tiles)
-                print(f"\n--- OOM Error within L2 tile (D={D}, Tile={curr_Q}x{curr_N}) ---")
-                print(f"--- Try reducing Q_TILE/N_TILE in distance_l22_tiled definition ---")
-                # Fill problematic tile with Inf and continue, or re-raise
+                print(f"\n--- OOM Error within main L2 tile (D={D}, Tile={curr_Q}x{curr_N}) ---")
+                print(f"--- Try reducing Q_TILE/N_TILE in distance_l22 definition ---")
                 dist_sq_total[q_start:q_end, n_start:n_end] = cp.inf
-                cp.get_default_memory_pool().free_all_blocks() # Attempt cleanup
-                continue # Skip to the next tile
+                # Clean up norms etc before continuing/raising
+                del norm_X_sq_chunk, norm_Y_sq_full
+                cp.get_default_memory_pool().free_all_blocks()
+                # Re-raising might be better to stop the problematic dimension
+                raise
 
-            # Optional: More aggressive memory freeing after each tile (can impact performance)
+            # Optional: More aggressive memory freeing
             # cp.get_default_memory_pool().free_all_blocks()
 
-        # Optional: Clean up precomputed X norm chunk outside the N loop
-        del norm_X_sq_chunk
+        del norm_X_sq_chunk # Clean up X norm chunk
 
-    # Optional: Clean up precomputed Y norms outside all loops
-    del norm_Y_sq_full
+    del norm_Y_sq_full # Clean up Y norms
 
     return dist_sq_total
 def distance_cosine2(X, Y, Q_TILE=1024, N_TILE=1024, epsilon=1e-8): # Add tile sizes
