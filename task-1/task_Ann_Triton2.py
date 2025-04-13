@@ -587,7 +587,7 @@ if __name__ == "__main__":
     RECALL_THRESHOLD = 0.70
 
     # Dimensions to test
-    dimensions_to_test = [2, 4, 64, 256, 1024]
+    dimensions_to_test = [2, 2,4, 4, 64, 256, 1024]
 
     print("\n" + "="*60)
     print("--- Triton/PyTorch ANN Full Test ---")
