@@ -769,7 +769,7 @@ if __name__ == "__main__":
 
     # ANN Parameters based on new pseudocode interpretation
     num_clusters_kmeans = 1000  # K for KMeans (Step 1)
-    num_clusters_probe = 100    # K1 for finding probe clusters (Step 2)
+    num_clusters_probe = 300    # K1 for finding probe clusters (Step 2)
                                # K2 from pseudocode is ignored based on interpretation
 
     kmeans_max_iters = 50      # Max iterations for KMeans

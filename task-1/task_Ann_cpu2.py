@@ -51,6 +51,473 @@ def pairwise_l2_squared_numpy(X_np, C_np):
         raise e
 
 
+Python
+import numpy as np
+import time
+
+# ============================================================================
+# CPU Helper Function (Pairwise Squared L2 Distance - Required by KMeans)
+# ============================================================================
+
+def pairwise_l2_squared_numpy(X_np, C_np):
+    """
+    Computes pairwise **squared** L2 distances using NumPy.
+    X_np: (N, D) data points OR (Q, D) query points (NumPy array)
+    C_np: (K, D) centroids OR (N, D) database points (NumPy array)
+    Returns: (N|Q, K|N) NumPy array of SQUARED distances.
+    """
+    # Ensure inputs are NumPy arrays and float32
+    if not isinstance(X_np, np.ndarray): X_np = np.asarray(X_np, dtype=np.float32)
+    elif X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
+    if not isinstance(C_np, np.ndarray): C_np = np.asarray(C_np, dtype=np.float32)
+    elif C_np.dtype != np.float32: C_np = C_np.astype(np.float32)
+
+    if X_np.ndim == 1: X_np = X_np[np.newaxis, :] # Ensure X is 2D
+    if C_np.ndim == 1: C_np = C_np[np.newaxis, :] # Ensure C is 2D
+
+    if X_np.shape[0] == 0 or C_np.shape[0] == 0:
+        return np.empty((X_np.shape[0], C_np.shape[0]), dtype=np.float32)
+    if X_np.shape[1] != C_np.shape[1]:
+        raise ValueError(f"Dimension mismatch: X_np={X_np.shape[1]}, C_np={C_np.shape[1]}")
+
+    # ||x - c||^2 = ||x||^2 - 2<x, c> + ||c||^2
+    try:
+        X_norm_sq = np.einsum('ij,ij->i', X_np, X_np)[:, np.newaxis]
+        C_norm_sq = np.einsum('ij,ij->i', C_np, C_np)[np.newaxis, :]
+        dot_products = np.dot(X_np, C_np.T)
+        dist_sq = X_norm_sq + C_norm_sq - 2 * dot_products
+        return np.maximum(0.0, dist_sq) # Clamp negatives
+    except MemoryError as e:
+        print(f"MemoryError in pairwise_l2_squared_numpy: Shapes X={X_np.shape}, C={C_np.shape}")
+        raise e
+    except Exception as e:
+        print(f"Error in pairwise_l2_squared_numpy: {e}")
+        raise e
+
+# ============================================================================
+# CPU KMeans Implementation
+# ============================================================================
+
+def our_kmeans_cpu(N_A, D, A_np, K, max_iters=100, tol=1e-4, verbose=False):
+    """
+    Performs K-means clustering entirely using NumPy on the CPU.
+
+    Args:
+        N_A (int): Number of data points (inferred).
+        D (int): Dimensionality (inferred).
+        A_np (np.ndarray): Data points (N_A, D) on CPU (NumPy ndarray).
+        K (int): Number of clusters.
+        max_iters (int): Maximum number of iterations.
+        tol (float): Tolerance for centroid movement convergence check.
+        verbose (bool): If True, prints iteration details.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]:
+            - centroids_np (np.ndarray): Final centroids (K, D), float32.
+            - assignments_np (np.ndarray): Final cluster assignment (N_A,), int64.
+    """
+    # --- Input Validation ---
+    if not isinstance(A_np, np.ndarray): A_np = np.asarray(A_np, dtype=np.float32)
+    elif A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
+
+    actual_N, actual_D = A_np.shape
+    if actual_N == 0: raise ValueError("Input data A_np cannot be empty.")
+    N_A = actual_N
+    D = actual_D
+
+    if not (K > 0): raise ValueError("K must be positive.")
+    if K > N_A:
+        print(f"Warning: CPU KMeans requested K ({K}) > N_A ({N_A}). Using K={N_A}.")
+        K = N_A
+    if K == 0: # K might be 0 after adjustment if N_A was 0 (already checked)
+         return np.empty((0, D), dtype=np.float32), np.empty((N_A,), dtype=np.int64)
+
+    print(f"Running K-Means (Pure NumPy CPU): N={N_A}, D={D}, K={K}")
+    start_time_total = time.time()
+
+    # --- Initialization ---
+    try:
+        # Ensure unique indices are chosen if K=N_A
+        initial_indices = np.random.choice(N_A, K, replace=False)
+    except ValueError as e:
+         print(f"Error during KMeans initialization choice: N_A={N_A}, K={K}. Error: {e}")
+         raise e # Likely N_A < K, though checks should prevent this
+    centroids_np = A_np[initial_indices].copy() # Shape (K, D)
+    assignments_np = np.empty(N_A, dtype=np.int32) # Use int32 internally
+
+    # --- Iteration Loop ---
+    for i in range(max_iters):
+        old_centroids_np = centroids_np.copy()
+
+        # --- Assignment Step ---
+        try:
+            all_dist_sq_np = pairwise_l2_squared_numpy(A_np, centroids_np) # Shape (N_A, K)
+        except MemoryError as e:
+            print(f"MemoryError during KMeans assignment step (Iter {i+1}): Calc ({N_A}, {K}) dist matrix.")
+            raise e
+        except Exception as e:
+            print(f"Error during KMeans assignment step (Iter {i+1}): {e}")
+            raise e
+
+        new_assignments_np = np.argmin(all_dist_sq_np, axis=1).astype(np.int32) # Shape (N_A,)
+
+        # --- Update Step (Optimized NumPy) ---
+        # Faster way to sum points for each cluster than looping
+        new_sums_np = np.zeros((K, D), dtype=np.float32)
+        np.add.at(new_sums_np, new_assignments_np, A_np) # Efficient in-place sum based on index
+
+        # Count points in each cluster
+        cluster_counts_np = np.bincount(new_assignments_np, minlength=K).astype(np.float32)
+
+        # Avoid division by zero for empty clusters
+        empty_cluster_mask = (cluster_counts_np == 0)
+        final_counts_safe_np = np.maximum(cluster_counts_np, 1.0) # Replace 0 with 1 for division
+
+        # Calculate new centroids
+        new_centroids_np = new_sums_np / final_counts_safe_np[:, np.newaxis] # Broadcast division
+
+        # Handle empty clusters: keep old centroid position
+        num_empty = np.sum(empty_cluster_mask)
+        if num_empty > 0:
+            # print(f"  Iter {i+1}: Found {num_empty} empty clusters. Re-using old centroids.")
+            new_centroids_np[empty_cluster_mask] = old_centroids_np[empty_cluster_mask]
+            if num_empty == K:
+                 print(f"Warning: Iter {i+1}, ALL clusters are empty. Stopping iteration.")
+                 centroids_np = old_centroids_np # Restore previous state
+                 assignments_np = new_assignments_np.astype(np.int64) # Use current assignments
+                 break # Stop if all clusters became empty
+
+
+        # Handle potential NaN/inf resulting from 0/0 or inf/inf (less likely with clamping)
+        if not np.all(np.isfinite(new_centroids_np)):
+            # print(f"Warning: Non-finite values found in centroids at iteration {i+1}. Replacing.")
+            nan_mask = np.isnan(new_centroids_np)
+            new_centroids_np[nan_mask] = old_centroids_np[nan_mask] # Replace NaN with old value
+
+        # Update assignments and centroids for next iteration / final return
+        assignments_np = new_assignments_np
+        centroids_np = new_centroids_np
+
+        # --- Check Convergence ---
+        centroid_diff_np = np.linalg.norm(centroids_np - old_centroids_np)
+
+        if verbose and ((i+1) % 10 == 0 or centroid_diff_np < tol or i == max_iters -1):
+             print(f"  Iter {i+1}/{max_iters} | Centroid Diff: {centroid_diff_np:.4f}")
+
+        if centroid_diff_np < tol:
+            print(f"Converged after {i+1} iterations (centroid movement < {tol}).")
+            break
+
+    if i == max_iters - 1: print(f"Reached max iterations ({max_iters}).")
+
+    # Final check for non-empty clusters
+    final_counts = np.bincount(assignments_np, minlength=K)
+    actual_k = np.sum(final_counts > 0)
+    print(f"K-Means finished. Found {actual_k} non-empty clusters out of {K} requested.")
+
+    total_time = time.time() - start_time_total
+    print(f"Total CPU K-Means time: {total_time:.4f}s")
+
+    # Return centroids and int64 assignments
+    return centroids_np.astype(np.float32), assignments_np.astype(np.int64)
+
+
+def ann_ivf_like_cpu(
+    N_A, D, A_np, X_np, K_final,
+    num_clusters, num_clusters_to_probe,
+    max_kmeans_iters=100,
+    precomputed_centroids=None,
+    precomputed_assignments=None,
+    verbose_kmeans=False
+    ):
+    """
+    Performs ANN search based on user's pseudocode using NumPy on the CPU.
+    Finds K_final nearest DATA POINTS (IVF-like approach).
+
+    Args:
+        N_A (int): Number of database points (inferred).
+        D (int): Dimension (inferred).
+        A_np (np.ndarray): Database vectors (N_A, D), float32, CPU.
+        X_np (np.ndarray): Query vectors (Q, D), float32, CPU.
+        K_final (int): Final number of nearest *data point* neighbors.
+        num_clusters (int): Number of clusters for K-Means.
+        num_clusters_to_probe (int): Number of nearest clusters to probe (K1).
+        max_kmeans_iters (int): Max iterations for K-Means.
+        precomputed_centroids (np.ndarray, optional): (num_clusters, D) centroids.
+        precomputed_assignments (np.ndarray, optional): (N_A,) assignments (int64).
+        verbose_kmeans (bool): Verbosity for KMeans function (not used in CPU version here).
+
+    Returns:
+        tuple[np.ndarray, np.ndarray, float, float]:
+            - all_indices_np (np.ndarray): Indices (in A) of K_final nearest neighbors (Q, K_final). Int64.
+            - all_distances_sq_np (np.ndarray): **Squared** L2 distances (Q, K_final). Float32.
+            - build_time (float): Time for K-Means + Inverted Index.
+            - search_time (float): Time for searching all queries.
+    """
+    print("--- Starting NumPy CPU ANN ---")
+    # --- Input Validation & Data Prep ---
+    if not isinstance(A_np, np.ndarray): A_np = np.asarray(A_np, dtype=np.float32)
+    elif A_np.dtype != np.float32: A_np = A_np.astype(np.float32)
+    if not isinstance(X_np, np.ndarray): X_np = np.asarray(X_np, dtype=np.float32)
+    elif X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
+
+    if A_np.ndim != 2: raise ValueError(f"Database A_np must be 2D, got shape {A_np.shape}")
+    if X_np.ndim != 2: raise ValueError(f"Queries X_np must be 2D, got shape {X_np.shape}")
+
+    actual_N_A, actual_D = A_np.shape
+    Q, query_D = X_np.shape
+
+    N_A = actual_N_A
+    D = actual_D
+    if query_D != D: raise ValueError(f"Dimension mismatch: A D={D}, X D={query_D}")
+
+    if N_A == 0: raise ValueError("Database A_np cannot be empty.")
+    if Q == 0: print("Warning: Query set X_np is empty."); # Will return empty
+
+    if not (K_final > 0): raise ValueError("K_final must be positive")
+    if not (num_clusters > 0): raise ValueError("num_clusters must be positive")
+    if not (num_clusters_to_probe > 0): raise ValueError("num_clusters_to_probe must be positive")
+
+    print(f"Running ANN (NumPy CPU IVF-like): Q={Q}, N={N_A}, D={D}, K_final={K_final}")
+    print(f"Params: num_clusters={num_clusters}, nprobe={num_clusters_to_probe}")
+
+    build_time_total = 0.0
+    build_start_time = time.time()
+
+    # --- Step 1: K-Means Clustering & Index Setup ---
+    assignments_np = None
+    centroids_np = None
+    kmeans_run_time = 0.0
+    if precomputed_centroids is not None and precomputed_assignments is not None:
+        print("Using precomputed centroids and assignments.")
+        centroids_np = np.asarray(precomputed_centroids, dtype=np.float32)
+        assignments_np = np.asarray(precomputed_assignments, dtype=np.int64)
+        # Basic validation
+        if centroids_np.ndim != 2 or centroids_np.shape[1] != D: raise ValueError("Invalid precomputed centroids shape/dim.")
+        if assignments_np.ndim != 1 or assignments_np.shape[0] != N_A: raise ValueError("Invalid precomputed assignments shape.")
+        actual_num_clusters = centroids_np.shape[0]
+        if actual_num_clusters < num_clusters: print(f"Warning: Provided {actual_num_clusters} centroids < requested {num_clusters}.")
+        elif actual_num_clusters > num_clusters:
+            print(f"Warning: Using first {num_clusters} of {actual_num_clusters} provided centroids.")
+            centroids_np = centroids_np[:num_clusters]
+            if assignments_np.max() >= num_clusters: raise ValueError("Assignments index out of bounds after truncating centroids.")
+        num_clusters = centroids_np.shape[0]
+
+    elif precomputed_centroids is not None or precomputed_assignments is not None:
+        raise ValueError("Provide both or neither of precomputed centroids/assignments.")
+    else:
+        print("Running KMeans (NumPy CPU)...")
+        kmeans_start = time.time()
+        centroids_np, assignments_np = our_kmeans_cpu(N_A, D, A_np, num_clusters, max_iters=max_kmeans_iters)
+        kmeans_run_time = time.time() - kmeans_start
+        actual_num_clusters = centroids_np.shape[0]
+        if actual_num_clusters < num_clusters: print(f"Note: KMeans used K={actual_num_clusters}.")
+        num_clusters = actual_num_clusters
+
+    # Handle case where KMeans might fail or return no clusters
+    if num_clusters == 0 or centroids_np is None or assignments_np is None:
+        print("Error: No clusters found or provided. Cannot proceed.")
+        empty_indices = np.full((Q, K_final), -1, dtype=np.int64)
+        empty_dists = np.full((Q, K_final), np.inf, dtype=np.float32)
+        build_time_total = time.time() - build_start_time
+        return empty_indices, empty_dists, build_time_total, 0.0
+
+    # Adjust num_clusters_to_probe
+    num_clusters_to_probe = min(num_clusters_to_probe, num_clusters)
+    if num_clusters_to_probe <= 0:
+        print("Error: num_clusters_to_probe is 0. Cannot proceed.")
+        empty_indices = np.full((Q, K_final), -1, dtype=np.int64)
+        empty_dists = np.full((Q, K_final), np.inf, dtype=np.float32)
+        build_time_total = time.time() - build_start_time
+        return empty_indices, empty_dists, build_time_total, 0.0
+
+    print(f"Building Inverted Index (NumPy) for {num_clusters} clusters...")
+    # --- Build Inverted Index (NumPy) ---
+    invidx_start_time = time.time()
+    original_indices_np = np.arange(N_A, dtype=np.int64)
+
+    # Sort original indices based on cluster assignments
+    sort_permutation_np = np.argsort(assignments_np)
+    inv_idx_values_np = original_indices_np[sort_permutation_np] # Original indices sorted by cluster
+    sorted_assignments_np = assignments_np[sort_permutation_np] # Cluster IDs sorted
+
+    # Find unique cluster IDs present and their counts/first occurrences
+    unique_clusters_np, cluster_starts_np, cluster_counts_np = np.unique(
+        sorted_assignments_np, return_index=True, return_counts=True
+    )
+
+    # Create full lookup tables
+    full_inv_idx_starts_np = np.full((num_clusters,), -1, dtype=np.int64)
+    full_inv_idx_counts_np = np.zeros((num_clusters,), dtype=np.int64)
+
+    # Populate the tables
+    valid_unique_mask_np = unique_clusters_np < num_clusters
+    valid_unique_clusters_np = unique_clusters_np[valid_unique_mask_np]
+    if valid_unique_clusters_np.size > 0:
+        full_inv_idx_starts_np[valid_unique_clusters_np] = cluster_starts_np[valid_unique_mask_np]
+        full_inv_idx_counts_np[valid_unique_clusters_np] = cluster_counts_np[valid_unique_mask_np]
+    else:
+         print("Warning: No valid unique clusters found for inverted index.")
+
+
+    invidx_end_time = time.time()
+    build_time_total = kmeans_run_time + (invidx_end_time - invidx_start_time)
+    print(f"Index build time (Total): {build_time_total:.4f}s (KMeans: {kmeans_run_time:.4f}s, InvIdx: {invidx_end_time - invidx_start_time:.4f}s)")
+
+    # --- Search Phase ---
+    search_start_time = time.time()
+    all_indices_np = np.full((Q, K_final), -1, dtype=np.int64)
+    all_distances_sq_np = np.full((Q, K_final), np.inf, dtype=np.float32)
+
+    # Handle empty query case
+    if Q == 0:
+        print("Empty query set, returning empty results.")
+        return all_indices_np, all_distances_sq_np, build_time_total, 0.0
+
+    # --- Step 2: Find nearest `num_clusters_to_probe` cluster centers ---
+    print("Calculating query-centroid distances (CPU)...")
+    try:
+        all_query_centroid_dists_sq_np = pairwise_l2_squared_numpy(X_np, centroids_np) # Shape (Q, num_clusters)
+    except MemoryError as e:
+        print(f"MemoryError calculating query-centroid distances: Q={Q}, K={num_clusters}")
+        raise e
+    except Exception as e:
+        print(f"Error calculating query-centroid distances: {e}")
+        raise e
+
+    print("Finding nearest clusters (CPU)...")
+    # Find indices of the nearest clusters
+    try:
+        probe_partition_idx = min(num_clusters_to_probe, num_clusters) -1 # 0-based index
+        if probe_partition_idx < 0: probe_partition_idx = 0
+
+        if num_clusters_to_probe >= num_clusters:
+            all_nearest_cluster_indices_np = np.argsort(all_query_centroid_dists_sq_np, axis=1)[:, :num_clusters_to_probe]
+        else:
+             if num_clusters > 0:
+                 all_nearest_cluster_indices_np = np.argpartition(all_query_centroid_dists_sq_np, kth=probe_partition_idx, axis=1)[:, :num_clusters_to_probe]
+             else: # Should not happen
+                 all_nearest_cluster_indices_np = np.empty((Q,0), dtype=np.int64)
+
+    except Exception as e:
+        print(f"Error finding nearest clusters (argpartition/argsort): {e}")
+        raise e
+
+    # --- Step 3 & 4: Gather Candidates & Find Top K_final data points ---
+    print(f"Searching {Q} queries (CPU)...")
+    # Iterate through queries (CPU loop)
+    for q_idx in range(Q):
+        query_np = X_np[q_idx:q_idx+1] # Keep 2D: (1, D)
+        probed_cluster_indices_np = all_nearest_cluster_indices_np[q_idx] # Shape (num_clusters_to_probe,)
+
+        # --- Gather candidate original indices (from A) ---
+        selected_starts_np = full_inv_idx_starts_np[probed_cluster_indices_np]
+        selected_counts_np = full_inv_idx_counts_np[probed_cluster_indices_np]
+
+        # Filter out invalid probes
+        valid_probe_mask_np = selected_starts_np >= 0
+        if not np.any(valid_probe_mask_np): continue # Skip if no valid clusters
+
+        valid_starts_np = selected_starts_np[valid_probe_mask_np]
+        valid_counts_np = selected_counts_np[valid_probe_mask_np]
+
+        # Use list comprehension and np.concatenate (common NumPy pattern)
+        try:
+            candidate_indices_list = [
+                inv_idx_values_np[start : start + count]
+                for start, count in zip(valid_starts_np, valid_counts_np) if count > 0
+            ]
+            if not candidate_indices_list: continue # Skip if empty
+            candidate_original_indices_np = np.concatenate(candidate_indices_list)
+        except ValueError as e: # Handle potential empty list error
+            if "need at least one array to concatenate" in str(e):
+                 continue # Skip if list becomes empty
+            else:
+                 print(f"Error concatenating indices for query {q_idx}: {e}")
+                 raise e # Re-raise other errors
+        except IndexError as e:
+            print(f"IndexError gathering candidates for query {q_idx}: {e}")
+            continue
+
+
+        # Remove duplicates
+        unique_candidate_original_indices_np = np.unique(candidate_original_indices_np)
+        num_unique_candidates = unique_candidate_original_indices_np.size
+        if num_unique_candidates == 0: continue
+
+        # --- Fetch candidate vectors ---
+        try:
+            # Add validity check
+            max_idx = np.max(unique_candidate_original_indices_np)
+            if max_idx >= N_A:
+                 print(f"ERROR: Invalid candidate index {max_idx} >= N_A ({N_A}) for query {q_idx}. Filtering.")
+                 valid_cand_mask = unique_candidate_original_indices_np < N_A
+                 unique_candidate_original_indices_np = unique_candidate_original_indices_np[valid_cand_mask]
+                 num_unique_candidates = unique_candidate_original_indices_np.size
+                 if num_unique_candidates == 0: continue
+
+            candidate_vectors_np = A_np[unique_candidate_original_indices_np] # Shape (num_unique, D)
+        except MemoryError as e:
+            print(f"MemoryError fetching candidates (Query {q_idx}, {num_unique_candidates} candidates): {e}")
+            continue
+        except IndexError as e:
+            print(f"IndexError fetching candidates (Query {q_idx}): {e}")
+            continue
+        except Exception as e:
+             print(f"Error fetching candidates (Query {q_idx}): {e}")
+             continue
+
+        # --- Calculate exact distances to candidates ---
+        try:
+            query_candidate_dists_sq_np = pairwise_l2_squared_numpy(query_np, candidate_vectors_np) # Shape (1, num_unique)
+        except MemoryError as e:
+            print(f"MemoryError calculating query-candidate dists (Query {q_idx}, {num_unique_candidates} candidates): {e}")
+            continue
+        except Exception as e:
+             print(f"Error calculating query-candidate dists (Query {q_idx}): {e}")
+             continue
+
+        # --- Find top K_final among candidates ---
+        actual_k_final = min(K_final, num_unique_candidates)
+        if actual_k_final > 0:
+            try:
+                # Use argpartition + argsort
+                k_partition_final_idx = min(actual_k_final, num_unique_candidates) - 1
+                if k_partition_final_idx < 0: k_partition_final_idx = 0
+
+                if actual_k_final >= num_unique_candidates:
+                    topk_relative_indices_np = np.argsort(query_candidate_dists_sq_np[0])[:actual_k_final]
+                else:
+                    if num_unique_candidates > 0:
+                         topk_indices_unstructured = np.argpartition(query_candidate_dists_sq_np[0], kth=k_partition_final_idx)[:actual_k_final]
+                         topk_distances_sq_unstructured = query_candidate_dists_sq_np[0, topk_indices_unstructured]
+                         sorted_order_in_k = np.argsort(topk_distances_sq_unstructured)
+                         topk_relative_indices_np = topk_indices_unstructured[sorted_order_in_k]
+                    else: # Should not happen if actual_k_final > 0
+                         topk_relative_indices_np = np.empty((0,), dtype=np.int64)
+
+
+                # Get sorted distances
+                final_topk_distances_sq_np = query_candidate_dists_sq_np[0, topk_relative_indices_np]
+                # Map relative indices back to original indices from A_np
+                final_topk_original_indices_np = unique_candidate_original_indices_np[topk_relative_indices_np]
+
+                # Store results
+                all_indices_np[q_idx, :actual_k_final] = final_topk_original_indices_np
+                all_distances_sq_np[q_idx, :actual_k_final] = final_topk_distances_sq_np
+
+            except Exception as e:
+                print(f"Error during top-K selection for query {q_idx}: {e}")
+                # Leave results as -1/inf
+
+    # --- Final Timing ---
+    search_time = time.time() - search_start_time
+    print(f"ANN search time: {search_time:.4f} seconds")
+    if search_time > 0 and Q > 0: print(f"-> Throughput: {Q / search_time:.2f} queries/sec")
+
+    return all_indices_np, all_distances_sq_np, build_time_total, search_time
+
+
 # ============================================================================
 # CPU Brute-Force k-NN (NumPy version - WITH QUERY BATCHING)
 # ============================================================================
@@ -214,38 +681,160 @@ def numpy_knn_bruteforce(N_A, D, A_np, X_np, K, batch_size_q=1024): # Add batch_
 # ============================================================================
 # Example Usage (Optional - How you would call it)
 # ============================================================================
+# ============================================================================
+# Main Execution Block (CPU ONLY - IVF-like ANN + Recall vs True k-NN)
+# ============================================================================
 if __name__ == "__main__":
 
-    # Assuming you have already defined pairwise_l2_squared_numpy somewhere above
+    # Assume necessary imports (numpy as np, time, traceback) and function definitions
+    # (pairwise_l2_squared_numpy, our_kmeans_cpu, ann_ivf_like_cpu, numpy_knn_bruteforce)
+    # are present above this block.
 
-    print("\n--- Example CPU k-NN Brute Force Usage ---")
-    # Create some dummy data
-    N_cpu = 10000 # Smaller N for quick CPU example
-    D_cpu = 64
-    Q_cpu = 500
-    K_cpu = 5
+    # --- Parameters ---
+    N_data = 100_000       # Smaller N for faster CPU testing
+    Dim = 64              # Smaller Dim for faster CPU testing
+    N_queries = 1_000       # Fewer queries for faster CPU testing
+    K_final_neighbors = 10  # Final number of neighbors to find
 
-    A_data_cpu = np.random.rand(N_cpu, D_cpu).astype(np.float32)
-    X_queries_cpu = np.random.rand(Q_cpu, D_cpu).astype(np.float32)
+    # ANN Parameters
+    num_clusters_kmeans = 500  # K for KMeans
+    num_clusters_probe = 20    # K1 (nprobe)
+    kmeans_max_iters = 50      # Max iterations for KMeans
 
-    print(f"Example Data: N={N_cpu}, D={D_cpu}, Q={Q_cpu}, K={K_cpu}")
+    # Recall threshold
+    RECALL_THRESHOLD = 0.70
 
+    print("\n" + "="*60)
+    print("--- NumPy CPU ANN Example with Recall vs True k-NN ---")
+    print("="*60)
+    print("Generating Test Data (NumPy CPU)...")
+    print(f"N={N_data}, D={Dim}, Q={N_queries}, K_final={K_final_neighbors}")
+    print(f"ANN Params: num_clusters={num_clusters_kmeans}, nprobe={num_clusters_probe}")
+    print("="*60)
+    A_data_np = None # Define outside try
+    X_queries_np = None
     try:
-        # Call the batched CPU k-NN function
-        # Use a smaller batch size suitable for CPU testing if desired
-        cpu_knn_indices, cpu_knn_dists_sq = numpy_knn_bruteforce(
-            N_A=N_cpu, D=D_cpu, A_np=A_data_cpu, X_np=X_queries_cpu, K=K_cpu, batch_size_q=512
-        )
+        # Generate data directly on CPU
+        A_data_np = np.random.randn(N_data, Dim).astype(np.float32)
+        X_queries_np = np.random.randn(N_queries, Dim).astype(np.float32)
+        print("Data generated successfully on CPU.")
+        mem_gb_a = A_data_np.nbytes / (1024**3)
+        mem_gb_x = X_queries_np.nbytes / (1024**3)
+        print(f"Approx memory: A={mem_gb_a:.3f} GB, X={mem_gb_x:.3f} GB")
 
-        print("\nCPU Brute Force Results:")
-        print(f"  Indices shape: {cpu_knn_indices.shape}") # Should be (Q_cpu, K_cpu)
-        print(f"  Sq Distances shape: {cpu_knn_dists_sq.shape}")
-        # print("  First 5 indices:", cpu_knn_indices[0,:5])
-        # print("  First 5 distances:", cpu_knn_dists_sq[0,:5])
-
-    except MemoryError:
-        print("\nMemoryError encountered during CPU k-NN example.")
-        print("Reduce N_cpu or Q_cpu, or ensure sufficient RAM.")
+    except MemoryError as e:
+        print(f"\nMemoryError during data generation: {e}")
+        print("Try reducing N_data or Dim.")
+        exit()
     except Exception as e:
-        print(f"\nAn error occurred during CPU k-NN example: {e}")
+        print(f"\nError generating data: {e}")
+        exit()
+
+    # --- Run ANN (CPU IVF-like) ---
+    print("\n" + "="*60)
+    print(f"Testing ANN (NumPy CPU IVF-like)...")
+    print("="*60)
+    ann_indices_np = None # Define outside try
+    ann_dists_sq_np = None
+    build_t = 0
+    search_t = 0
+    try:
+        # Call the new CPU IVF-like function
+        ann_indices_np, ann_dists_sq_np, build_t, search_t = ann_ivf_like_cpu(
+            N_A=N_data, D=Dim, A_np=A_data_np, X_np=X_queries_np,
+            K_final=K_final_neighbors,
+            num_clusters=num_clusters_kmeans,
+            num_clusters_to_probe=num_clusters_probe,
+            max_kmeans_iters=kmeans_max_iters
+        )
+        print("\nANN Results:")
+        if ann_indices_np is not None: print(f"  Indices shape: {ann_indices_np.shape}")
+        if ann_dists_sq_np is not None: print(f"  Sq Distances shape: {ann_dists_sq_np.shape}")
+        print(f"  Build Time: {build_t:.4f}s")
+        print(f"  Search Time: {search_t:.4f}s")
+
+    except MemoryError as e:
+        print(f"\nMemoryError during CPU ANN execution: {e}")
+        ann_indices_np = None # Prevent recall
+    except Exception as e:
+        print(f"\nError during CPU ANN execution: {e}")
         traceback.print_exc()
+        ann_indices_np = None # Prevent recall
+
+    # --- Run Brute-Force KNN (CPU, Batched) for Ground Truth ---
+    true_knn_indices_np = None # Define outside try
+    if ann_indices_np is not None: # Only run if ANN succeeded
+        print("\n" + "="*60)
+        print(f"Calculating Ground Truth (NumPy CPU k-NN)...")
+        print("="*60)
+        try:
+            # Call the batched CPU brute-force function
+            true_knn_indices_np, true_knn_dists_sq_np = numpy_knn_bruteforce(
+                N_A=N_data, D=Dim, A_np=A_data_np, X_np=X_queries_np, K=K_final_neighbors, batch_size_q=1024 # Adjust batch size if needed
+            )
+            print("\nGround Truth Results:")
+            if true_knn_indices_np is not None: print(f"  Indices shape: {true_knn_indices_np.shape}")
+            # if true_knn_dists_sq_np is not None: print(f"  Sq Distances shape: {true_knn_dists_sq_np.shape}")
+
+        except MemoryError as e:
+            print(f"\nMemoryError during CPU Brute Force k-NN: {e}")
+            true_knn_indices_np = None # Prevent recall
+        except Exception as e:
+            print(f"\nError during CPU Brute Force k-NN execution: {e}")
+            traceback.print_exc()
+            true_knn_indices_np = None # Prevent recall
+        finally:
+             if 'true_knn_dists_sq_np' in locals(): del true_knn_dists_sq_np # Clear dists
+
+    # --- Calculate Recall ---
+    if ann_indices_np is not None and true_knn_indices_np is not None:
+        print("\n" + "="*60)
+        print(f"Calculating Recall@{K_final_neighbors}...")
+        print("="*60)
+
+        try:
+            total_intersect = 0
+            # Calculate expected neighbors, accounting for N_A
+            expected_neighbors_per_query = min(K_final_neighbors, N_data)
+
+            if N_queries > 0 and expected_neighbors_per_query > 0:
+                for i in range(N_queries):
+                    # Filter out potential -1 padding
+                    ann_set = set(idx for idx in ann_indices_np[i] if idx >= 0)
+                    true_set = set(idx for idx in true_knn_indices_np[i] if idx >= 0)
+                    total_intersect += len(ann_set.intersection(true_set))
+
+                denominator = N_queries * expected_neighbors_per_query
+                avg_recall = total_intersect / denominator if denominator > 0 else 1.0
+
+                print(f"\nAverage Recall @ {K_final_neighbors} (vs {expected_neighbors_per_query} possible): {avg_recall:.4f} ({avg_recall:.2%})")
+
+                if avg_recall >= RECALL_THRESHOLD:
+                    print(f"Recall meets the threshold ({RECALL_THRESHOLD:.2%}). Result CORRECT.")
+                else:
+                    print(f"Recall is BELOW the threshold ({RECALL_THRESHOLD:.2%}). Result INCORRECT.")
+                    # Suggestions specific to IVF-like ANN
+                    print("Suggestions to improve recall:")
+                    print(f" - Increase `num_clusters_to_probe` (currently {num_clusters_probe}).")
+                    print(f" - Increase `num_clusters_kmeans` (currently {num_clusters_kmeans}).")
+            else:
+                print("\nCannot calculate recall (N_queries=0 or K_final=0 or N_A=0).")
+
+        except Exception as e:
+            print(f"\nError during Recall calculation: {e}")
+            traceback.print_exc()
+
+    elif ann_indices_np is None:
+         print("\nSkipping Recall: ANN execution failed or produced None.")
+    elif true_knn_indices_np is None:
+         print("\nSkipping Recall: CPU Brute Force k-NN failed or produced None.")
+
+    print("\n--- CPU Execution Finished ---")
+
+    # Clean up large arrays
+    del A_data_np
+    del X_queries_np
+    if 'ann_indices_np' in locals(): del ann_indices_np
+    if 'ann_dists_sq_np' in locals(): del ann_dists_sq_np
+    if 'true_knn_indices_np' in locals(): del true_knn_indices_np
+    print("Cleaned up NumPy arrays.")
