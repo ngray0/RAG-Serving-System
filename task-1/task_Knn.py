@@ -993,127 +993,114 @@ def our_knn_stream2(N, D, A, X, K):
     return results if B > 1 else results[0]
 
 
-def our_knn_stream(N, D, A, X, K, N_TILE=8192):
+def our_knn_stream(N, D, A, X, K):
     """
-    Performs KNN search using CuPy CUDA Streams and database tiling for memory efficiency.
-    It processes one query per stream and iterates through tiles of the database,
-    maintaining the top K results incrementally for each query.
+    Performs KNN search using CuPy CUDA Streams.
+    Each stream processes one query, calculating all distances to the database A
+    at once and then finding the top K.
 
     Args:
         N (int): Number of database points (A.shape[0]).
         D (int): Dimensionality (A.shape[1]).
         A (cp.ndarray): Database vectors (N, D) on GPU, float32.
-        X (cp.ndarray): Query vectors (Q, D) on GPU, float32.
+        X (cp.ndarray): Query vectors (Q, D) or (D,) on GPU, float32.
         K (int): Number of neighbors to find.
-        N_TILE (int): Tile size for processing the database (N dimension).
-                      Adjust based on GPU memory and K. Affects intermediate
-                      memory usage (K + N_TILE).
 
     Returns:
         list[cp.ndarray] or cp.ndarray:
-            List containing the indices (int64) of the K nearest neighbors for each query,
-            or a single array if Q=1. Each array shape is (K,).
-            Returns indices sorted by distance (ascending).
+            List containing the indices (int64) of the K nearest neighbors
+            for each query, or a single array if Q=1. Each array shape is (K,).
+            Returns indices sorted by distance (ascending for L2/Cosine/Manhattan).
     """
-    # Ensure A and X are CuPy arrays and float32
+    # --- Input Validation & Preparation ---
     if not isinstance(A, cp.ndarray): A = cp.asarray(A, dtype=cp.float32)
     elif A.dtype != cp.float32: A = A.astype(cp.float32)
     if not isinstance(X, cp.ndarray): X = cp.asarray(X, dtype=cp.float32)
     elif X.dtype != cp.float32: X = X.astype(cp.float32)
 
-    # --- Input Validation ---
     if A.shape[0] != N or A.shape[1] != D:
         print(f"Warning: Database A shape {A.shape} does not match N={N}, D={D}. Using A.shape.")
         N, D = A.shape
     if X.ndim == 0 or X.shape[-1] != D:
         raise ValueError(f"Query X feature dimension {X.shape[-1]} does not match D={D}")
 
-    Q = X.shape[0] if X.ndim > 1 else 1
-    if Q == 0: return [] # Handle empty query batch
+    Q = X.shape[0] if X.ndim == 2 else 1
+    if Q == 0: return []
 
-    print(f"Running Tiled KNN Stream: Q={Q}, N={N}, D={D}, K={K}, N_TILE={N_TILE}")
+    print(f"Running Optimized KNN Stream: Q={Q}, N={N}, D={D}, K={K} (Using L2 distance)") # Specify distance
 
     streams = [cp.cuda.Stream() for _ in range(Q)]
-    results = [None] * Q # To store final indices for each query
+    results_indices = [None] * Q  # To store final indices
+    results_distances = [None] * Q # Optionally store distances too
 
     actual_k = min(K, N)
-    if actual_k <= 0: # Handles K<=0 or N=0
+    if actual_k <= 0:
         empty_result = cp.array([], dtype=cp.int64)
         return [empty_result] * Q if Q > 1 else empty_result
 
+    # --- Process each query in its own stream ---
     for i in range(Q):
-        # Assign work to the stream for query i
         with streams[i]:
-            # Extract the query, ensure it's 2D (1, D)
-            query = X[i] if X.ndim > 1 else X
+            # Get query, ensure it's 2D (1, D) for pairwise distance functions
+            query = X[i] if X.ndim == 2 else X
             query_2d = query.reshape(1, D)
 
-            # --- Initialize Top-K storage on GPU for this query ---
-            # Store indices and corresponding squared distances
-            current_top_indices = cp.full(actual_k, -1, dtype=cp.int64)
-            current_top_dists = cp.full(actual_k, cp.inf, dtype=cp.float32)
-            num_valid_in_topk = 0 # Track how many actual points we have initially
+            # 1. Calculate ALL distances for this query against the entire database A
+            #    Assuming distance_l22 returns SQUARED L2 distances
+            #    Output shape: (1, N) -> Squeeze to (N,)
+            try:
+                # Using distance_l22 as the original code did for the tile
+                all_dists_sq = distance_l22(query_2d, A)[0] # Shape (N,)
+            except Exception as e:
+                 print(f"Error calculating distances in stream {i}: {e}")
+                 # Handle error appropriately, maybe store None or raise
+                 all_dists_sq = None # Mark as failed
 
-            # --- Iterate through database tiles ---
-            for n_start in range(0, N, N_TILE):
-                n_end = min(n_start + N_TILE, N)
-                curr_N = n_end - n_start
-                if curr_N <= 0: continue
+            if all_dists_sq is not None and all_dists_sq.size == N: # Check if distance calc succeeded
+                # 2. Find the indices of the K smallest distances
+                if actual_k == N:
+                    # If K >= N, we need all indices, just sort them
+                    k_indices_unsorted = cp.arange(N, dtype=cp.int64)
+                elif actual_k > 0 :
+                    # Use argpartition for efficiency when K < N
+                    # kth is 0-based, so find up to index K-1
+                    kth = actual_k - 1
+                    k_indices_unsorted = cp.argpartition(all_dists_sq, kth=kth)[:actual_k]
+                else: # actual_k is 0
+                    k_indices_unsorted = cp.array([], dtype=cp.int64)
 
-                A_chunk_n = A[n_start:n_end] # Shape: (curr_N, D)
 
-                # Calculate squared L2 distances for this tile
-                # Uses non-tiled version as (1, curr_N) should fit memory
-                dist_sq_tile = distance_l22(query_2d, A_chunk_n)[0] # Shape: (curr_N,)
+                # 3. Sort the results *within* the top K found by argpartition
+                if k_indices_unsorted.size > 0:
+                    # Get the distances corresponding to the unsorted top-K indices
+                    topk_dists_unsorted = all_dists_sq[k_indices_unsorted]
+                    # Find the sort order based on these distances
+                    sort_order_in_k = cp.argsort(topk_dists_unsorted)
+                    # Apply the sort order to the indices and distances
+                    final_indices = k_indices_unsorted[sort_order_in_k]
+                    final_distances = topk_dists_unsorted[sort_order_in_k] # Store sorted distances
+                else:
+                    final_indices = cp.array([], dtype=cp.int64)
+                    final_distances = cp.array([], dtype=cp.float32)
 
-                # Get original indices for this tile
-                n_indices_tile = cp.arange(n_start, n_end, dtype=cp.int64) # Shape: (curr_N,)
+                results_indices[i] = final_indices.astype(cp.int64) # Ensure int64
+                results_distances[i] = final_distances # Store the distances
+            else:
+                # Handle distance calculation failure for this query
+                 results_indices[i] = cp.array([-1]*actual_k, dtype=cp.int64) # Or some other indicator
+                 results_distances[i] = cp.array([cp.inf]*actual_k, dtype=cp.float32)
 
-                # --- Update Top-K using concatenation and partitioning ---
-                # Combine current best K with new candidates from the tile
-                combined_dists = cp.concatenate((current_top_dists, dist_sq_tile))
-                combined_indices = cp.concatenate((current_top_indices, n_indices_tile))
 
-                # Find the best K among the combined candidates
-                # Need to handle the initial phase where we have fewer than K candidates
-                num_combined = combined_dists.size
-                k_to_find = min(actual_k, num_combined)
-
-                if k_to_find > 0:
-                    # Use argpartition to find the indices of the smallest k_to_find distances
-                    # Note: kth is 0-based index
-                    kth = k_to_find - 1
-                    part_indices = cp.argpartition(combined_dists, kth=kth)[:k_to_find]
-
-                    # Update the current best K distances and indices
-                    current_top_dists = combined_dists[part_indices]
-                    current_top_indices = combined_indices[part_indices]
-                    num_valid_in_topk = k_to_find # Update the count
-
-                # Explicitly delete intermediate arrays for this tile if memory is tight
-                # del dist_sq_tile, n_indices_tile, combined_dists, combined_indices, part_indices
-
-            # --- Final Sort ---
-            # After processing all tiles, the current_top_dists/indices hold the best K (unsorted)
-            # Sort the final K results by distance
-            if num_valid_in_topk > 0:
-                 sort_order = cp.argsort(current_top_dists)
-                 final_top_indices = current_top_indices[sort_order]
-            else: # Handle cases where N=0 or no valid distances were found
-                 final_top_indices = cp.array([], dtype=cp.int64) # Should already be size actual_k if N>0
-
-            # Store the final sorted indices for this query
-            results[i] = final_top_indices
-
-            # Explicitly delete per-query arrays (optional, stream context might handle it)
-            # del query_2d, current_top_indices, current_top_dists, final_top_indices, sort_order
-
-    # Wait for all streams to finish
+    # --- Wait for all streams to complete ---
     for s in streams:
         s.synchronize()
 
-    # Return list of results or single result
-    return results if Q > 1 else results[0]
+    # --- Return results ---
+    # Decide if you need indices, distances, or both
+    # Returning only indices for compatibility with original function signature
+    return results_indices if Q > 1 else results_indices[0]
+
+    # Or retu
 
 
 # ============================================================================
