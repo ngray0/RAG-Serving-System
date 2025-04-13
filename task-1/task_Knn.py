@@ -426,10 +426,73 @@ def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
     # print(f"CuPy Pairwise Dot: {X_cp.shape} @ {Y_cp.T.shape}")
     return cp.matmul(X_cp, Y_cp.T) # (Q, D) @ (D, N) -> (Q, N)
 
-def distance_l22(X, Y): # Corrected: Pairwise SQUARED L2
-    """ Calculates pairwise SQUARED L2 distance using CuPy. """
-    # Reuse the optimized squared L2 logic
-    return pairwise_l2_squared_cupy(X, Y)
+def distance_l22(X, Y, Q_TILE=1024, N_TILE=1024): # Tile sizes, tune as needed
+    """ Calculates pairwise SQUARED L2 distance using CuPy with tiling. """
+    X_cp = cp.asarray(X, dtype=cp.float32)
+    Y_cp = cp.asarray(Y, dtype=cp.float32)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :]
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
+
+    Q, D = X_cp.shape
+    N = Y_cp.shape[0]
+    if D != Y_cp.shape[1]: raise ValueError(f"Dimension mismatch: X({D}) vs Y({N},{Y_cp.shape[1]})")
+    if Q == 0 or N == 0: return cp.empty((Q,N), dtype=cp.float32)
+
+    # print(f"CuPy Pairwise L2 Squared (Tiled): Shapes {X_cp.shape}, {Y_cp.shape}")
+    l2_dist_sq = cp.empty((Q, N), dtype=cp.float32)
+
+    # Precompute Y norms (can do this once)
+    Y_norm_sq_full = cp.sum(Y_cp**2, axis=1) # Shape (N,)
+
+    for q_start in range(0, Q, Q_TILE):
+        q_end = min(q_start + Q_TILE, Q)
+        X_chunk_q = X_cp[q_start:q_end] # Shape (curr_Q, D)
+        curr_Q = X_chunk_q.shape[0]
+        if curr_Q == 0: continue
+
+        # Precompute X norms for the current chunk
+        X_norm_sq_chunk = cp.sum(X_chunk_q**2, axis=1)[:, None] # Shape (curr_Q, 1)
+
+        for n_start in range(0, N, N_TILE):
+            n_end = min(n_start + N_TILE, N)
+            Y_chunk_n = Y_cp[n_start:n_end] # Shape (curr_N, D)
+            Y_norm_sq_chunk = Y_norm_sq_full[n_start:n_end][None, :] # Shape (1, curr_N)
+            curr_N = Y_chunk_n.shape[0]
+            if curr_N == 0: continue
+
+            # Calculate dot products for the tile: (curr_Q, D) @ (D, curr_N) -> (curr_Q, curr_N)
+            try:
+                dot_products_tile = cp.matmul(X_chunk_q, Y_chunk_n.T)
+
+                # Calculate squared L2 distance for the tile using broadcasting
+                # Shapes: (curr_Q, 1) - 2 * (curr_Q, curr_N) + (1, curr_N) -> (curr_Q, curr_N)
+                dist_sq_tile = X_norm_sq_chunk - 2 * dot_products_tile + Y_norm_sq_chunk
+                dist_sq_tile = cp.maximum(0.0, dist_sq_tile) # Ensure non-negative
+
+                # Store result in the output matrix slice
+                l2_dist_sq[q_start:q_end, n_start:n_end] = dist_sq_tile
+
+                # Optional: Clean up intermediate tile explicitly
+                del dot_products_tile, dist_sq_tile
+
+            except cp.cuda.memory.OutOfMemoryError:
+                print(f"\n--- OOM Error even within L2 tile (D={D}, Tile={curr_Q}x{curr_N}) ---")
+                print(f"--- Try reducing Q_TILE/N_TILE in distance_l22 definition ---")
+                l2_dist_sq[q_start:q_end, n_start:n_end] = cp.inf
+                cp.get_default_memory_pool().free_all_blocks() # Attempt cleanup
+                # Decide whether to continue or raise the error further
+                # For benchmarking, filling with inf might be okay to proceed
+                continue
+
+            # Optional: Free memory more aggressively if needed
+            # cp.get_default_memory_pool().free_all_blocks()
+
+    # Clean up precomputed norms
+    del Y_norm_sq_full, X_norm_sq_chunk # Ensure cleanup happens outside inner loops where possible
+    # cp.get_default_memory_pool().free_all_blocks() # Final cleanup
+
+    return l2_dist_sq
+
 
 def distance_cosine2(X, Y, epsilon=1e-8): # Corrected: Pairwise Cosine Distance
     """ Calculates pairwise cosine distance (1 - similarity) using CuPy. """
@@ -1010,16 +1073,16 @@ def our_knn_stream(N, D, A, X, K):
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data = 4000000 # Using 4 Million points
-    N_queries = 1     # Using 1 query as per your last log
+    N_data = 1000000 # Using 4 Million points
+    N_queries = 1000     # Using 1 query as per your last log
     K_val = 10          # K for KNN
     NUM_RUNS = 2       # Number of timed runs for averaging
     WARMUP_RUNS = 1     # Number of warm-up runs
     # --- CPU BENCHMARKING FLAG ---
-    BENCHMARK_CPU = True # Set to False to skip CPU tests (can be slow)
+    BENCHMARK_CPU = False # Set to False to skip CPU tests (can be slow)
 
     # --- Dimensions to Test ---
-    dimensions_to_test = [1024]
+    dimensions_to_test = [2,2,4,64,256,1024]
 
     # --- Tolerance for Numerical Check ---
     rtol_check = 1e-4
