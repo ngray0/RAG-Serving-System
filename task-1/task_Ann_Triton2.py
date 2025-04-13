@@ -573,13 +573,13 @@ def pytorch_knn_bruteforce(N_A, D, A, X, K, batch_size_q=256):
 # ============================================================================
 if __name__ == "__main__":
     # --- Fixed Parameters ---
-    N_data = 1000000    # Database size
+    N_data = 100000    # Database size
     # Dim will be set in the loop # Dim = 128
     N_queries = 1000     # Queries
     K_final_neighbors = 10 # Final K for output
 
     # ANN Parameters
-    num_clusters_kmeans = 2000 # K for KMeans (Step 1)
+    num_clusters_kmeans = 5000 # K for KMeans (Step 1)
     num_clusters_probe = 15   # K1 (nprobe) for cluster probing (Step 2)
     kmeans_max_iters = 100      # Max iterations for KMeans
 
