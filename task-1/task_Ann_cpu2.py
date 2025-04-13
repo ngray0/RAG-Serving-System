@@ -2,58 +2,6 @@ import numpy as np
 import time
 import traceback # For error printing
 
-# ============================================================================
-# CPU Helper Function (Pairwise Squared L2 Distance - Provided by User)
-# ============================================================================
-
-def pairwise_l2_squared_numpy(X_np, C_np):
-    """
-    Computes pairwise **squared** L2 distances using NumPy.
-    X_np: (N, D) data points OR (Q, D) query points (NumPy array)
-    C_np: (K, D) centroids OR (N, D) database points (NumPy array)
-    Returns: (N|Q, K|N) NumPy array of SQUARED distances.
-    """
-    # Ensure inputs are NumPy arrays and float32
-    if not isinstance(X_np, np.ndarray): X_np = np.asarray(X_np, dtype=np.float32)
-    elif X_np.dtype != np.float32: X_np = X_np.astype(np.float32)
-    if not isinstance(C_np, np.ndarray): C_np = np.asarray(C_np, dtype=np.float32)
-    elif C_np.dtype != np.float32: C_np = C_np.astype(np.float32)
-
-    if X_np.ndim == 1: X_np = X_np[np.newaxis, :] # Ensure X is 2D
-    if C_np.ndim == 1: C_np = C_np[np.newaxis, :] # Ensure C is 2D
-
-    # Handle empty inputs gracefully
-    if X_np.shape[0] == 0 or C_np.shape[0] == 0:
-        return np.empty((X_np.shape[0], C_np.shape[0]), dtype=np.float32)
-
-    # Check dimension compatibility AFTER ensuring 2D and non-empty
-    if X_np.shape[1] != C_np.shape[1]:
-        raise ValueError(f"Dimension mismatch: X_np has D={X_np.shape[1]}, C_np has D={C_np.shape[1]}")
-
-    # ||x - c||^2 = ||x||^2 - 2<x, c> + ||c||^2
-    try:
-        X_norm_sq = np.einsum('ij,ij->i', X_np, X_np)[:, np.newaxis] # Shape (N|Q, 1)
-        C_norm_sq = np.einsum('ij,ij->i', C_np, C_np)[np.newaxis, :] # Shape (1, K|N)
-        # Use np.dot for matrix multiplication
-        dot_products = np.dot(X_np, C_np.T) # Shape (N|Q, K|N)
-
-        # Broadcasting: (N|Q, 1) + (1, K|N) - 2*(N|Q, K|N) -> (N|Q, K|N)
-        dist_sq = X_norm_sq + C_norm_sq - 2 * dot_products
-        return np.maximum(0.0, dist_sq) # Clamp numerical negatives
-
-    except MemoryError as e:
-        print(f"MemoryError in pairwise_l2_squared_numpy: Shapes X={X_np.shape}, C={C_np.shape}")
-        dot_prod_mem_gb = X_np.shape[0] * C_np.shape[0] * 4 / (1024**3) # GB
-        print(f"Estimated memory for dot product matrix: {dot_prod_mem_gb:.2f} GB")
-        raise e # Re-raise the exception
-    except Exception as e:
-        print(f"Error in pairwise_l2_squared_numpy: {e}")
-        raise e
-
-
-Python
-import numpy as np
-import time
 
 # ============================================================================
 # CPU Helper Function (Pairwise Squared L2 Distance - Required by KMeans)
