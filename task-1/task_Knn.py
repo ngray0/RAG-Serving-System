@@ -909,7 +909,7 @@ def our_knn(N_A, D, A, X, K):
 
     # 1. Calculate all pairwise squared L2 distances
     #    distance_l2 returns squared L2 distances
-    all_distances = distance_dot_tiled(X_prep, A_prep, prep = False) # Shape (Q, N_A)
+    all_distances = distance_l2(X_prep, A_prep) # Shape (Q, N_A)
     #all_distances = distance_dot(X_prep, A_prep)
     # 2. Find the top K smallest distances for each query
     #    largest=False gives smallest distances (nearest neighbors)
@@ -1085,7 +1085,7 @@ def our_knn_stream(N, D, A, X, K):
             # Calculate raw dot products (similarities) using the specified function
             # Input shapes: query_2d (1, D), A (N, D)
             # Output shape: raw_dot_products (1, N)
-            raw_dot_products = distance_dot3(query_2d, A)
+            raw_dot_products = distance_l22(query_2d, A)
 
             # We have scores for one query vs all dataset points, shape (1, N).
             # Get the 1D array of scores (shape N,)
@@ -1149,7 +1149,7 @@ def our_knn_stream(N, D, A, X, K):
 if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 1000000 # Using 4 Million points
-    N_queries = 10000     # Using 1 query as per your last log
+    N_queries = 1000     # Using 1 query as per your last log
     K_val = 10          # K for KNN
     NUM_RUNS = 2       # Number of timed runs for averaging
     WARMUP_RUNS = 1     # Number of warm-up runs
