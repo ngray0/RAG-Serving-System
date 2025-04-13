@@ -575,11 +575,11 @@ if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 1000000    # Database size
     # Dim will be set in the loop # Dim = 128
-    N_queries = 1     # Queries
-    K_final_neighbors = 10 # Final K for output
+    N_queries = 1000     # Queries
+    K_final_neighbors = 100 # Final K for output
 
     # ANN Parameters
-    num_clusters_kmeans = 1000  # K for KMeans (Step 1)
+    num_clusters_kmeans = 500  # K for KMeans (Step 1)
     num_clusters_probe = 80    # K1 (nprobe) for cluster probing (Step 2)
     kmeans_max_iters = 50      # Max iterations for KMeans
 
@@ -587,7 +587,7 @@ if __name__ == "__main__":
     RECALL_THRESHOLD = 0.70
 
     # Dimensions to test
-    dimensions_to_test = [2, 2,4, 4, 64, 256, 1024]
+    dimensions_to_test = [2,2, 2, 4,4, 4, 64, 256, 1024]
 
     print("\n" + "="*60)
     print("--- Triton/PyTorch ANN Full Test ---")

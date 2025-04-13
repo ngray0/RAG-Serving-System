@@ -774,12 +774,12 @@ if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 1000000    # Database size
     # Dim will be set in the loop
-    N_queries = 1      # Queries
-    K_final_neighbors = 10 # Final K for output
+    N_queries = 1000      # Queries
+    K_final_neighbors = 100 # Final K for output
 
     # ANN Parameters
-    num_clusters_kmeans = 1000  # K for KMeans (Step 1)
-    num_clusters_probe = 400    # K1 (nprobe) for cluster probing (Step 2)
+    num_clusters_kmeans = 500  # K for KMeans (Step 1)
+    num_clusters_probe = 100    # K1 (nprobe) for cluster probing (Step 2)
     kmeans_max_iters = 50      # Max iterations for KMeans
 
     # Recall threshold
