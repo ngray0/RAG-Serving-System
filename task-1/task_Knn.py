@@ -425,7 +425,25 @@ def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
     if X_cp.shape[1] != Y_cp.shape[1]: raise ValueError("Dimension mismatch for dot product")
     # print(f"CuPy Pairwise Dot: {X_cp.shape} @ {Y_cp.T.shape}")
     return cp.matmul(X_cp, Y_cp.T) # (Q, D) @ (D, N) -> (Q, N)
-    
+
+def distance_l223(X, Y):
+    # --- Input Handling & Optimization ---
+    X_cp = cp.asarray(X, dtype=cp.float32)
+    Y_cp = cp.asarray(Y, dtype=cp.float32)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :]
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
+    Q, D = X_cp.shape
+    N, D_Y = Y_cp.shape
+    if D != D_Y: raise ValueError(f"Dimension mismatch: X({D}) vs Y({D_Y})")
+    if Q == 0 or N == 0: return cp.empty((Q, N), dtype=cp.float32)
+    # --- Optimized Calculation ---
+    X_norm_sq = cp.sum(cp.square(X_cp), axis=1, keepdims=True) # Shape: (Q, 1)
+    Y_norm_sq = cp.sum(cp.square(Y_cp), axis=1)              # Shape: (N,)
+    dot_prods = cp.matmul(X_cp, Y_cp.T)                     # Shape: (Q, N)
+    dist_sq = X_norm_sq - 2 * dot_prods
+    dist_sq += Y_norm_sq[None, :]                           # Shape: (Q, N)
+    return cp.maximum(0.0, dist_sq)
+
 def distance_l22(X, Y, Q_TILE=1024, N_TILE=4096): # Tile sizes, can be tuned
     """
     Calculates pairwise SQUARED L2 distance using CuPy with tiling
@@ -519,7 +537,6 @@ def distance_l22(X, Y, Q_TILE=1024, N_TILE=4096): # Tile sizes, can be tuned
     del norm_Y_sq_full
 
     return dist_sq_total
-
 def distance_cosine2(X, Y, Q_TILE=1024, N_TILE=1024, epsilon=1e-8): # Add tile sizes
     """ Calculates pairwise cosine distance (1 - similarity) using CuPy with tiling. """
     X_cp = cp.asarray(X, dtype=cp.float32)
@@ -1203,7 +1220,7 @@ def our_knn_stream(N, D, A, X, K):
 if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 1000000 # Using 4 Million points
-    N_queries = 1000     # Using 1 query as per your last log
+    N_queries = 1    # Using 1 query as per your last log
     K_val = 10          # K for KNN
     NUM_RUNS = 2       # Number of timed runs for averaging
     WARMUP_RUNS = 1     # Number of warm-up runs
