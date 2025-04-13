@@ -639,14 +639,14 @@ if __name__ == "__main__":
     # are present above this block.
 
     # --- Parameters ---
-    N_data = 100_000       # Smaller N for faster CPU testing
+    N_data = 1000000       # Smaller N for faster CPU testing
     Dim = 64              # Smaller Dim for faster CPU testing
-    N_queries = 1_000       # Fewer queries for faster CPU testing
+    N_queries = 10000       # Fewer queries for faster CPU testing
     K_final_neighbors = 10  # Final number of neighbors to find
 
     # ANN Parameters
     num_clusters_kmeans = 500  # K for KMeans
-    num_clusters_probe = 20    # K1 (nprobe)
+    num_clusters_probe = 300    # K1 (nprobe)
     kmeans_max_iters = 50      # Max iterations for KMeans
 
     # Recall threshold
