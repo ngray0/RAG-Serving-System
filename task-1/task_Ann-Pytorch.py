@@ -476,7 +476,7 @@ if __name__ == "__main__":
     N_data = 1000000
     N_queries = 1000
     K_final_neighbors = 10
-    num_clusters_kmeans = 50000
+    num_clusters_kmeans = 2500
     num_clusters_probe = 3 # Keeping increased probe
     kmeans_max_iters = 100
     RECALL_THRESHOLD = 0.70
