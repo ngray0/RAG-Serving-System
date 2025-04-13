@@ -491,7 +491,7 @@ def ann_user_pseudocode_ivf_like_triton(
 
     # Find unique cluster IDs present and their counts/first occurrences
     # unique_consecutive returns unique values, inverse indices, and counts
-    unique_clusters, _, cluster_counts = torch.unique_consecutive(sorted_assignments, return_inverse=False, return_counts=True)
+    unique_clusters, cluster_counts = torch.unique_consecutive(sorted_assignments, return_inverse=False, return_counts=True)
 
     # Calculate start indices: cumulative sum of counts of *previous* clusters
     cluster_starts = torch.zeros_like(cluster_counts)
@@ -666,13 +666,18 @@ def ann_user_pseudocode_ivf_like_triton(
 # Brute-Force k-NN (PyTorch/Triton Version)
 # ============================================================================
 
-def pytorch_knn_bruteforce(N_A, D, A, X, K):
+# ============================================================================
+# Brute-Force k-NN (PyTorch/Triton Version - MODIFIED WITH QUERY BATCHING)
+# ============================================================================
+
+def pytorch_knn_bruteforce(N_A, D, A, X, K, batch_size_q=256): # Add batch_size_q parameter
     """
-    Finds the K nearest neighbors using brute-force PyTorch/Triton distance.
+    Finds the K nearest neighbors using brute-force PyTorch/Triton distance
+    with query batching to handle large Q * N distance matrices.
     Returns original indices (int64) and SQUARED L2 distances (float32).
     Handles K > N_A by padding results.
     """
-    print(f"Running k-NN Brute Force (PyTorch/Triton)...")
+    print(f"Running k-NN Brute Force (PyTorch/Triton, Batched)...")
     A_prep = _prepare_tensors(A)
     X_prep = _prepare_tensors(X)
 
@@ -702,46 +707,84 @@ def pytorch_knn_bruteforce(N_A, D, A, X, K):
          return torch.empty((Q, 0), dtype=torch.int64, device=device), \
                 torch.empty((0, 0), dtype=torch.float32, device=device)
 
-    print(f"Params: Q={Q}, N={N_A}, D={D}, K={effective_K}")
+    print(f"Params: Q={Q}, N={N_A}, D={D}, K={effective_K}, BatchSize={batch_size_q}")
     start_time = time.time()
 
-    # Calculate SQUARED L2 distances
-    try:
-        all_distances_sq = distance_l2_squared_pytorch(X_prep, A_prep) # Shape (Q, N_A)
-    except RuntimeError as e: # Catch OOM
-         print(f"OOM Error during Brute Force distance calculation: {e}")
-         raise e
-    except Exception as e:
-         print(f"Error during Brute Force distance calculation: {e}")
-         raise e
+    # Pre-allocate result arrays on GPU
+    all_topk_indices = torch.full((Q, effective_K), -1, dtype=torch.int64, device=device)
+    all_topk_distances_sq = torch.full((Q, effective_K), float('inf'), dtype=torch.float32, device=device)
 
+    # --- Batch Processing Loop ---
+    for q_start in range(0, Q, batch_size_q):
+        q_end = min(q_start + batch_size_q, Q)
+        batch_q_indices = slice(q_start, q_end) # Slice for indexing results
+        X_batch = X_prep[batch_q_indices]       # Current batch of queries
+        current_batch_size = X_batch.shape[0]
+        if current_batch_size == 0: continue
 
-    # Find top K distances and indices using torch.topk
-    try:
-        topk_distances_sq, topk_indices = torch.topk(
-            all_distances_sq,
-            k=effective_K,
-            dim=1,          # Along the N_A dimension
-            largest=False,  # Find smallest distances
-            sorted=True     # Ensure results are sorted by distance
-        )
-    except Exception as e:
-         print(f"Error during Brute Force topk: {e}")
-         raise e
+        # print(f"  Processing query batch {q_start}-{q_end-1}...") # Optional progress
 
-    torch.cuda.synchronize(device=device) # Wait for topk
+        # Calculate SQUARED L2 distances for the current batch using the Triton-accelerated function
+        try:
+            # distance_l2_squared_pytorch uses Triton dot kernel inside
+            batch_distances_sq = distance_l2_squared_pytorch(X_batch, A_prep) # Shape (current_batch_size, N_A)
+        except RuntimeError as e: # Catch OOM
+            batch_mem_gb = current_batch_size * N_A * 4 / (1024**3)
+            print(f"OOM Error during Brute Force batch distance calculation (PyTorch/Triton):")
+            print(f"  Batch Q={current_batch_size}, N={N_A}. Estimated matrix memory: {batch_mem_gb:.2f} GB")
+            print(f"  Try reducing batch_size_q (current={batch_size_q}).")
+            torch.cuda.empty_cache() # Attempt to free memory
+            raise e # Re-raise
+        except Exception as e:
+            print(f"Error during Brute Force batch distance calculation: {e}")
+            raise e
+
+        # Find top K for the current batch using torch.topk
+        batch_topk_indices = None
+        batch_topk_distances_sq = None
+        try:
+            batch_topk_distances_sq, batch_topk_indices = torch.topk(
+                batch_distances_sq,
+                k=effective_K,
+                dim=1,          # Along the N_A dimension
+                largest=False,  # Find smallest distances
+                sorted=True     # Get them sorted
+            )
+        except Exception as e:
+            print(f"Error during Brute Force batch topk ({q_start}-{q_end-1}): {e}")
+            # Decide how to handle: continue or raise? Raise is safer for correctness.
+            raise e
+
+        # Store batch results in the main arrays
+        all_topk_indices[batch_q_indices] = batch_topk_indices
+        all_topk_distances_sq[batch_q_indices] = batch_topk_distances_sq
+
+        # Optional: Clear intermediate batch results
+        del batch_distances_sq, batch_topk_indices, batch_topk_distances_sq, X_batch
+        # torch.cuda.empty_cache() # Use cautiously inside loop, can hurt performance
+
+    # --- End Batch Loop ---
+
+    torch.cuda.synchronize(device=device) # Wait for all batches to finish
     end_time = time.time()
-    print(f"k-NN Brute Force (PyTorch/Triton) computation time: {end_time - start_time:.4f} seconds")
+    print(f"k-NN Brute Force (PyTorch/Triton, Batched) total computation time: {end_time - start_time:.4f} seconds")
 
     # Pad results if original K > effective_K (i.e., K > N_A)
     if K > effective_K:
         pad_width = K - effective_K
         indices_pad = torch.full((Q, pad_width), -1, dtype=torch.int64, device=device)
         dists_pad = torch.full((Q, pad_width), float('inf'), dtype=torch.float32, device=device)
-        topk_indices = torch.cat((topk_indices, indices_pad), dim=1)
-        topk_distances_sq = torch.cat((topk_distances_sq, dists_pad), dim=1)
+        # Ensure results are not None before padding (shouldn't be if checks passed)
+        if all_topk_indices is None: all_topk_indices = torch.full((Q, effective_K), -1, dtype=torch.int64, device=device)
+        if all_topk_distances_sq is None: all_topk_distances_sq = torch.full((Q, effective_K), float('inf'), dtype=torch.float32, device=device)
+        all_topk_indices = torch.cat((all_topk_indices, indices_pad), dim=1)
+        all_topk_distances_sq = torch.cat((all_topk_distances_sq, dists_pad), dim=1)
 
-    return topk_indices.to(torch.int64), topk_distances_sq
+    # Ensure final return types are correct
+    if all_topk_indices is None: all_topk_indices = torch.full((Q, K), -1, dtype=torch.int64, device=device)
+    if all_topk_distances_sq is None: all_topk_distances_sq = torch.full((Q, K), float('inf'), dtype=torch.float32, device=device)
+
+    return all_topk_indices.to(torch.int64), all_topk_distances_sq.to(torch.float32)
 
 
 # ============================================================================
