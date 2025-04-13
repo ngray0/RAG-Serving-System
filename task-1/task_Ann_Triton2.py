@@ -575,7 +575,7 @@ if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 1000000    # Database size
     # Dim will be set in the loop # Dim = 128
-    N_queries = 10000      # Queries
+    N_queries = 1     # Queries
     K_final_neighbors = 10 # Final K for output
 
     # ANN Parameters

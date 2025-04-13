@@ -637,7 +637,7 @@ if __name__ == "__main__":
     # Reduced N/Q for potentially faster CPU runs across multiple dimensions
     # Adjust these based on your CPU/RAM capabilities
     N_data = 1000000
-    N_queries = 10000
+    N_queries = 1
     K_final_neighbors = 10 # Final K for output
 
     # ANN Parameters
@@ -772,8 +772,6 @@ if __name__ == "__main__":
             if 'ann_indices_np' in locals(): del ann_indices_np
             if 'ann_dists_sq_np' in locals(): del ann_dists_sq_np
             if 'true_knn_indices_np' in locals(): del true_knn_indices_np
-            gc.collect() # Suggest garbage collection
-            print(f"[D={Dim}] Cleanup complete.")
 
         print(f"\n--- Finished Test for Dimension D = {Dim} ---")
 

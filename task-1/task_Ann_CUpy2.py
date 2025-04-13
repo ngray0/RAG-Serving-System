@@ -774,7 +774,7 @@ if __name__ == "__main__":
     # --- Fixed Parameters ---
     N_data = 1000000    # Database size
     # Dim will be set in the loop
-    N_queries = 10000      # Queries
+    N_queries = 1      # Queries
     K_final_neighbors = 10 # Final K for output
 
     # ANN Parameters
@@ -904,6 +904,7 @@ if __name__ == "__main__":
                 ann_indices = None; mempool.free_all_blocks(); pinned_mempool.free_all_blocks() # Prevent recall
             except Exception as e:
                 print(f"\n[D={Dim}] ERROR during ANN execution: {e}")
+                import traceback
                 traceback.print_exc(); ann_indices = None # Prevent recall
 
             # --- Run Brute-Force KNN for Current Dimension ---

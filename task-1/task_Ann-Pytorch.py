@@ -474,7 +474,7 @@ def pytorch_knn_bruteforce_native(N_A, D, A, X, K, batch_size_q=256): # Renamed 
 if __name__ == "__main__":
     # --- Fixed Parameters (Same as before) ---
     N_data = 1000000
-    N_queries = 10000
+    N_queries = 1
     K_final_neighbors = 10
     num_clusters_kmeans = 1000
     num_clusters_probe = 300 # Keeping increased probe
