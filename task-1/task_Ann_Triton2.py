@@ -580,7 +580,7 @@ if __name__ == "__main__":
 
     # ANN Parameters
     num_clusters_kmeans = 1000 # K for KMeans (Step 1)
-    num_clusters_probe = 200    # K1 (nprobe) for cluster probing (Step 2)
+    num_clusters_probe = 30   # K1 (nprobe) for cluster probing (Step 2)
     kmeans_max_iters = 100      # Max iterations for KMeans
 
     # Recall threshold
