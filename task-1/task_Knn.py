@@ -426,7 +426,7 @@ def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
     # print(f"CuPy Pairwise Dot: {X_cp.shape} @ {Y_cp.T.shape}")
     return cp.matmul(X_cp, Y_cp.T) # (Q, D) @ (D, N) -> (Q, N)
 
-def distance_l22(X, Y, Q_TILE=512, N_TILE=512): # Tile sizes, tune as needed
+def distance_l22(X, Y, Q_TILE=4000, N_TILE=4000): # Tile sizes, tune as needed
     """ Calculates pairwise SQUARED L2 distance using CuPy with tiling. """
     X_cp = cp.asarray(X, dtype=cp.float32)
     Y_cp = cp.asarray(Y, dtype=cp.float32)
