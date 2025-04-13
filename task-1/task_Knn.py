@@ -426,72 +426,69 @@ def distance_dot2(X, Y): # Corrected: Pairwise Dot Product
     # print(f"CuPy Pairwise Dot: {X_cp.shape} @ {Y_cp.T.shape}")
     return cp.matmul(X_cp, Y_cp.T) # (Q, D) @ (D, N) -> (Q, N)
 
-def distance_l22(X, Y, Q_TILE=4000, N_TILE=4000): # Tile sizes, tune as needed
-    """ Calculates pairwise SQUARED L2 distance using CuPy with tiling. """
+def distance_l2(X, Y):
+    """
+    Computes pairwise SQUARED L2 distances using CuPy, optimized for speed
+    assuming the intermediate (Q, N) matrices fit in GPU memory.
+    *** Does NOT use tiling - high risk of OutOfMemoryError for large Q*N. ***
+
+    Args:
+        X (cp.ndarray or array-like): Query vectors, shape (Q, D).
+        Y (cp.ndarray or array-like): Database vectors, shape (N, D).
+
+    Returns:
+        cp.ndarray: Pairwise squared L2 distances, shape (Q, N).
+
+    Raises:
+        cupy.cuda.memory.OutOfMemoryError: If intermediate (Q, N) arrays are too large.
+        ValueError: If input dimensions mismatch.
+    """
+    # --- Input Handling & Optimization ---
+    # Ensure CuPy arrays and optimal dtype (float32)
+    # Using .asarray avoids copying if already a cupy array of correct type
     X_cp = cp.asarray(X, dtype=cp.float32)
     Y_cp = cp.asarray(Y, dtype=cp.float32)
-    if X_cp.ndim == 1: X_cp = X_cp[None, :]
-    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :]
+
+    # Ensure 2D inputs (handle cases where Q=1 or N=1 passed as 1D)
+    if X_cp.ndim == 1: X_cp = X_cp[None, :] # Reshape (D,) to (1, D)
+    if Y_cp.ndim == 1: Y_cp = Y_cp[None, :] # Reshape (D,) to (1, D)
 
     Q, D = X_cp.shape
-    N = Y_cp.shape[0]
-    if D != Y_cp.shape[1]: raise ValueError(f"Dimension mismatch: X({D}) vs Y({N},{Y_cp.shape[1]})")
-    if Q == 0 or N == 0: return cp.empty((Q,N), dtype=cp.float32)
+    N, D_Y = Y_cp.shape
+    if D != D_Y:
+        raise ValueError(f"Dimension mismatch: X({D}) vs Y({D_Y})")
+    if Q == 0 or N == 0:
+        return cp.empty((Q, N), dtype=cp.float32) # Handle empty inputs
 
-    # print(f"CuPy Pairwise L2 Squared (Tiled): Shapes {X_cp.shape}, {Y_cp.shape}")
-    l2_dist_sq = cp.empty((Q, N), dtype=cp.float32)
+    # Optional: Ensure contiguity (can sometimes help matmul slightly, but CuPy often handles it)
+    # if not X_cp.flags.c_contiguous: X_cp = cp.ascontiguousarray(X_cp)
+    # if not Y_cp.flags.c_contiguous: Y_cp = cp.ascontiguousarray(Y_cp)
 
-    # Precompute Y norms (can do this once)
-    Y_norm_sq_full = cp.sum(Y_cp**2, axis=1) # Shape (N,)
+    # --- Optimized Calculation: ||x-y||^2 = ||x||^2 - 2<x,y> + ||y||^2 ---
 
-    for q_start in range(0, Q, Q_TILE):
-        q_end = min(q_start + Q_TILE, Q)
-        X_chunk_q = X_cp[q_start:q_end] # Shape (curr_Q, D)
-        curr_Q = X_chunk_q.shape[0]
-        if curr_Q == 0: continue
+    # 1. Calculate squared norms efficiently
+    # keepdims=True for X helps with broadcasting later
+    X_norm_sq = cp.sum(cp.square(X_cp), axis=1, keepdims=True) # Shape: (Q, 1)
+    # Keep Y_norm_sq as (N,) - broadcasting addition is efficient
+    Y_norm_sq = cp.sum(cp.square(Y_cp), axis=1)              # Shape: (N,)
 
-        # Precompute X norms for the current chunk
-        X_norm_sq_chunk = cp.sum(X_chunk_q**2, axis=1)[:, None] # Shape (curr_Q, 1)
+    # 2. Calculate dot products using optimized matrix multiplication (GEMM)
+    # This is typically the most performance-critical step.
+    # X_cp: (Q, D), Y_cp.T: (D, N) -> dot_prods: (Q, N)
+    # This step allocates the potentially large (Q, N) dot product matrix.
+    dot_prods = cp.matmul(X_cp, Y_cp.T)
 
-        for n_start in range(0, N, N_TILE):
-            n_end = min(n_start + N_TILE, N)
-            Y_chunk_n = Y_cp[n_start:n_end] # Shape (curr_N, D)
-            Y_norm_sq_chunk = Y_norm_sq_full[n_start:n_end][None, :] # Shape (1, curr_N)
-            curr_N = Y_chunk_n.shape[0]
-            if curr_N == 0: continue
+    # 3. Combine terms using broadcasting. CuPy handles this efficiently,
+    # but intermediate arrays of shape (Q, N) might be allocated.
+    # Step 3a: -2 * dot_prods. This likely creates a temporary (Q, N) array.
+    # Step 3b: X_norm_sq - (2 * dot_prods). Broadcasting (Q, 1) with (Q, N). Another temp (Q, N).
+    # Step 3c: Add Y_norm_sq. Broadcasting (Q, N) with (N,). Final result (Q, N).
+    dist_sq = X_norm_sq - 2 * dot_prods
+    dist_sq += Y_norm_sq[None, :] # Efficient broadcasting addition
 
-            # Calculate dot products for the tile: (curr_Q, D) @ (D, curr_N) -> (curr_Q, curr_N)
-            try:
-                dot_products_tile = cp.matmul(X_chunk_q, Y_chunk_n.T)
-
-                # Calculate squared L2 distance for the tile using broadcasting
-                # Shapes: (curr_Q, 1) - 2 * (curr_Q, curr_N) + (1, curr_N) -> (curr_Q, curr_N)
-                dist_sq_tile = X_norm_sq_chunk - 2 * dot_products_tile + Y_norm_sq_chunk
-                dist_sq_tile = cp.maximum(0.0, dist_sq_tile) # Ensure non-negative
-
-                # Store result in the output matrix slice
-                l2_dist_sq[q_start:q_end, n_start:n_end] = dist_sq_tile
-
-                # Optional: Clean up intermediate tile explicitly
-                del dot_products_tile, dist_sq_tile
-
-            except cp.cuda.memory.OutOfMemoryError:
-                print(f"\n--- OOM Error even within L2 tile (D={D}, Tile={curr_Q}x{curr_N}) ---")
-                print(f"--- Try reducing Q_TILE/N_TILE in distance_l22 definition ---")
-                l2_dist_sq[q_start:q_end, n_start:n_end] = cp.inf
-                cp.get_default_memory_pool().free_all_blocks() # Attempt cleanup
-                # Decide whether to continue or raise the error further
-                # For benchmarking, filling with inf might be okay to proceed
-                continue
-
-            # Optional: Free memory more aggressively if needed
-            # cp.get_default_memory_pool().free_all_blocks()
-
-    # Clean up precomputed norms
-    del Y_norm_sq_full, X_norm_sq_chunk # Ensure cleanup happens outside inner loops where possible
-    # cp.get_default_memory_pool().free_all_blocks() # Final cleanup
-
-    return l2_dist_sq
+    # Ensure non-negative results due to potential floating-point inaccuracies
+    # cp.maximum is an elementwise operation, efficient.
+    return cp.maximum(0.0, dist_sq)
 
 
 def distance_cosine2(X, Y, Q_TILE=1024, N_TILE=1024, epsilon=1e-8): # Add tile sizes
