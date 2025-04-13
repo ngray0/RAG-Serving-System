@@ -8,7 +8,6 @@ import cupy as cp
 import cupyx # Required for cupyx.scatter_add
 import torch # Keep for device check or if HNSW part is used elsewhere
 
-# --- Device Setup ---
 pytorch_device = None
 if torch.cuda.is_available():
     pytorch_device = torch.device("cuda:0")
