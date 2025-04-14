@@ -1,44 +1,95 @@
-# Machine Learning Systems - 2024/2025
+# GPU-Accelerated Information Retrieval with Batched RAG Serving
 
-Welcome to the repository for the **Machine Learning Systems** course (INFR11269) for the **2024/2025** academic year. This course focuses on building and deploying machine learning systems, with hands-on programming tasks, paper writing, and peer reviews.
+This repository contains our implementation of a high-performance GPU-accelerated information retrieval system with a batch-oriented RAG (Retrieval-Augmented Generation) serving architecture. Our system achieves a maximum throughput of 23.67 requests/second on a single Nvidia Testla L4 GPU (batch size = 32) and offers support for scalable deployment and autoscaling with Kubernetes.
 
-The full course schedule, assessments, and additional details are available in the official course page:
+## Directory Structure
 
-[Machine Learning Systems - 2024/2025](http://www.drps.ed.ac.uk/24-25/dpt/cxinfr11269.htm)
+```
+ngray0-mls-g31/
+├── LICENSE
+├── task-1/                 # GPU-accelerated Information Retrieval (IR) implementations
+└── task-2/                 # Batched RAG Serving System
+    ├── Dockerfile          # Container definition for the RAG service
+    ├── Dockerfile.autoscaler  # Container definition for the autoscaler
+    ├── main.py             # Main application entry point
+    ├── requirements.txt    # Python dependencies
+    ├── benchmarks/         # Load testing and performance evaluation tools
+    │   ├── load_generator.py  # Async request generator for load testing
+    │   ├── load_test.sh    # Script to run load tests with increasing RPS
+    │   └── metrics/        # Performance metrics collection utilities
+    │       └── collector.py  # Records and analyzes request latencies
+    ├── data/               
+    ├── deployment/         # Kubernetes deployment configurations
+    │   ├── auto_scaler.py  # Horizontal pod autoscaler logic
+    │   ├── autoscaler.yaml # K8s autoscaler definition
+    │   ├── rag-service.yaml  # K8s RAG service deployment
+    │   ├── rag-service-service.yaml  # K8s service definition
+    │   └── redis.yaml      # Redis deployment for distributed queue
+    ├── rag_service/        # Core RAG service implementation
+    │   ├── config.py       # Configuration settings
+    │   ├── api/            # FastAPI endpoints and models
+    │   │   ├── endpoints.py  # API routes for RAG service
+    │   │   └── models.py   # Pydantic models for request/response
+    │   └── core/           # Core RAG functionality
+    │       ├── batch_processor.py  # Processes batches of RAG requests
+    │       ├── request_queue.py    # Request queue implementations
+    │       └── retriever.py        # GPU-accelerated vector similarity search
+    └── scripts/            # Utility scripts
+        ├── fact_dataset.py    # Generates synthetic fact dataset
+        └── squad_dataset.py   # Prepares SQuAD dataset with embeddings
+```
 
----
+## Key Features
 
-## Repository Structure
+- **GPU-Accelerated Vector Similarity**: Fast similarity computation using CuPy for efficient document retrieval
+- **Batched Request Processing**: Optimised multi-stage pipeline for efficient GPU utilisation (batched embedding creation, document retrieval and LLM inference)
+- **Asynchronous API**: Non-blocking request handling with Redis-based distributed queue
+- **Horizontal Scaling**: Kubernetes-based autoscaling based on queue metrics
+- **Comprehensive Benchmarking**: Load testing framework with detailed performance metrics
 
-- [**Task-1**](./task-1): Part 1, Implementing machine learning operators with GPU programming.
-- [**Task-2**](./task-2): Part 2, Integrating the operator into a distributed ML system (ServerlessLLM + RAG).
-- [**Resources**](./resources): Slides and reading materials related to the course.
+## Getting Started
 
----
+# Local Deployment on single GPU
+1. Create a conda environment and install dependencies:
+```bash
+conda create -n rag python=3.10 -y
+conda activate rag
+pip install -r task-2/requirements.txt
+```
 
-## Last Update
-- **[11/02/2025]** Update instructions of pytorch demo. If you encounter a `No disk space` error, try logging into Interactive mode first and installing the environment on the node.
-- **[05/02/2025]** We have uploaded the code template for the first part of the assessment into the `task-1` folder. Additionally, we have relocated the `pytorch-demo` to the `resources` directory and have included materials for `gpu-programming` in the same directory. The part 1 specification in under the `Assessment` section on Learn.
----
+2. Download required models (if running on a GPU machine with limited internet access):
+```bash
+bashhuggingface-cli download intfloat/multilingual-e5-large-instruct
+huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct
+```
 
-## Course Tasks
+3. Run the RAG service:
+```bash
+cd task-2
+python main.py
+```
 
-### Task 1: Triton/Cupy Operator
-- Implement an ML operator using Triton/Cupy.
-- Learn about performance optimization and profiling.
+3. For load testing and performance evaluation:
+```bash
+cd task-2
+bash benchmarks/load_test.sh
+```
 
-### Task 2: Integration into Distributed System
-- Integrate your Task 1 operator into a distributed ML system using ServerlessLLM and RAG.
+# Kubernetes-Based Deployment for autoscaling with Multiple GPUs
+For containerized deployment with Kubernetes:
+```bash
+# Build container images
+docker build -t rag-service:latest -f Dockerfile .
+docker build -t rag-autoscaler:latest -f Dockerfile.autoscaler .
 
-### Paper Writing
-- Write a paper documenting your work on both tasks in the format of a NeurIPS or ICML paper.
+# Deploy to Kubernetes
+kubectl apply -f deployment/redis.yaml
+kubectl apply -f deployment/rag-service.yaml
+kubectl apply -f deployment/rag-service-service.yaml
+kubectl apply -f deployment/autoscaler.yaml
+```
+*Note:* autoscaler.py should be configured for preferences and also *automatic downscaling implementated* before using this deployment.
 
----
+## Performance Evaluation
 
-## Course Schedule
-
-The course consists of 10 weeks of lectures and Q&A sessions. Each week has the following structure:
-- **Lectures**: Core topics presented by the primary and guest lecturers.
-- **Q&A Sessions**: Focused on solving problems, demos, and discussing task-related questions.
-
-The full course schedule is available [here](https://browser.ted.is.ed.ac.uk/generate/?courses%5B%5D=INFR11269_SS1_SEM2&period=SEM2&week=26-37).
+Our system has been extensively benchmarked under various load conditions to determine optimal batch sizes and scaling properties. Our testing has found the system to work optimally with a MAX_BATCH_SIZE=32 and a MAX_WAIT_TIME=1 for Nvidia Tesla L4 GPUs, however optimal settings may very on other GPUs/ CPUs. Important performance metrics include throughput, average latency, and P99 latency under different RPS (Requests Per Second) loads under different request patterns (random, poisson, uniform). 
