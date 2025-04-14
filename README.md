@@ -5,7 +5,7 @@ This repository contains our implementation of a high-performance GPU-accelerate
 ## Directory Structure
 
 ```
-ngray0-mls-g31/
+RAG-Serving-System/
 ├── LICENSE
 ├── task-1/                 # GPU-accelerated Information Retrieval (IR) implementations
 └── task-2/                 # Batched RAG Serving System
