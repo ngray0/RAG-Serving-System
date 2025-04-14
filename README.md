@@ -1,4 +1,4 @@
-# RAG/ Serverless LLM Serving System with GPU Accelorated Information Retreival (IR)
+# RAG/ Serverless LLM Serving System with GPU Accelerated Information Retreival (IR)
 
 This repository contains our implementation of a high-performance GPU-accelerated information retrieval system with a batch-oriented RAG (Retrieval-Augmented Generation) serving architecture. Our system achieves a maximum throughput of 23.67 requests/second on a single Nvidia Testla L4 GPU (batch size = 32) and offers support for scalable deployment/ autoscaling with Kubernetes.
 
