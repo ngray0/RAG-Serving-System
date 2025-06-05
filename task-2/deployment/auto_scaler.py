@@ -20,6 +20,9 @@ QUEUE_KEY = os.environ.get("QUEUE_KEY", "rag_service:requests")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "15"))  # seconds
 WAIT_THRESHOLD = float(os.environ.get("WAIT_THRESHOLD", "5.0"))  # seconds
 QUEUE_SIZE_PER_REPLICA = int(os.environ.get("QUEUE_SIZE_PER_REPLICA", "30"))
+IDLE_THRESHOLD = int(os.environ.get("IDLE_THRESHOLD", "300"))  # seconds queue must remain empty before downscaling
+MIN_IDLE_REPLICAS = int(os.environ.get("MIN_IDLE_REPLICAS", "0"))
+LOW_WAIT_THRESHOLD = float(os.environ.get("LOW_WAIT_THRESHOLD", "1.0"))
 
 def get_queue_metrics():
     # Get queue size
@@ -61,27 +64,50 @@ def scale_deployment(desired_replicas):
         return False
 
 def autoscale_loop():
+    idle_start_time = None
     while True:
         try:
             queue_size, wait_time = get_queue_metrics()
             print(f"Queue metrics - Size: {queue_size}, Wait time: {wait_time:.2f}s")
-            
-            # Calculate desired replicas based on queue size
-            size_based_replicas = max(MIN_REPLICAS, min(MAX_REPLICAS, 
-                                     (queue_size // QUEUE_SIZE_PER_REPLICA) + 1))
-            
-            # If wait time is too high, add more replicas
-            if wait_time > WAIT_THRESHOLD:
-                # Scale up by one more replica if wait time is high
-                desired_replicas = min(MAX_REPLICAS, size_based_replicas + 1)
+
+            if queue_size == 0:
+                if idle_start_time is None:
+                    idle_start_time = time.time()
             else:
-                desired_replicas = size_based_replicas
-            
+                idle_start_time = None
+
+            if idle_start_time and (time.time() - idle_start_time >= IDLE_THRESHOLD):
+                desired_replicas = MIN_IDLE_REPLICAS
+            else:
+                # Calculate desired replicas based on queue size
+                size_based_replicas = max(
+                    MIN_REPLICAS,
+                    min(MAX_REPLICAS, (queue_size // QUEUE_SIZE_PER_REPLICA) + 1),
+                )
+
+                # If wait time is too high, add more replicas
+                if wait_time > WAIT_THRESHOLD:
+                    desired_replicas = min(MAX_REPLICAS, size_based_replicas + 1)
+                else:
+                    current_replicas = k8s_apps_v1.read_namespaced_deployment(
+                        name=DEPLOYMENT_NAME, namespace=NAMESPACE
+                    ).spec.replicas
+                    if (
+                        wait_time < LOW_WAIT_THRESHOLD
+                        and current_replicas > size_based_replicas
+                    ):
+                        desired_replicas = max(
+                            size_based_replicas,
+                            current_replicas - 1,
+                        )
+                    else:
+                        desired_replicas = size_based_replicas
+
             scale_deployment(desired_replicas)
-            
+
         except Exception as e:
             print(f"Error in autoscaler loop: {e}")
-        
+
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":

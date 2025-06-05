@@ -88,7 +88,7 @@ kubectl apply -f deployment/rag-service.yaml
 kubectl apply -f deployment/rag-service-service.yaml
 kubectl apply -f deployment/autoscaler.yaml
 ```
-*Note:* autoscaler.py should be configured for preferences and also *automatic downscaling implementated* before using this deployment.
+The autoscaler supports automatic downscaling when the request queue is idle. Configure the `IDLE_THRESHOLD` and `MIN_IDLE_REPLICAS` environment variables in `autoscaler.yaml` to control how quickly the service scales to zero (or another minimal replica count). For gradual scaling when traffic is low, use `LOW_WAIT_THRESHOLD` to remove a replica whenever the oldest queued request has waited less than this value.
 
 ## Performance Evaluation
 

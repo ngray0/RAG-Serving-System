@@ -55,3 +55,9 @@ spec:
           value: "10.0"
         - name: QUEUE_SIZE_PER_REPLICA
           value: "30"
+        - name: IDLE_THRESHOLD
+          value: "300"
+        - name: MIN_IDLE_REPLICAS
+          value: "0"
+        - name: LOW_WAIT_THRESHOLD
+          value: "1.0"
