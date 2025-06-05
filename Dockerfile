@@ -1,6 +1,6 @@
 FROM python:3.10
 
-WORKDIR /teamspace/studios/this_studio/MLS-G31/task-2
+WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -23,7 +23,7 @@ RUN python -c "from transformers import AutoTokenizer, AutoModel; \
 
 COPY . .
 
-ENV PYTHONPATH=/task-2
+ENV PYTHONPATH=/app
 
 # env variables
 ENV HOST=0.0.0.0
