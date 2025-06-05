@@ -7,36 +7,34 @@ This repository contains our implementation of a high-performance GPU-accelerate
 ```
 RAG-Serving-System/
 ├── LICENSE
-├── task-1/                 # GPU-accelerated Information Retrieval (IR) implementations
-└── task-2/                 # Batched RAG Serving System
-    ├── Dockerfile          # Container definition for the RAG service
-    ├── Dockerfile.autoscaler  # Container definition for the autoscaler
-    ├── main.py             # Main application entry point
-    ├── requirements.txt    # Python dependencies
-    ├── benchmarks/         # Load testing and performance evaluation tools
-    │   ├── load_generator.py  # Async request generator for load testing
-    │   ├── load_test.sh    # Script to run load tests with increasing RPS
-    │   └── metrics/        # Performance metrics collection utilities
-    │       └── collector.py  # Records and analyzes request latencies
-    ├── data/               
-    ├── deployment/         # Kubernetes deployment configurations
-    │   ├── auto_scaler.py  # Horizontal pod autoscaler logic
-    │   ├── autoscaler.yaml # K8s autoscaler definition
-    │   ├── rag-service.yaml  # K8s RAG service deployment
-    │   ├── rag-service-service.yaml  # K8s service definition
-    │   └── redis.yaml      # Redis deployment for distributed queue
-    ├── rag_service/        # Core RAG service implementation
-    │   ├── config.py       # Configuration settings
-    │   ├── api/            # FastAPI endpoints and models
-    │   │   ├── endpoints.py  # API routes for RAG service
-    │   │   └── models.py   # Pydantic models for request/response
-    │   └── core/           # Core RAG functionality
-    │       ├── batch_processor.py  # Processes batches of RAG requests
-    │       ├── request_queue.py    # Request queue implementations
-    │       └── retriever.py        # GPU-accelerated vector similarity search
-    └── scripts/            # Utility scripts
-        ├── fact_dataset.py    # Generates synthetic fact dataset
-        └── squad_dataset.py   # Prepares SQuAD dataset with embeddings
+├── Dockerfile             # Container definition for the RAG service
+├── Dockerfile.autoscaler  # Container definition for the autoscaler
+├── main.py                # Main application entry point
+├── requirements.txt       # Python dependencies
+├── benchmarks/            # Load testing and performance evaluation tools
+│   ├── load_generator.py  # Async request generator for load testing
+│   ├── load_test.sh       # Script to run load tests with increasing RPS
+│   └── metrics/           # Performance metrics collection utilities
+│       └── collector.py   # Records and analyzes request latencies
+├── data/
+├── deployment/            # Kubernetes deployment configurations
+│   ├── auto_scaler.py     # Horizontal pod autoscaler logic
+│   ├── autoscaler.yaml    # K8s autoscaler definition
+│   ├── rag-service.yaml   # K8s RAG service deployment
+│   ├── rag-service-service.yaml  # K8s service definition
+│   └── redis.yaml         # Redis deployment for distributed queue
+├── rag_service/           # Core RAG service implementation
+│   ├── config.py          # Configuration settings
+│   ├── api/               # FastAPI endpoints and models
+│   │   ├── endpoints.py   # API routes for RAG service
+│   │   └── models.py      # Pydantic models for request/response
+│   └── core/              # Core RAG functionality
+│       ├── batch_processor.py  # Processes batches of RAG requests
+│       ├── request_queue.py    # Request queue implementations
+│       └── retriever.py        # GPU-accelerated vector similarity search
+└── scripts/               # Utility scripts
+    ├── fact_dataset.py    # Generates synthetic fact dataset
+    └── squad_dataset.py   # Prepares SQuAD dataset with embeddings
 ```
 
 ## Key Features
@@ -54,24 +52,22 @@ RAG-Serving-System/
 ```bash
 conda create -n rag python=3.10 -y
 conda activate rag
-pip install -r task-2/requirements.txt
+pip install -r requirements.txt
 ```
 
 2. Download required models (if running on a GPU machine with limited internet access):
 ```bash
-bashhuggingface-cli download intfloat/multilingual-e5-large-instruct
+huggingface-cli download intfloat/multilingual-e5-large-instruct
 huggingface-cli download Qwen/Qwen2.5-1.5B-Instruct
 ```
 
 3. Run the RAG service:
 ```bash
-cd task-2
 python main.py
 ```
 
-3. For load testing and performance evaluation:
+4. For load testing and performance evaluation:
 ```bash
-cd task-2
 bash benchmarks/load_test.sh
 ```
 
